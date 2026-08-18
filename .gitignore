@@ -1,0 +1,16 @@
+node_modules/
+dist/
+src-tauri/target/
+*.tsbuildinfo
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.bak
+.env
+.env.*
+!.env.example
+.prime/
+coverage/
+.idea/
+.vscode/
