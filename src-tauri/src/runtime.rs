@@ -20,6 +20,8 @@ use tauri::AppHandle;
 use std::ffi::OsStr;
 
 pub const OFFICIAL_REPOSITORY_URL: &str = "https://github.com/PrimeIntellect-ai/prime-agent.git";
+pub const SUPPORTED_PRIME_AGENT_TAG: &str = "v0.7.3";
+pub const SUPPORTED_PRIME_AGENT_COMMIT: &str = "61131b2d195ba7a67a4ce8ac60bb10cecae07b67";
 const STARTUP_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const COMMAND_TERMINATION_GRACE: Duration = Duration::from_millis(500);

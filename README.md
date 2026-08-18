@@ -61,10 +61,10 @@ Prime Agent's interactive `/login`, `/logout`, and OAuth MCP flows still run in 
 4. Let the onboarding flow detect Prime Agent, or use **Quick install** to install it from the official repository.
 5. Configure a provider, create a conversation, and start working.
 
-The 0.1.8 desktop build is validated on Windows 10/11 x64. Microsoft Edge WebView2 is normally already present on supported Windows installations.
+The 0.1.9 desktop build is validated on Windows 10/11 x64. Microsoft Edge WebView2 is normally already present on supported Windows installations.
 
 > [!IMPORTANT]
-> The 0.1.8 installers are not code-signed yet. Windows SmartScreen may display an unknown-publisher warning. Verify the SHA-256 values in the release notes before running a downloaded installer.
+> The 0.1.9 installers are not code-signed yet. Windows SmartScreen may display an unknown-publisher warning. Verify the SHA-256 values in the release notes before running a downloaded installer.
 
 ### Prime Agent requirements
 
@@ -75,7 +75,7 @@ For an existing or managed Prime Agent installation, Prime Orbit checks for:
 - Git;
 - Bash (Git Bash is supported on Windows).
 
-The managed installer clones only the official Prime Agent repository. It refuses an unexpected origin, a dirty managed checkout, or an unsafe target path, and updates only by fast-forward.
+The managed installer clones only the official Prime Agent repository. It refuses an unexpected origin, an unsafe target path, or unrecognized local changes, and pins the runtime to an exact verified stable tag and commit.
 
 ## Core capabilities
 
@@ -114,7 +114,7 @@ Prime Orbit first tries the native RPC session. When possible, it then displays 
 
 ### `EPERM` while opening a session on Windows
 
-Prime Agent versions affected by the Windows directory-rename behavior can leave a stale session lease after an interrupted process. Prime Orbit 0.1.8 safely quarantines only the exact stale lease after verifying its owner identity, then retries the normal RPC launch.
+Prime Agent versions affected by the Windows directory-rename behavior can leave a stale session lease after an interrupted process. Prime Orbit 0.1.8 and later safely quarantine only the exact stale lease after verifying its owner identity, then retry the normal RPC launch. Version 0.1.9 also normalizes the upstream Windows lease collision inside managed daemon workers.
 
 ### Authentication or MCP OAuth is required
 
@@ -174,7 +174,7 @@ Tauri writes platform bundles under `src-tauri/target/release/bundle/`.
 
 ## Release status
 
-Prime Orbit is an early desktop release. Version 0.1.8 ships Windows x64 NSIS and MSI installers. macOS and Linux code paths exist, but official binaries have not yet been validated or published.
+Prime Orbit is an early desktop release. Version 0.1.9 ships Windows x64 NSIS and MSI installers. macOS and Linux code paths exist, but official binaries have not yet been validated or published.
 
 See [CHANGELOG.md](CHANGELOG.md) for release details.
 

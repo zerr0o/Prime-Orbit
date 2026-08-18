@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use crate::runtime::LaunchSpec;
 use crate::{
     paths::canonicalize,
     runtime::{detect_internal, now_millis},
@@ -562,6 +564,10 @@ fn start_agent_blocking(
     }
 
     let mut command = launch_spec.command(&arguments);
+    #[cfg(windows)]
+    if matches!(&launch_spec, LaunchSpec::Source { .. }) {
+        crate::node_compat::configure_source_rpc(&app, &mut command)?;
+    }
     command
         .current_dir(&cwd)
         .stdin(Stdio::piped())

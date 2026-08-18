@@ -2,6 +2,8 @@ mod agents;
 mod connections;
 mod files;
 mod install;
+#[cfg(windows)]
+mod node_compat;
 mod paths;
 mod runtime;
 mod session_history;
