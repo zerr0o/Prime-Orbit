@@ -2,6 +2,33 @@
 
 All notable changes to Prime Orbit are documented in this file.
 
+## [0.1.10] - 2026-08-19
+
+### Reliability and persistence
+
+- Stopped the workspace-state write storm caused by property-order-sensitive JSON comparisons and made identical native CAS writes idempotent.
+- Kept runtime-only status, messages, activities, and errors out of durable workspace timestamps and automatic-save retries.
+- Made prompt submission transactional, preserving concurrent runtime updates while rolling failed optimistic messages back exactly.
+- Hardened multi-window runtime ownership, interactive extension request routing, queued follow-ups, and local session-history recovery.
+
+### Security and integrations
+
+- Moved image attachments to bounded, window-scoped native handles with TTL and aggregate limits while preserving explicitly selected external documents as path references.
+- Redacted credentials from renderer diagnostics and activity payloads before display or persistence.
+- Hardened MCP settings with HTTPS/auth rules, safe loopback exceptions, guarded atomic locking, secret-free inspection, and protection against moving opaque authorization headers to a new origin.
+- Confined model configuration edits to the managed `models.json` file and strengthened runtime, path, symlink, and input validation.
+
+### Desktop experience
+
+- Added a complete project context menu for pinning, renaming, opening, archiving, and typed deletion confirmation without changing the active conversation.
+- Opened project folders directly in Explorer, Finder, or the Linux file manager instead of selecting them in the parent folder.
+- Improved attachment errors, provider/MCP setup, managed-install feedback, retry behavior, and bilingual interface coverage.
+
+### Engineering
+
+- Declared Node.js 22.12 for development, Rust 1.88 as the MSRV, locked Rust validation, dependency audits, and Tauri integration builds in CI.
+- 74 Rust tests and 20 frontend unit tests, plus TypeScript production, strict Clippy, MSRV, and Windows bundle validation.
+
 ## [0.1.9] - 2026-08-19
 
 ### Managed Prime Agent repair
@@ -43,5 +70,6 @@ All notable changes to Prime Orbit are documented in this file.
 - TypeScript build and checks.
 - Strict Rust Clippy validation with warnings denied.
 
+[0.1.10]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.10
 [0.1.9]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.9
 [0.1.8]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.8

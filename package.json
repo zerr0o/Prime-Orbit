@@ -1,7 +1,7 @@
 {
   "name": "prime-orbit",
   "private": true,
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "A professional desktop workspace for Prime Agent",
   "license": "MIT",
   "repository": {
@@ -11,6 +11,9 @@
   "homepage": "https://github.com/zerr0o/Prime-Orbit#readme",
   "bugs": {
     "url": "https://github.com/zerr0o/Prime-Orbit/issues"
+  },
+  "engines": {
+    "node": ">=22.12.0"
   },
   "type": "module",
   "scripts": {

@@ -11,6 +11,7 @@ mod session_lease;
 mod storage;
 
 use agents::AgentsState;
+use files::AttachmentCache;
 use install::InstallState;
 use serde::Serialize;
 use storage::PersistenceLock;
@@ -56,6 +57,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AgentsState::default())
+        .manage(AttachmentCache::default())
         .manage(InstallState::default())
         .manage(PersistenceLock::default())
         .invoke_handler(tauri::generate_handler![
@@ -76,8 +78,10 @@ pub fn run() {
             storage::save_models_json,
             install::quick_install_prime_agent,
             install::is_prime_agent_installing,
-            files::read_attachment,
+            files::pick_attachments,
+            files::release_attachment_handles,
             files::list_git_changes,
+            files::open_project_folder,
             connections::inspect_prime_agent_connections,
             connections::save_mcp_server,
             connections::delete_mcp_server,
@@ -95,8 +99,11 @@ pub fn run() {
             // callback. Release its process leases away from the UI thread;
             // active agents are retained until their agent_end boundary.
             let agents = app.state::<AgentsState>().inner().clone();
+            let attachments = app.state::<AttachmentCache>().inner().clone();
+            let attachment_owner = label.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 agents::release_window_agents(agents, label);
+                files::release_window_attachments(attachments, &attachment_owner);
             });
         }
         tauri::RunEvent::ExitRequested { .. } => {

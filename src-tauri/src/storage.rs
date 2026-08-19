@@ -89,73 +89,167 @@ fn app_state_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_data_dir(app)?.join("app-state.json"))
 }
 
-fn default_models_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let home = app
-        .path()
-        .home_dir()
-        .map_err(|error| format!("Impossible de localiser le dossier utilisateur: {error}"))?;
-    Ok(home.join(".prime").join("agent").join("models.json"))
+fn managed_agent_directory(home: &Path, create: bool) -> Result<PathBuf, String> {
+    let home = canonicalize(home).map_err(|error| {
+        format!(
+            "Impossible de résoudre le dossier utilisateur {}: {error}",
+            home.display()
+        )
+    })?;
+    let mut current = home.clone();
+
+    for component in [".prime", "agent"] {
+        let candidate = current.join(component);
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(format!(
+                        "{} doit être un dossier régulier non symbolique",
+                        candidate.display()
+                    ));
+                }
+                let resolved = canonicalize(&candidate).map_err(|error| {
+                    format!("Impossible de résoudre {}: {error}", candidate.display())
+                })?;
+                if !resolved.starts_with(&home) {
+                    return Err(format!(
+                        "Le dossier models.json {} sort du dossier utilisateur autorisé",
+                        resolved.display()
+                    ));
+                }
+                current = resolved;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+                match fs::create_dir(&candidate) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "Impossible de créer le dossier de configuration {}: {error}",
+                            candidate.display()
+                        ));
+                    }
+                }
+                let metadata = fs::symlink_metadata(&candidate).map_err(|error| {
+                    format!("Impossible d’inspecter {}: {error}", candidate.display())
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(format!(
+                        "{} doit être un dossier régulier non symbolique",
+                        candidate.display()
+                    ));
+                }
+                current = canonicalize(&candidate).map_err(|error| {
+                    format!("Impossible de résoudre {}: {error}", candidate.display())
+                })?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Nothing below a missing regular component can be trusted or
+                // canonicalized yet. Preserve the exact managed destination;
+                // save_models_json will create and revalidate it before use.
+                current = candidate;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Impossible d’inspecter {}: {error}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Ok(current)
 }
 
-fn resolve_models_path(app: &AppHandle, requested: Option<String>) -> Result<PathBuf, String> {
-    let is_default = requested.is_none();
-    let requested_path = match requested {
-        Some(path) if path.trim().is_empty() => {
-            return Err("Le chemin models.json ne peut pas être vide".to_string())
-        }
-        Some(path) => PathBuf::from(path),
-        None => default_models_path(app)?,
-    };
+fn resolve_models_path_from_home(
+    home: &Path,
+    requested: Option<&str>,
+    create_parent: bool,
+) -> Result<PathBuf, String> {
+    let managed_directory = managed_agent_directory(home, create_parent)?;
+    // Validate the directory entry itself before any canonicalization. If the
+    // managed filename is a symlink, resolving it first would make an
+    // attacker-controlled target look identical to the requested path.
+    let managed_path = validate_managed_models_file(managed_directory.join("models.json"))?;
 
-    if !is_default && !requested_path.is_absolute() {
+    let Some(requested) = requested else {
+        return validate_managed_models_file(managed_path);
+    };
+    if requested.trim().is_empty() {
+        return Err("Le chemin models.json ne peut pas être vide".to_string());
+    }
+    let requested_path = PathBuf::from(requested);
+    if !requested_path.is_absolute() {
         return Err("Le chemin models.json choisi doit être absolu".to_string());
     }
-    if requested_path.extension().and_then(|value| value.to_str()) != Some("json") {
-        return Err("Le fichier de modèles doit avoir l’extension .json".to_string());
+    if requested_path.file_name().and_then(|value| value.to_str()) != Some("models.json") {
+        return Err(
+            "Prime Orbit ne peut modifier que le fichier ~/.prime/agent/models.json géré"
+                .to_string(),
+        );
     }
+    validate_managed_models_file(requested_path.clone())?;
 
-    if requested_path.exists() {
-        let link_metadata = fs::symlink_metadata(&requested_path).map_err(|error| {
-            format!(
-                "Impossible d’inspecter {}: {error}",
-                requested_path.display()
-            )
-        })?;
-        if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
-            return Err(format!(
-                "Le chemin {} doit désigner un fichier régulier non symbolique",
-                requested_path.display()
-            ));
-        }
-        return canonicalize(&requested_path).map_err(|error| {
+    let resolved_requested = if requested_path.exists() {
+        canonicalize(&requested_path).map_err(|error| {
             format!(
                 "Impossible de résoudre {}: {error}",
                 requested_path.display()
             )
-        });
-    }
-
-    let parent = requested_path
-        .parent()
-        .ok_or_else(|| "Le chemin models.json n’a pas de dossier parent".to_string())?;
-    if is_default {
-        fs::create_dir_all(parent).map_err(|error| {
+        })?
+    } else {
+        let parent = requested_path
+            .parent()
+            .ok_or_else(|| "Le chemin models.json n’a pas de dossier parent".to_string())?;
+        let parent = canonicalize(parent).map_err(|error| {
             format!(
-                "Impossible de créer le dossier de configuration {}: {error}",
+                "Le dossier parent {} est inaccessible: {error}",
                 parent.display()
             )
         })?;
+        parent.join("models.json")
+    };
+    let resolved_managed = if managed_path.exists() {
+        canonicalize(&managed_path).map_err(|error| {
+            format!("Impossible de résoudre {}: {error}", managed_path.display())
+        })?
+    } else {
+        managed_path
+    };
+    if resolved_requested != resolved_managed {
+        return Err(format!(
+            "Prime Orbit refuse d’accéder à {} : seul {} est géré par cet éditeur",
+            resolved_requested.display(),
+            resolved_managed.display()
+        ));
     }
-    let parent = canonicalize(parent).map_err(|error| {
-        format!(
-            "Le dossier parent {} est inaccessible: {error}",
-            parent.display()
-        )
-    })?;
-    let name = requested_path
-        .file_name()
-        .ok_or_else(|| "Nom de fichier models.json invalide".to_string())?;
-    Ok(parent.join(name))
+    validate_managed_models_file(resolved_managed)
+}
+
+fn validate_managed_models_file(path: PathBuf) -> Result<PathBuf, String> {
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(format!(
+            "Le chemin {} doit désigner un fichier régulier non symbolique",
+            path.display()
+        )),
+        Ok(_) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path),
+        Err(error) => Err(format!(
+            "Impossible d’inspecter {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn resolve_models_path(
+    app: &AppHandle,
+    requested: Option<String>,
+    create_parent: bool,
+) -> Result<PathBuf, String> {
+    let home = app
+        .path()
+        .home_dir()
+        .map_err(|error| format!("Impossible de localiser le dossier utilisateur: {error}"))?;
+    resolve_models_path_from_home(&home, requested.as_deref(), create_parent)
 }
 
 pub fn read_json_file(path: &Path, max_bytes: u64) -> Result<Value, String> {
@@ -323,53 +417,144 @@ fn validate_models_json(value: &Value) -> Result<(), String> {
     let root = value
         .as_object()
         .ok_or_else(|| "models.json doit contenir un objet JSON à la racine".to_string())?;
-
-    if let Some(providers) = root.get("providers") {
-        let providers = providers
-            .as_object()
-            .ok_or_else(|| "models.json.providers doit être un objet".to_string())?;
-        for (provider_id, provider) in providers {
-            if provider_id.trim().is_empty() {
-                return Err("Un identifiant de provider ne peut pas être vide".to_string());
-            }
-            let provider = provider.as_object().ok_or_else(|| {
-                format!("La configuration du provider {provider_id} doit être un objet")
-            })?;
-            for string_field in ["baseUrl", "apiKey", "api"] {
-                if let Some(field) = provider.get(string_field) {
-                    if !field.is_string() {
-                        return Err(format!(
-                            "providers.{provider_id}.{string_field} doit être une chaîne"
-                        ));
-                    }
-                }
-            }
-            if let Some(models) = provider.get("models") {
-                let models = models.as_array().ok_or_else(|| {
-                    format!("providers.{provider_id}.models doit être un tableau")
+    if root.keys().any(|key| key != "providers") {
+        return Err("models.json ne peut contenir que la propriété racine providers".to_string());
+    }
+    let providers = root
+        .get("providers")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "models.json.providers est requis et doit être un objet".to_string())?;
+    for (provider_id, provider) in providers {
+        if provider_id.trim().is_empty() || provider_id.len() > 128 {
+            return Err(
+                "Un identifiant de provider doit contenir entre 1 et 128 caractères".to_string(),
+            );
+        }
+        let provider = provider.as_object().ok_or_else(|| {
+            format!("La configuration du provider {provider_id} doit être un objet")
+        })?;
+        for string_field in ["name", "baseUrl", "apiKey", "api"] {
+            if let Some(field) = provider.get(string_field) {
+                let text = field.as_str().ok_or_else(|| {
+                    format!("providers.{provider_id}.{string_field} doit être une chaîne")
                 })?;
-                for (index, model) in models.iter().enumerate() {
-                    let model = model.as_object().ok_or_else(|| {
-                        format!("providers.{provider_id}.models[{index}] doit être un objet")
-                    })?;
-                    let id = model.get("id").and_then(Value::as_str).ok_or_else(|| {
-                        format!("providers.{provider_id}.models[{index}].id doit être une chaîne")
-                    })?;
-                    if id.trim().is_empty() {
-                        return Err(format!(
-                            "providers.{provider_id}.models[{index}].id ne peut pas être vide"
-                        ));
-                    }
-                }
-            }
-            if let Some(overrides) = provider.get("modelOverrides") {
-                if !overrides.is_object() {
+                if text.is_empty() {
                     return Err(format!(
-                        "providers.{provider_id}.modelOverrides doit être un objet"
+                        "providers.{provider_id}.{string_field} ne peut pas être vide"
                     ));
                 }
             }
         }
+        if let Some(auth_header) = provider.get("authHeader") {
+            if !auth_header.is_boolean() {
+                return Err(format!(
+                    "providers.{provider_id}.authHeader doit être un booléen"
+                ));
+            }
+        }
+        if let Some(headers) = provider.get("headers") {
+            validate_string_map(headers, &format!("providers.{provider_id}.headers"))?;
+        }
+        if let Some(compat) = provider.get("compat") {
+            if !compat.is_object() {
+                return Err(format!("providers.{provider_id}.compat doit être un objet"));
+            }
+        }
+        if let Some(models) = provider.get("models") {
+            let models = models
+                .as_array()
+                .ok_or_else(|| format!("providers.{provider_id}.models doit être un tableau"))?;
+            for (index, model) in models.iter().enumerate() {
+                validate_model_definition(provider_id, index, model)?;
+            }
+        }
+        if let Some(overrides) = provider.get("modelOverrides") {
+            let overrides = overrides.as_object().ok_or_else(|| {
+                format!("providers.{provider_id}.modelOverrides doit être un objet")
+            })?;
+            for (model_id, value) in overrides {
+                if model_id.trim().is_empty() {
+                    return Err(format!(
+                        "providers.{provider_id}.modelOverrides contient un identifiant vide"
+                    ));
+                }
+                if !value.is_object() {
+                    return Err(format!(
+                        "providers.{provider_id}.modelOverrides.{model_id} doit être un objet"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_string_map(value: &Value, path: &str) -> Result<(), String> {
+    let values = value
+        .as_object()
+        .ok_or_else(|| format!("{path} doit être un objet"))?;
+    if values.values().any(|value| !value.is_string()) {
+        return Err(format!(
+            "Toutes les valeurs de {path} doivent être des chaînes"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_model_definition(provider_id: &str, index: usize, value: &Value) -> Result<(), String> {
+    let path = format!("providers.{provider_id}.models[{index}]");
+    let model = value
+        .as_object()
+        .ok_or_else(|| format!("{path} doit être un objet"))?;
+    let id = model
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{path}.id doit être une chaîne"))?;
+    if id.is_empty() {
+        return Err(format!("{path}.id ne peut pas être vide"));
+    }
+    for string_field in ["name", "api", "baseUrl"] {
+        if let Some(field) = model.get(string_field) {
+            let text = field
+                .as_str()
+                .ok_or_else(|| format!("{path}.{string_field} doit être une chaîne"))?;
+            if text.is_empty() {
+                return Err(format!("{path}.{string_field} ne peut pas être vide"));
+            }
+        }
+    }
+    for boolean_field in ["reasoning"] {
+        if model
+            .get(boolean_field)
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err(format!("{path}.{boolean_field} doit être un booléen"));
+        }
+    }
+    for number_field in ["contextWindow", "maxTokens"] {
+        if model
+            .get(number_field)
+            .is_some_and(|value| !value.is_number())
+        {
+            return Err(format!("{path}.{number_field} doit être un nombre"));
+        }
+    }
+    if let Some(input) = model.get("input") {
+        let input = input
+            .as_array()
+            .ok_or_else(|| format!("{path}.input doit être un tableau"))?;
+        if input
+            .iter()
+            .any(|kind| !matches!(kind.as_str(), Some("text" | "image")))
+        {
+            return Err(format!("{path}.input ne peut contenir que text et image"));
+        }
+    }
+    if let Some(headers) = model.get("headers") {
+        validate_string_map(headers, &format!("{path}.headers"))?;
+    }
+    if model.get("compat").is_some_and(|value| !value.is_object()) {
+        return Err(format!("{path}.compat doit être un objet"));
     }
     Ok(())
 }
@@ -436,7 +621,7 @@ pub async fn save_app_state(
         let path = app_state_path(&app)?;
         let result = compare_and_save_app_state(&path, state, expected_revision)?;
         drop(_guard);
-        if result.saved {
+        if result.saved && result.snapshot.revision > expected_revision {
             let _ = app.emit("prime-orbit://state-changed", result.snapshot.clone());
         }
         Ok(result)
@@ -456,6 +641,15 @@ fn compare_and_save_app_state(
     if current.revision != expected_revision {
         return Ok(SaveAppStateResult {
             saved: false,
+            snapshot: current,
+        });
+    }
+    // Treat an identical CAS payload as a successful no-op. The frontend
+    // normally filters these writes, but this native guard prevents a render
+    // or serialization regression from churning the state file and revision.
+    if current.state == state {
+        return Ok(SaveAppStateResult {
+            saved: true,
             snapshot: current,
         });
     }
@@ -491,7 +685,7 @@ pub async fn read_models_json(
     path: Option<String>,
 ) -> Result<ModelsJsonDocument, String> {
     crate::run_blocking(move || {
-        let path = resolve_models_path(&app, path)?;
+        let path = resolve_models_path(&app, path, false)?;
         if !path.exists() {
             return Ok(ModelsJsonDocument {
                 path: path.to_string_lossy().into_owned(),
@@ -521,7 +715,7 @@ pub async fn save_models_json(
     crate::run_blocking(move || {
         validate_models_json(&models)?;
         let bytes = serialize_pretty(&models, MAX_MODELS_JSON_BYTES, "models.json")?;
-        let path = resolve_models_path(&app, path)?;
+        let path = resolve_models_path(&app, path, true)?;
         let _guard = persistence.lock();
 
         let backup_path = if path.exists() {
@@ -568,7 +762,11 @@ pub fn load_typed_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Opti
 
 #[cfg(test)]
 mod tests {
-    use super::{compare_and_save_app_state, load_app_state_from_path, validate_models_json};
+    use super::{
+        compare_and_save_app_state, load_app_state_from_path, resolve_models_path_from_home,
+        validate_models_json,
+    };
+    use std::fs;
 
     #[test]
     fn validates_provider_model_ids() {
@@ -586,6 +784,66 @@ mod tests {
             "providers": { "local": { "models": [{ "name": "Missing id" }] } }
         });
         assert!(validate_models_json(&invalid).is_err());
+
+        assert!(validate_models_json(&serde_json::json!({})).is_err());
+        assert!(validate_models_json(&serde_json::json!({ "unrelated": true })).is_err());
+        assert!(validate_models_json(&serde_json::json!({
+            "providers": { "local": { "headers": { "Authorization": 42 } } }
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn models_editor_is_confined_to_the_managed_models_file() {
+        let home = tempfile::tempdir().expect("temporary home");
+        let managed = resolve_models_path_from_home(home.path(), None, true)
+            .expect("managed path is created");
+        assert_eq!(
+            managed,
+            home.path().join(".prime").join("agent").join("models.json")
+        );
+        assert_eq!(
+            resolve_models_path_from_home(home.path(), managed.to_str(), true)
+                .expect("the exact managed path remains accepted"),
+            managed
+        );
+
+        let unrelated = home.path().join("package.json");
+        assert!(resolve_models_path_from_home(home.path(), unrelated.to_str(), true).is_err());
+        let lookalike = home.path().join("elsewhere").join("models.json");
+        fs::create_dir_all(lookalike.parent().unwrap()).unwrap();
+        assert!(resolve_models_path_from_home(home.path(), lookalike.to_str(), true).is_err());
+    }
+
+    #[test]
+    fn models_editor_rejects_a_symbolic_managed_file_before_resolution() {
+        let home = tempfile::tempdir().expect("temporary home");
+        let managed = home.path().join(".prime").join("agent").join("models.json");
+        fs::create_dir_all(managed.parent().unwrap()).expect("create managed directory");
+        let target = home.path().join("outside.json");
+        fs::write(&target, br#"{"outside":true}"#).expect("write target");
+
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&target, &managed);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, &managed);
+        #[cfg(not(any(windows, unix)))]
+        let linked: std::io::Result<()> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlink test unsupported",
+        ));
+        if linked.is_err() {
+            // Some locked-down Windows environments disable symlink creation;
+            // the production check remains platform-independent.
+            return;
+        }
+
+        assert!(resolve_models_path_from_home(home.path(), None, false).is_err());
+        assert!(resolve_models_path_from_home(home.path(), managed.to_str(), false).is_err());
+        assert_eq!(
+            fs::read_to_string(target).expect("target remains readable"),
+            r#"{"outside":true}"#
+        );
     }
 
     #[test]
@@ -625,5 +883,23 @@ mod tests {
         assert!(second.saved);
         assert_eq!(second.snapshot.revision, 2);
         assert_eq!(second.snapshot.state, second_state);
+    }
+
+    #[test]
+    fn identical_app_state_save_is_an_idempotent_success() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("app-state.json");
+        let state = serde_json::json!({ "projects": [{ "id": "same" }] });
+
+        let first =
+            compare_and_save_app_state(&path, state.clone(), 0).expect("first save succeeds");
+        assert!(first.saved);
+        assert_eq!(first.snapshot.revision, 1);
+
+        let identical =
+            compare_and_save_app_state(&path, state, 1).expect("identical save succeeds");
+        assert!(identical.saved);
+        assert_eq!(identical.snapshot.revision, 1);
+        assert_eq!(load_app_state_from_path(&path).unwrap().revision, 1);
     }
 }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   ArrowRight,
@@ -40,7 +40,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { deleteMcpServer, inspectPrimeAgentConnections, openPrimeAgentTerminal, quickInstallPrimeAgent, readModelsJson, saveMcpServer, saveModelsJson } from "../lib/bridge";
+import { deleteMcpServer, inspectPrimeAgentConnections, openPrimeAgentTerminal, readModelsJson, saveMcpServer, saveModelsJson } from "../lib/bridge";
 import { useI18n } from "../i18n";
 import type { AppView, Conversation, McpAuthKind, McpScope, McpServerSummary, ModelInfo, PersistedAppState, PrimeAgentConnections, Project, RuntimeDetection } from "../types";
 import { Badge, Button, EmptyState, Modal, Switch } from "./Ui";
@@ -101,7 +101,7 @@ export function HomeView({ projects, conversations, detection, onView, onProject
 
       <section className="dashboard-section project-row-section">
         <SectionHeader title={t("projects.title")} subtitle={t("home.workspaces", { count: projects.length })} action={<button type="button" onClick={() => onView("projects")}>{t("home.manageProjects")} <ArrowRight size={14} /></button>} />
-        <div className="project-row">{projects.slice(0, 4).map((project) => { const count = visibleConversations.filter((conversation) => conversation.projectId === project.id).length; return <button type="button" key={project.id} onClick={() => onProject(project.id)}><span className="project-folder-visual" style={{ "--folder-accent": project.color } as React.CSSProperties}><Folder size={23} /></span><div><strong>{project.name}</strong><small>{t(count === 1 ? "home.conversation.one" : "home.conversation.other", { count })}</small><span>{shortPath(project.path)}</span></div>{project.pinned ? <Pin size={14} /> : null}</button>; })}<button type="button" className="add-project-tile" onClick={onOpenProject}><Plus size={22} /><strong>{t("home.addProject")}</strong><small>{t("home.addProjectHint")}</small></button></div>
+        <div className="project-row">{projects.slice(0, 4).map((project) => { const count = visibleConversations.filter((conversation) => conversation.projectId === project.id).length; return <button type="button" key={project.id} data-context-type="project" data-context-id={project.id} aria-haspopup="menu" onClick={() => onProject(project.id)}><span className="project-folder-visual" style={{ "--folder-accent": project.color } as React.CSSProperties}><Folder size={23} /></span><div><strong>{project.name}</strong><small>{t(count === 1 ? "home.conversation.one" : "home.conversation.other", { count })}</small><span>{shortPath(project.path)}</span></div>{project.pinned ? <Pin size={14} /> : null}</button>; })}<button type="button" className="add-project-tile" onClick={onOpenProject}><Plus size={22} /><strong>{t("home.addProject")}</strong><small>{t("home.addProjectHint")}</small></button></div>
       </section>
     </div>
   );
@@ -119,7 +119,7 @@ export function ProjectsView({ projects, conversations, onProject, onOpenProject
     <div className="page-scroll standard-page">
       <PageHeader eyebrow={t("projects.eyebrow")} title={t("projects.title")} description={t("projects.description")} actions={<Button variant="primary" onClick={onOpenProject}><FolderOpen size={16} />{t("home.openFolder")}</Button>} />
       <div className="page-tools"><div className="large-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t("projects.search")} /></div><div className="segmented"><button type="button" className={filter === "all" ? "is-active" : ""} onClick={() => setFilter("all")}>{t("projects.all")}</button><button type="button" className={filter === "pinned" ? "is-active" : ""} onClick={() => setFilter("pinned")}>{t("projects.pinned")}</button><button type="button" className={filter === "recent" ? "is-active" : ""} onClick={() => setFilter("recent")}>{t("projects.recent")}</button></div></div>
-      {filtered.length ? <div className="projects-grid">{filtered.map((project) => { const items = conversations.filter((conversation) => conversation.projectId === project.id && !conversation.archived && conversation.hasContent !== false); const active = items.filter((conversation) => ["streaming", "tool", "queued", "starting"].includes(conversation.status)).length; return <div key={project.id} className="project-card-shell"><button type="button" className="project-card" onClick={() => onProject(project.id)}><header><span className="large-project-icon" style={{ "--project-color": project.color } as React.CSSProperties}><Folder size={24} /></span><span className="project-card-badges">{project.pinned ? <Pin size={14} /> : null}{active ? <Badge tone="success">{t("projects.active", { count: active })}</Badge> : null}</span></header><h3>{project.name}</h3><p>{project.path}</p><div className="project-card-stats"><span><Bot size={14} />{t(items.length === 1 ? "home.conversation.one" : "home.conversation.other", { count: items.length })}</span><span><Clock3 size={14} />{relativeTime(project.lastOpenedAt, t)}</span></div><footer><span className="preset-dot" />{t(project.permissionPreset === "guarded" ? "projects.permission.guarded" : project.permissionPreset === "autonomous" ? "projects.permission.autonomous" : "projects.permission.standard")}<ChevronRight size={15} /></footer></button><button type="button" className="project-delete-button" aria-label={t("projects.deleteLabel", { name: project.name })} title={t("projects.deleteTitle")} onClick={() => onDeleteProject(project)}><Trash2 size={15} /></button></div>; })}<button type="button" className="project-card project-card-add" onClick={onOpenProject}><span><Plus size={28} /></span><h3>{t("home.addProject")}</h3><p>{t("projects.addText")}</p></button></div> : <EmptyState icon={<FolderOpen size={28} />} title={t("projects.empty")} description={search ? t("projects.emptySearch") : filter === "pinned" ? t("projects.emptyPinned") : t("projects.emptyDefault")}><Button variant="primary" onClick={onOpenProject}>{t("home.openFolder")}</Button></EmptyState>}
+      {filtered.length ? <div className="projects-grid">{filtered.map((project) => { const items = conversations.filter((conversation) => conversation.projectId === project.id && !conversation.archived && conversation.hasContent !== false); const active = items.filter((conversation) => ["streaming", "tool", "queued", "starting"].includes(conversation.status)).length; return <div key={project.id} className="project-card-shell" data-context-type="project" data-context-id={project.id}><button type="button" className="project-card" aria-haspopup="menu" onClick={() => onProject(project.id)}><header><span className="large-project-icon" style={{ "--project-color": project.color } as React.CSSProperties}><Folder size={24} /></span><span className="project-card-badges">{project.pinned ? <Pin size={14} /> : null}{active ? <Badge tone="success">{t("projects.active", { count: active })}</Badge> : null}</span></header><h3>{project.name}</h3><p>{project.path}</p><div className="project-card-stats"><span><Bot size={14} />{t(items.length === 1 ? "home.conversation.one" : "home.conversation.other", { count: items.length })}</span><span><Clock3 size={14} />{relativeTime(project.lastOpenedAt, t)}</span></div><footer><span className="preset-dot" />{t(project.permissionPreset === "guarded" ? "projects.permission.guarded" : project.permissionPreset === "autonomous" ? "projects.permission.autonomous" : "projects.permission.standard")}<ChevronRight size={15} /></footer></button><button type="button" className="project-delete-button" aria-label={t("projects.deleteLabel", { name: project.name })} title={t("projects.deleteTitle")} onClick={() => onDeleteProject(project)}><Trash2 size={15} /></button></div>; })}<button type="button" className="project-card project-card-add" onClick={onOpenProject}><span><Plus size={28} /></span><h3>{t("home.addProject")}</h3><p>{t("projects.addText")}</p></button></div> : <EmptyState icon={<FolderOpen size={28} />} title={t("projects.empty")} description={search ? t("projects.emptySearch") : filter === "pinned" ? t("projects.emptyPinned") : t("projects.emptyDefault")}><Button variant="primary" onClick={onOpenProject}>{t("home.openFolder")}</Button></EmptyState>}
     </div>
   );
 }
@@ -144,26 +144,40 @@ export function ConnectionsView({ models, projectPath, onOpenSetup }: { models: 
     for (const model of models) map.set(model.provider, [...(map.get(model.provider) ?? []), model]);
     return Array.from(map.entries());
   }, [models]);
-  const [connections, setConnections] = useState<PrimeAgentConnections>();
+  const [connectionSnapshot, setConnectionSnapshot] = useState<{ projectPath?: string; data: PrimeAgentConnections }>();
   const [loadingConnections, setLoadingConnections] = useState(true);
   const [notice, setNotice] = useState<{ tone: "success" | "error" | "info"; message: string }>();
   const [mcpEditor, setMcpEditor] = useState<McpEditorDraft>();
   const [mcpToDelete, setMcpToDelete] = useState<McpServerSummary>();
+  const refreshGeneration = useRef(0);
+  const activeProjectPath = useRef(projectPath);
+  activeProjectPath.current = projectPath;
+  const connections = connectionSnapshot && connectionSnapshot.projectPath === projectPath ? connectionSnapshot.data : undefined;
 
-  const refreshConnections = useCallback(async () => {
+  const refreshConnections = useCallback(async (requestedProjectPath?: string) => {
+    const generation = ++refreshGeneration.current;
     setLoadingConnections(true);
     try {
-      setConnections(await inspectPrimeAgentConnections(projectPath));
+      const data = await inspectPrimeAgentConnections(requestedProjectPath);
+      if (refreshGeneration.current !== generation) return;
+      setConnectionSnapshot({ projectPath: requestedProjectPath, data });
     } catch (error) {
+      if (refreshGeneration.current !== generation) return;
       setNotice({ tone: "error", message: t("connections.readFailed", { error: error instanceof Error ? error.message : String(error) }) });
     } finally {
-      setLoadingConnections(false);
+      if (refreshGeneration.current === generation) setLoadingConnections(false);
     }
-  }, [projectPath, t]);
+  }, [t]);
 
   useEffect(() => {
-    void refreshConnections();
-  }, [refreshConnections]);
+    setNotice(undefined);
+    setMcpEditor(undefined);
+    setMcpToDelete(undefined);
+    void refreshConnections(projectPath);
+    return () => {
+      refreshGeneration.current += 1;
+    };
+  }, [projectPath, refreshConnections]);
 
   const openOfficialSetup = async (command: string, label: string) => {
     if (!projectPath) {
@@ -180,30 +194,37 @@ export function ConnectionsView({ models, projectPath, onOpenSetup }: { models: 
   };
 
   const saveMcp = async (draft: McpEditorDraft) => {
+    const ownerProjectPath = projectPath;
     try {
-      await saveMcpServer(projectPath, draft.scope, {
+      await saveMcpServer(ownerProjectPath, draft.scope, {
         name: draft.name.trim(),
         url: draft.url.trim(),
         enabled: draft.enabled,
         authKind: draft.authKind,
         ...(draft.authKind === "bearer-env" ? { bearerTokenEnvVar: draft.bearerTokenEnvVar.trim() } : {}),
       });
+      if (activeProjectPath.current !== ownerProjectPath) return;
       setMcpEditor(undefined);
-      await refreshConnections();
+      await refreshConnections(ownerProjectPath);
+      if (activeProjectPath.current !== ownerProjectPath) return;
       setNotice({ tone: "success", message: t("connections.mcpSaved", { name: draft.name }) });
     } catch (error) {
+      if (activeProjectPath.current !== ownerProjectPath) return;
       setNotice({ tone: "error", message: t("connections.mcpRejected", { error: error instanceof Error ? error.message : String(error) }) });
-      throw error;
     }
   };
 
   const removeMcp = async (server: McpServerSummary) => {
+    const ownerProjectPath = projectPath;
     try {
-      await deleteMcpServer(projectPath, server.scope, server.name);
+      await deleteMcpServer(ownerProjectPath, server.scope, server.name);
+      if (activeProjectPath.current !== ownerProjectPath) return;
       setMcpToDelete(undefined);
-      await refreshConnections();
+      await refreshConnections(ownerProjectPath);
+      if (activeProjectPath.current !== ownerProjectPath) return;
       setNotice({ tone: "success", message: t(server.scope === "project" ? "connections.mcpRemovedProject" : "connections.mcpRemovedGlobal", { name: server.name }) });
     } catch (error) {
+      if (activeProjectPath.current !== ownerProjectPath) return;
       setNotice({ tone: "error", message: t("connections.mcpDeleteFailed", { error: error instanceof Error ? error.message : String(error) }) });
     }
   };
@@ -220,7 +241,7 @@ export function ConnectionsView({ models, projectPath, onOpenSetup }: { models: 
   const builtinMcp = (name: string) => connections?.mcpServers.find((server) => server.builtin && server.name.toLowerCase() === name);
   return (
     <div className="page-scroll standard-page connections-page">
-      <PageHeader eyebrow={t("connections.eyebrow")} title={t("connections.title")} description={t("connections.description")} actions={<><Button variant="ghost" loading={loadingConnections} onClick={() => void refreshConnections()}><RefreshCw size={15} />{t("common.refresh")}</Button><Button variant="secondary" onClick={() => onOpenSetup("provider")}><Settings2 size={16} />{t("connections.officialGuide")}</Button></>} />
+      <PageHeader eyebrow={t("connections.eyebrow")} title={t("connections.title")} description={t("connections.description")} actions={<><Button variant="ghost" loading={loadingConnections} onClick={() => void refreshConnections(projectPath)}><RefreshCw size={15} />{t("common.refresh")}</Button><Button variant="secondary" onClick={() => onOpenSetup("provider")}><Settings2 size={16} />{t("connections.officialGuide")}</Button></>} />
       {notice ? <div className={`connection-notice is-${notice.tone}`}><Info size={16} /><span>{notice.message}</span><button type="button" onClick={() => setNotice(undefined)} aria-label={t("connections.closeNotice")}><X size={14} /></button></div> : null}
       <section className="connections-section">
         <SectionHeader title={t("connections.providers")} subtitle={t("connections.providerSummary", { auth: providerIds.length, catalogs: providers.length })} />
@@ -238,7 +259,7 @@ export function ConnectionsView({ models, projectPath, onOpenSetup }: { models: 
         <div className="mcp-grid">
           <McpCard name="Linear" description="Issues, projects & cycles" color="#5e6ad2" status={builtinMcp("linear")?.enabled ? t("connections.oauthConfigured") : t("connections.oauthRequired")} connected={Boolean(builtinMcp("linear")?.enabled)} actionLabel={builtinMcp("linear")?.enabled ? t("common.manage") : t("common.connect")} onConfigure={() => void openOfficialSetup("/mcp login linear", `${t("common.configure")} Linear.`)} />
           <McpCard name="Notion" description="Pages, databases & search" color="#f4f4f2" status={builtinMcp("notion")?.enabled ? t("connections.oauthConfigured") : t("connections.oauthRequired")} connected={Boolean(builtinMcp("notion")?.enabled)} dark actionLabel={builtinMcp("notion")?.enabled ? t("common.manage") : t("common.connect")} onConfigure={() => void openOfficialSetup("/mcp login notion", `${t("common.configure")} Notion.`)} />
-          {customMcp.map((server) => { const editable = Boolean(server.url); return <article key={`${server.scope}:${server.name}`} className="mcp-card"><span className="mcp-logo custom-server-logo"><Server size={18} /></span><div><strong>{server.name}</strong><p>{server.url ?? t("connections.stdioReadonly")}</p><small><span className={`status-dot ${server.enabled ? "is-online" : ""}`} />{editable ? (server.enabled ? authKindLabel(server.authKind, t) : t("connections.disabled")) : t("connections.kernelUnsupported")} · {server.scope === "project" ? t("connections.projectScope") : t("connections.globalScope")}</small></div><div className="mcp-card-actions"><Button variant="ghost" disabled={!editable} title={editable ? t("common.edit") : t("connections.stdioEditDisabled")} onClick={() => setMcpEditor(mcpDraftFromServer(server))}>{t("common.edit")}</Button><button type="button" className="inline-danger" disabled={!editable} aria-label={t("projects.deleteLabel", { name: server.name })} title={editable ? t("common.delete") : t("connections.stdioKept")} onClick={() => setMcpToDelete(server)}><Trash2 size={14} /></button></div></article>; })}
+          {customMcp.map((server) => { const deletable = Boolean(server.url); const editable = deletable && !server.hasCustomHeaders; const status = !deletable ? t("connections.kernelUnsupported") : !server.enabled ? t("connections.disabled") : server.hasCustomHeaders ? t("connections.customHeaders") : authKindLabel(server.authKind, t); return <article key={`${server.scope}:${server.name}`} className="mcp-card"><span className="mcp-logo custom-server-logo"><Server size={18} /></span><div><strong>{server.name}</strong><p>{server.url ?? t("connections.stdioReadonly")}</p><small><span className={`status-dot ${server.enabled ? "is-online" : ""}`} />{status} · {server.scope === "project" ? t("connections.projectScope") : t("connections.globalScope")}</small></div><div className="mcp-card-actions"><Button variant="ghost" disabled={!editable} title={editable ? t("common.edit") : server.hasCustomHeaders ? t("connections.customHeadersReadonly") : t("connections.stdioEditDisabled")} onClick={() => setMcpEditor(mcpDraftFromServer(server))}>{t("common.edit")}</Button><button type="button" className="inline-danger" disabled={!deletable} aria-label={t("projects.deleteLabel", { name: server.name })} title={deletable ? t("common.delete") : t("connections.stdioKept")} onClick={() => setMcpToDelete(server)}><Trash2 size={14} /></button></div></article>; })}
           <button type="button" className="mcp-card mcp-custom" onClick={() => setMcpEditor(emptyMcpDraft(Boolean(projectPath)))}><span><Plus size={20} /></span><div><strong>{t("connections.customServer")}</strong><p>{t("connections.customServerText")}</p></div><ChevronRight size={16} /></button>
         </div>
         <p className="capability-note"><Info size={15} />{t("connections.capabilityNote")}</p>
@@ -272,11 +293,16 @@ function authKindLabel(kind: McpAuthKind, t: ReturnType<typeof useI18n>["t"]) {
   return kind === "oauth" ? "OAuth" : kind === "bearer-env" ? t("mcp.bearerVariable") : t("mcp.none");
 }
 
-function isValidMcpUrl(value: string) {
+function isValidMcpUrl(value: string, authKind: McpAuthKind) {
   if (!value || value.trim() !== value) return false;
   try {
     const parsed = new URL(value);
-    return ["http:", "https:"].includes(parsed.protocol) && Boolean(parsed.hostname) && !parsed.username && !parsed.password && !parsed.search && !parsed.hash;
+    if (!["http:", "https:"].includes(parsed.protocol) || !parsed.hostname || parsed.username || parsed.password || parsed.search || parsed.hash) return false;
+    if (parsed.protocol === "https:") return true;
+    const loopback = parsed.hostname === "localhost"
+      || parsed.hostname === "[::1]"
+      || /^127(?:\.\d{1,3}){3}$/.test(parsed.hostname);
+    return loopback && authKind === "none";
   } catch {
     return false;
   }
@@ -287,7 +313,7 @@ function McpEditorModal({ draft: initialDraft, projectAvailable, onClose, onSave
   const [draft, setDraft] = useState(initialDraft);
   const [saving, setSaving] = useState(false);
   const validName = /^[a-z][a-z0-9_]{0,63}$/.test(draft.name.trim()) && !["linear", "notion"].includes(draft.name.trim());
-  const validUrl = isValidMcpUrl(draft.url);
+  const validUrl = isValidMcpUrl(draft.url, draft.authKind);
   const validEnv = draft.authKind !== "bearer-env" || /^[A-Z_][A-Z0-9_]*$/.test(draft.bearerTokenEnvVar.trim());
   const valid = validName && validUrl && validEnv && (draft.scope !== "project" || projectAvailable);
   const save = async () => {
@@ -306,12 +332,13 @@ function Capability({ icon, title, description, status }: { icon: React.ReactNod
   return <article><span>{icon}</span><div><strong>{title}</strong><small>{description}</small></div><Badge tone="success">{status}</Badge></article>;
 }
 
-export function SettingsView({ state, setState, detection, installState, onRefreshDetection }: {
+export function SettingsView({ state, setState, detection, installState, onRefreshDetection, onInstall }: {
   state: PersistedAppState;
   setState: (updater: (current: PersistedAppState) => PersistedAppState) => void;
   detection?: RuntimeDetection;
-  installState: { running: boolean; phase?: string; lines: string[] };
+  installState: { running: boolean; outcome?: "success" | "error"; phase?: string; lines: string[] };
   onRefreshDetection: () => void;
+  onInstall: () => Promise<void>;
 }) {
   const { t } = useI18n();
   const [section, setSection] = useState<"general" | "appearance" | "agent" | "models" | "security" | "about">("general");
@@ -350,9 +377,9 @@ export function SettingsView({ state, setState, detection, installState, onRefre
   };
   return (
     <div className="settings-layout">
-      <aside className="settings-nav"><div><p className="eyebrow">{t("settings.eyebrow")}</p><h1>{t("settings.title")}</h1></div><nav>{settingsSections.map((item) => { const ItemIcon = item.icon; return <button key={item.id} type="button" className={section === item.id ? "is-active" : ""} onClick={() => setSection(item.id)}><ItemIcon size={16} />{item.label}</button>; })}</nav><footer><span className="mini-orbit"><span /></span><div><strong>Prime Orbit</strong><small>Version 0.1.9</small></div></footer></aside>
+      <aside className="settings-nav"><div><p className="eyebrow">{t("settings.eyebrow")}</p><h1>{t("settings.title")}</h1></div><nav>{settingsSections.map((item) => { const ItemIcon = item.icon; return <button key={item.id} type="button" className={section === item.id ? "is-active" : ""} onClick={() => setSection(item.id)}><ItemIcon size={16} />{item.label}</button>; })}</nav><footer><span className="mini-orbit"><span /></span><div><strong>Prime Orbit</strong><small>Version 0.1.10</small></div></footer></aside>
       <main className="settings-content">
-        {section === "general" ? <SettingsSection title={t("settings.general")} description={t("settings.generalDescription")}><SettingsGroup title={t("settings.startup")}><SettingRow title={t("settings.restore")} description={t("settings.restoreText")}><Switch checked={prefs.restoreLastWorkspace} onChange={(restoreLastWorkspace) => patchPreferences({ restoreLastWorkspace })} label={t("settings.restore")} /></SettingRow><SettingRow title={t("settings.language")} description={t("settings.languageText")}><select value={prefs.language} onChange={(event) => patchPreferences({ language: event.target.value as "fr" | "en" })}><option value="fr">Français</option><option value="en">English</option></select></SettingRow></SettingsGroup><SettingsGroup title={t("settings.newConversations")}><SettingRow title={t("settings.defaultReasoning")} description={t("settings.defaultReasoningText")}><select value={prefs.defaultThinking} onChange={(event) => patchPreferences({ defaultThinking: event.target.value as typeof prefs.defaultThinking })}><option value="low">{t("settings.light")}</option><option value="medium">{t("settings.balanced")}</option><option value="high">{t("settings.deep")}</option><option value="xhigh">{t("settings.veryDeep")}</option></select></SettingRow><SettingRow title={t("settings.defaultSupervision")} description={t("settings.defaultSupervisionText")}><select value={prefs.defaultPermissionPreset} onChange={(event) => patchPreferences({ defaultPermissionPreset: event.target.value as typeof prefs.defaultPermissionPreset })}><option value="guarded">{t("settings.strict")}</option><option value="standard">{t("settings.standard")}</option><option value="autonomous">{t("settings.autonomy")}</option></select></SettingRow></SettingsGroup><SettingsGroup title={t("settings.privacy")}><SettingRow title={t("settings.telemetry")} description={t("settings.telemetryText")}><Switch checked={prefs.telemetry} onChange={(telemetry) => patchPreferences({ telemetry })} label={t("settings.telemetry")} /></SettingRow></SettingsGroup></SettingsSection> : null}
+        {section === "general" ? <SettingsSection title={t("settings.general")} description={t("settings.generalDescription")}><SettingsGroup title={t("settings.startup")}><SettingRow title={t("settings.restore")} description={t("settings.restoreText")}><Switch checked={prefs.restoreLastWorkspace} onChange={(restoreLastWorkspace) => patchPreferences({ restoreLastWorkspace })} label={t("settings.restore")} /></SettingRow><SettingRow title={t("settings.language")} description={t("settings.languageText")}><select value={prefs.language} onChange={(event) => patchPreferences({ language: event.target.value as "fr" | "en" })}><option value="fr">Français</option><option value="en">English</option></select></SettingRow></SettingsGroup><SettingsGroup title={t("settings.newConversations")}><SettingRow title={t("settings.defaultReasoning")} description={t("settings.defaultReasoningText")}><select value={prefs.defaultThinking} onChange={(event) => patchPreferences({ defaultThinking: event.target.value as typeof prefs.defaultThinking })}><option value="low">{t("settings.light")}</option><option value="medium">{t("settings.balanced")}</option><option value="high">{t("settings.deep")}</option><option value="xhigh">{t("settings.veryDeep")}</option></select></SettingRow><SettingRow title={t("settings.defaultSupervision")} description={t("settings.defaultSupervisionText")}><select value={prefs.defaultPermissionPreset} onChange={(event) => patchPreferences({ defaultPermissionPreset: event.target.value as typeof prefs.defaultPermissionPreset })}><option value="guarded">{t("settings.strict")}</option><option value="standard">{t("settings.standard")}</option><option value="autonomous">{t("settings.autonomy")}</option></select></SettingRow></SettingsGroup></SettingsSection> : null}
         {section === "appearance" ? <SettingsSection title={t("settings.appearance")} description={t("settings.appearanceDescription")}><SettingsGroup title={t("settings.theme")}><div className="theme-picker">{(["dark", "light", "system"] as const).map((theme) => <button key={theme} type="button" className={prefs.theme === theme ? "is-active" : ""} onClick={() => patchPreferences({ theme })}><span className={`theme-preview theme-${theme}`}><i /><i /><i /></span><strong>{theme === "dark" ? t("settings.dark") : theme === "light" ? t("settings.lightTheme") : t("settings.system")}</strong>{prefs.theme === theme ? <Check size={15} /> : null}</button>)}</div></SettingsGroup><SettingsGroup title={t("settings.interface")}><SettingRow title={t("settings.compactSidebar")} description={t("settings.compactSidebarText")}><Switch checked={prefs.compactSidebar} onChange={(compactSidebar) => patchPreferences({ compactSidebar })} label={t("settings.compactSidebar")} /></SettingRow><SettingRow title={t("settings.reduceMotion")} description={t("settings.reduceMotionText")}><Switch checked={prefs.reduceMotion} onChange={(reduceMotion) => patchPreferences({ reduceMotion })} label={t("settings.reduceMotion")} /></SettingRow></SettingsGroup></SettingsSection> : null}
         {section === "agent" ? <SettingsSection title="Prime Agent" description={t("settings.agentDescription")}>
           <div className={`runtime-hero ${detection?.installed ? "is-ready" : runtimeBroken ? "is-broken" : "is-missing"}`}>
@@ -364,24 +391,24 @@ export function SettingsView({ state, setState, detection, installState, onRefre
             </div>
             <div>
               <Button variant="secondary" onClick={onRefreshDetection}><RefreshCw size={15} />{t("settings.recheck")}</Button>
-              <Button variant="primary" loading={installState.running} onClick={() => void quickInstallPrimeAgent()}><Download size={15} />{t("settings.managedInstall")}</Button>
+              <Button variant="primary" loading={installState.running} onClick={() => void onInstall()}><Download size={15} />{t("settings.managedInstall")}</Button>
             </div>
           </div>
           {runtimeBroken ? <div className="runtime-diagnostic" role="alert"><ShieldAlert size={17} /><pre>{detection?.error}</pre></div> : null}
-          {installState.running || installState.lines.length ? <div className="install-progress"><header><span><LoaderCircle size={15} className={installState.running ? "spin" : ""} />{installState.phase ?? t("settings.installation")}</span><small>{installState.running ? t("common.running") : t("common.complete")}</small></header><pre>{installState.lines.slice(-18).join("\n")}</pre></div> : null}
+          {installState.running || installState.lines.length ? <div className="install-progress"><header><span><LoaderCircle size={15} className={installState.running ? "spin" : ""} />{installState.phase ?? t("settings.installation")}</span><small>{installState.running ? t("common.running") : installState.outcome === "error" ? t("common.failed") : t("common.complete")}</small></header><pre>{installState.lines.slice(-18).join("\n")}</pre></div> : null}
           <SettingsGroup title={t("settings.prerequisites")}>{(detection?.prerequisites ?? []).map((item) => <SettingRow key={item.name} title={item.name} description={item.path ?? t("common.systemComponent")}><Badge tone={item.found ? "success" : "danger"}>{item.found ? item.version ?? t("common.detected") : t("common.missing")}</Badge></SettingRow>)}</SettingsGroup>
           <div className="warning-card"><ShieldAlert size={19} /><div><strong>{t("settings.notSandbox")}</strong><p>{t("settings.notSandboxText")}</p></div></div>
         </SettingsSection> : null}
-        {section === "models" ? <SettingsSection title={t("settings.models")} description={t("settings.modelsDescription")}><div className="settings-callout"><FileJson2 size={22} /><div><h3>{t("settings.customCatalog")}</h3><p>{t("settings.customCatalogText")}</p></div><Button variant="secondary" onClick={() => void openModels()}><FileJson2 size={15} />{t("settings.openEditor")}</Button></div><SettingsGroup title={t("settings.displayRules")}><SettingRow title={t("settings.checkVision")} description={t("settings.checkVisionText")}><Switch checked onChange={() => undefined} label={t("settings.checkVision")} /></SettingRow><SettingRow title={t("settings.technicalIds")} description={t("settings.technicalIdsText")}><Switch checked={false} onChange={() => undefined} label={t("settings.technicalIds")} /></SettingRow></SettingsGroup></SettingsSection> : null}
-        {section === "security" ? <SettingsSection title={t("settings.security")} description={t("settings.securityDescription")}><div className="security-principles"><SecurityPrinciple icon={<Folder size={18} />} title={t("settings.visibleFolder")} text={t("settings.visibleFolderText")} /><SecurityPrinciple icon={<Terminal size={18} />} title={t("settings.inspectableCommands")} text={t("settings.inspectableCommandsText")} /><SecurityPrinciple icon={<ShieldAlert size={18} />} title={t("settings.noImplicitIsolation")} text={t("settings.noImplicitIsolationText")} /></div><SettingsGroup title={t("settings.protection")}><SettingRow title={t("settings.confirmInstall")} description={t("settings.confirmInstallText")}><Switch checked onChange={() => undefined} label={t("settings.confirmInstall")} /></SettingRow><SettingRow title={t("settings.hideSecrets")} description={t("settings.hideSecretsText")}><Switch checked onChange={() => undefined} label={t("settings.hideSecrets")} /></SettingRow></SettingsGroup><div className="warning-card"><Info size={19} /><div><strong>{t("settings.realIsolation")}</strong><p>{t("settings.realIsolationText")}</p></div></div></SettingsSection> : null}
-        {section === "about" ? <SettingsSection title={t("settings.about")} description={t("settings.aboutDescription")}><div className="about-card"><span className="about-orbit"><span /></span><h2>Prime Orbit</h2><p>{t("settings.aboutText")}</p><Badge tone="accent">Version 0.1.9 · Preview</Badge><div><a href="https://github.com/PrimeIntellect-ai/prime-agent" target="_blank" rel="noreferrer"><Code2 size={15} />Prime Agent<ExternalLink size={12} /></a><a href="https://github.com/PrimeIntellect-ai/prime-agent/blob/main/LICENSE" target="_blank" rel="noreferrer"><Globe2 size={15} />{t("settings.licenses")}<ExternalLink size={12} /></a></div></div></SettingsSection> : null}
+        {section === "models" ? <SettingsSection title={t("settings.models")} description={t("settings.modelsDescription")}><div className="settings-callout"><FileJson2 size={22} /><div><h3>{t("settings.customCatalog")}</h3><p>{t("settings.customCatalogText")}</p></div><Button variant="secondary" onClick={() => void openModels()}><FileJson2 size={15} />{t("settings.openEditor")}</Button></div></SettingsSection> : null}
+        {section === "security" ? <SettingsSection title={t("settings.security")} description={t("settings.securityDescription")}><div className="security-principles"><SecurityPrinciple icon={<Folder size={18} />} title={t("settings.visibleFolder")} text={t("settings.visibleFolderText")} /><SecurityPrinciple icon={<Terminal size={18} />} title={t("settings.inspectableCommands")} text={t("settings.inspectableCommandsText")} /><SecurityPrinciple icon={<ShieldAlert size={18} />} title={t("settings.noImplicitIsolation")} text={t("settings.noImplicitIsolationText")} /></div><div className="warning-card"><Info size={19} /><div><strong>{t("settings.realIsolation")}</strong><p>{t("settings.realIsolationText")}</p></div></div></SettingsSection> : null}
+        {section === "about" ? <SettingsSection title={t("settings.about")} description={t("settings.aboutDescription")}><div className="about-card"><span className="about-orbit"><span /></span><h2>Prime Orbit</h2><p>{t("settings.aboutText")}</p><Badge tone="accent">Version 0.1.10 · Preview</Badge><div><a href="https://github.com/PrimeIntellect-ai/prime-agent" target="_blank" rel="noreferrer"><Code2 size={15} />Prime Agent<ExternalLink size={12} /></a><a href="https://github.com/PrimeIntellect-ai/prime-agent/blob/main/LICENSE" target="_blank" rel="noreferrer"><Globe2 size={15} />{t("settings.licenses")}<ExternalLink size={12} /></a></div></div></SettingsSection> : null}
       </main>
       {modelsEditor ? <Modal title={t("settings.modelCatalog")} description={modelsEditor.path} width="820px" onClose={() => setModelsEditor(undefined)} footer={<><span className={`editor-status is-${modelSaveState}`}>{modelSaveState === "error" ? t("settings.invalidJson") : modelSaveState === "saved" ? t("settings.saved") : t("settings.backupNotice")}</span><Button variant="secondary" onClick={() => setModelsEditor(undefined)}>{t("common.cancel")}</Button><Button variant="primary" loading={modelSaveState === "saving"} onClick={() => void saveModels()}>{t("settings.validateSave")}</Button></>}><textarea className="json-editor" value={modelsEditor.content} spellCheck={false} onChange={(event) => { setModelsEditor({ ...modelsEditor, content: event.target.value }); setModelSaveState("idle"); }} /></Modal> : null}
     </div>
   );
 }
 
-export function Onboarding({ detection, installState, onInstall, onUseExisting, onContinue }: { detection?: RuntimeDetection; installState: { running: boolean; phase?: string; lines: string[] }; onInstall: () => void; onUseExisting: () => void; onContinue: () => void }) {
+export function Onboarding({ detection, installState, onInstall, onUseExisting, onContinue }: { detection?: RuntimeDetection; installState: { running: boolean; outcome?: "success" | "error"; phase?: string; lines: string[] }; onInstall: () => void; onUseExisting: () => void; onContinue: () => void }) {
   const { t } = useI18n();
   const runtimeBroken = Boolean(detection && !detection.installed && detection.error);
   return (

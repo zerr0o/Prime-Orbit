@@ -24,8 +24,8 @@ export interface Attachment {
   path?: string;
   mimeType: string;
   size: number;
-  dataBase64?: string;
-  previewUrl?: string;
+  /** Ephemeral, owner-scoped native cache key. Never persisted after submit. */
+  attachmentHandle?: string;
   isImage: boolean;
 }
 
@@ -45,7 +45,7 @@ export interface ChatMessage {
   role: "user" | "assistant" | "system";
   content: string;
   createdAt: string;
-  status?: "streaming" | "complete" | "error";
+  status?: "pending" | "streaming" | "complete" | "error";
   attachments?: Attachment[];
   tools?: ToolActivity[];
   model?: string;
@@ -211,6 +211,8 @@ export interface McpServerSummary {
   enabled: boolean;
   scope: McpScope;
   authKind: McpAuthKind;
+  /** True when opaque HTTP headers exist in settings.json; their names and values never leave Rust. */
+  hasCustomHeaders: boolean;
   builtin: boolean;
 }
 
@@ -249,6 +251,12 @@ export interface ExtensionUiRequest extends RpcEnvelope {
   notifyType?: "info" | "warning" | "error";
 }
 
+export interface PendingExtensionUiRequest extends ExtensionUiRequest {
+  conversationId: string;
+  /** Stable identity across conversations, used to queue and key the modal. */
+  requestKey: string;
+}
+
 export interface NativeEventPayload {
   conversationId: string;
   line: string;
@@ -277,13 +285,12 @@ export interface InstallProgressPayload {
 }
 
 export interface AttachmentReadResult {
-  path: string;
+  path?: string;
   name: string;
   mimeType: string;
-  dataBase64: string;
+  attachmentHandle?: string;
   size: number;
   isImage: boolean;
-  textPreview?: string;
 }
 
 export interface GitChange {

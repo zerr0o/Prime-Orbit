@@ -1,6 +1,7 @@
 #[cfg(windows)]
 use crate::runtime::LaunchSpec;
 use crate::{
+    files::{hydrate_prompt_images, AttachmentCache},
     paths::canonicalize,
     runtime::{detect_internal, now_millis},
     session_lease::reclaim_stale_session_lease,
@@ -45,6 +46,7 @@ struct RunningAgent {
     stdin: Arc<Mutex<ChildStdin>>,
     exit_emitted: Arc<AtomicBool>,
     owners: HashSet<String>,
+    interactive_owner: Option<String>,
     busy: bool,
     release_when_idle: bool,
 }
@@ -216,6 +218,57 @@ fn emit_line(app: &AppHandle, event_name: &str, conversation_id: &str, line: Str
     );
 }
 
+fn is_extension_ui_request(record: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(record)
+        .ok()
+        .and_then(|event| {
+            event
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some("extension_ui_request")
+}
+
+fn extension_request_target(
+    agents: &AgentsState,
+    conversation_id: &str,
+    record: &[u8],
+) -> Option<Option<String>> {
+    is_extension_ui_request(record).then(|| {
+        agents
+            .0
+            .lock()
+            .get(conversation_id)
+            .and_then(|agent| agent.interactive_owner.clone())
+    })
+}
+
+fn emit_runtime_line(
+    app: &AppHandle,
+    event_name: &str,
+    conversation_id: &str,
+    line: String,
+    target: Option<Option<String>>,
+) {
+    let event = AgentLineEvent {
+        conversation_id: conversation_id.to_string(),
+        line,
+    };
+    match target {
+        Some(Some(owner)) => {
+            let _ = app.emit_to(owner, event_name, event);
+        }
+        // An interactive request without a surviving owner must not be
+        // broadcast to unrelated windows, where it could be answered twice.
+        Some(None) => {}
+        None => {
+            let _ = app.emit(event_name, event);
+        }
+    }
+}
+
 fn append_diagnostic_tail(target: &Mutex<String>, line: &str) {
     let mut target = target.lock();
     if !target.is_empty() {
@@ -261,7 +314,10 @@ fn stream_records<R: Read>(
                 if let Some(diagnostic_tail) = diagnostic_tail.as_ref() {
                     append_diagnostic_tail(diagnostic_tail, &line);
                 }
-                emit_line(&app, event_name, &conversation_id, line);
+                let target = agents
+                    .as_ref()
+                    .and_then(|agents| extension_request_target(agents, &conversation_id, &record));
+                emit_runtime_line(&app, event_name, &conversation_id, line, target);
             }
             Err(error) => {
                 let line = format!("Erreur de lecture du processus Prime Agent: {error}");
@@ -364,6 +420,7 @@ fn schedule_idle_release(agents: AgentsState, conversation_id: String, pid: u32)
 }
 
 fn acquire_owner(agent: &mut RunningAgent, owner: String) {
+    agent.interactive_owner = Some(owner.clone());
     acquire_owner_lease(&mut agent.owners, &mut agent.release_when_idle, owner);
 }
 
@@ -616,7 +673,8 @@ fn start_agent_blocking(
             child: Arc::clone(&child),
             stdin: Arc::new(Mutex::new(stdin)),
             exit_emitted: Arc::clone(&exit_emitted),
-            owners: HashSet::from([owner]),
+            owners: HashSet::from([owner.clone()]),
+            interactive_owner: Some(owner),
             // A resumed daemon session may already be working. Treat startup
             // as busy until get_state proves otherwise, so a fast navigation
             // cannot accidentally terminate live work.
@@ -702,8 +760,15 @@ fn release_agent_blocking(
     let conversation_id = validated_identifier(conversation_id)?;
     let release_candidate = {
         let mut map = agents.0.lock();
-        map.get_mut(&conversation_id)
-            .and_then(|agent| release_owner_lease(agent, &owner).then_some(agent.info.pid))
+        map.get_mut(&conversation_id).and_then(|agent| {
+            let release = release_owner_lease(agent, &owner);
+            if agent.interactive_owner.as_deref() == Some(owner.as_str())
+                && !agent.owners.is_empty()
+            {
+                agent.interactive_owner = agent.owners.iter().min().cloned();
+            }
+            release.then_some(agent.info.pid)
+        })
     };
     if let Some(pid) = release_candidate {
         schedule_idle_release(agents, conversation_id, pid);
@@ -717,7 +782,11 @@ fn release_owner_blocking(agents: AgentsState, owner: &str) {
         let mut map = agents.0.lock();
         map.iter_mut()
             .filter_map(|(conversation_id, agent)| {
-                release_owner_lease(agent, owner).then(|| (conversation_id.clone(), agent.info.pid))
+                let release = release_owner_lease(agent, owner);
+                if agent.interactive_owner.as_deref() == Some(owner) {
+                    agent.interactive_owner = agent.owners.iter().min().cloned();
+                }
+                release.then(|| (conversation_id.clone(), agent.info.pid))
             })
             .collect::<Vec<_>>()
     };
@@ -726,15 +795,52 @@ fn release_owner_blocking(agents: AgentsState, owner: &str) {
     }
 }
 
+fn owner_may_send(
+    owners: &HashSet<String>,
+    interactive_owner: Option<&str>,
+    owner: &str,
+    payload_type: Option<&str>,
+) -> bool {
+    owners.contains(owner)
+        || (payload_type == Some("extension_ui_response") && interactive_owner == Some(owner))
+}
+
 fn send_rpc_blocking(
     agents: AgentsState,
+    attachments: AttachmentCache,
+    owner: String,
     conversation_id: String,
-    payload: Value,
+    mut payload: Value,
 ) -> Result<(), String> {
     let conversation_id = validated_identifier(conversation_id)?;
     if !payload.is_object() {
         return Err("Le payload RPC doit être un objet JSON".to_string());
     }
+    let payload_type = payload.get("type").and_then(Value::as_str);
+    let stdin = {
+        let mut map = agents.0.lock();
+        let agent = map
+            .get_mut(&conversation_id)
+            .ok_or_else(|| format!("Aucun Prime Agent actif pour {conversation_id}"))?;
+        if !owner_may_send(
+            &agent.owners,
+            agent.interactive_owner.as_deref(),
+            &owner,
+            payload_type,
+        ) {
+            return Err(
+                "Cette fenêtre ne possède pas la conversation Prime Agent demandée.".to_string(),
+            );
+        }
+        if agent.owners.contains(&owner) {
+            agent.interactive_owner = Some(owner.clone());
+        }
+        Arc::clone(&agent.stdin)
+    };
+    // Image handles are owner-scoped and expanded only in native memory at
+    // the last possible moment. Dropping the reservation on any serialization
+    // or write error makes the same handles available for an explicit retry.
+    let image_reservation = hydrate_prompt_images(attachments, &owner, &mut payload)?;
     let mut bytes = serde_json::to_vec(&payload)
         .map_err(|error| format!("Impossible de sérialiser le payload RPC: {error}"))?;
     if bytes.len() > MAX_RPC_BYTES {
@@ -745,17 +851,17 @@ fn send_rpc_blocking(
     }
     bytes.push(b'\n');
 
-    let stdin = {
-        let map = agents.0.lock();
-        map.get(&conversation_id)
-            .map(|agent| Arc::clone(&agent.stdin))
-            .ok_or_else(|| format!("Aucun Prime Agent actif pour {conversation_id}"))?
-    };
     let mut stdin = stdin.lock();
-    stdin
+    let write_result = stdin
         .write_all(&bytes)
         .and_then(|_| stdin.flush())
-        .map_err(|error| format!("Impossible d’envoyer la commande RPC: {error}"))
+        .map_err(|error| format!("Impossible d’envoyer la commande RPC: {error}"));
+    if write_result.is_ok() {
+        if let Some(reservation) = image_reservation {
+            reservation.commit();
+        }
+    }
+    write_result
 }
 
 fn stop_agent_blocking(
@@ -828,12 +934,19 @@ pub async fn release_agent(
 
 #[tauri::command(rename_all = "camelCase")]
 pub async fn send_rpc(
+    window: tauri::WebviewWindow,
     agents: tauri::State<'_, AgentsState>,
+    attachments: tauri::State<'_, AttachmentCache>,
     conversation_id: String,
     payload: Value,
 ) -> Result<(), String> {
     let agents = AgentsState(Arc::clone(&agents.0));
-    crate::run_blocking(move || send_rpc_blocking(agents, conversation_id, payload)).await
+    let attachments = attachments.inner().clone();
+    let owner = window.label().to_string();
+    crate::run_blocking(move || {
+        send_rpc_blocking(agents, attachments, owner, conversation_id, payload)
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -870,8 +983,8 @@ pub fn release_window_agents(agents: AgentsState, owner: String) {
 mod tests {
     use super::{
         acquire_owner_lease, append_diagnostic_tail, conflicting_session_conversation,
-        release_owner_lease_state, runtime_busy_state, runtime_session_path, RunningAgentInfo,
-        MAX_EXIT_DIAGNOSTIC_BYTES,
+        is_extension_ui_request, owner_may_send, release_owner_lease_state, runtime_busy_state,
+        runtime_session_path, RunningAgentInfo, MAX_EXIT_DIAGNOSTIC_BYTES,
     };
     use parking_lot::Mutex;
     use std::{collections::HashSet, path::Path};
@@ -932,6 +1045,37 @@ mod tests {
         );
         assert_eq!(owners, HashSet::from(["workspace-2".to_string()]));
         assert!(!release_when_idle);
+    }
+
+    #[test]
+    fn interactive_requests_are_recognized_before_window_routing() {
+        assert!(is_extension_ui_request(
+            br#"{"type":"extension_ui_request","id":"request-1","method":"confirm"}"#
+        ));
+        assert!(!is_extension_ui_request(br#"{"type":"agent_start"}"#));
+    }
+
+    #[test]
+    fn only_an_owner_or_the_interactive_responder_can_write_rpc() {
+        let owners = HashSet::from(["workspace-2".to_string()]);
+        assert!(owner_may_send(
+            &owners,
+            Some("workspace-2"),
+            "workspace-2",
+            Some("prompt"),
+        ));
+        assert!(!owner_may_send(
+            &owners,
+            Some("main"),
+            "main",
+            Some("prompt"),
+        ));
+        assert!(owner_may_send(
+            &owners,
+            Some("main"),
+            "main",
+            Some("extension_ui_response"),
+        ));
     }
 
     #[test]

@@ -10,17 +10,38 @@ use serde_json::{Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
-    fmt, fs,
-    io::Read,
+    fmt,
+    fs::{self, OpenOptions},
+    io::{Read, Write},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
-use url::Url;
+use url::{Host, Url};
+
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE, STILL_ACTIVE},
+    Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    },
+    System::Threading::{
+        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    },
+};
 
 const MAX_SETTINGS_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_AUTH_BYTES: u64 = 4 * 1024 * 1024;
+const SETTINGS_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
+static SETTINGS_LOCK_RECLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
+static PROCESS_START_FALLBACK: OnceLock<String> = OnceLock::new();
 const BUILTIN_SERVERS: [(&str, &str); 2] = [
     ("linear", "https://mcp.linear.app/mcp"),
     ("notion", "https://mcp.notion.com/mcp"),
@@ -50,6 +71,7 @@ pub struct PublicMcpServer {
     pub enabled: bool,
     pub scope: McpScope,
     pub auth_kind: McpAuthKind,
+    pub has_custom_headers: bool,
     pub builtin: bool,
 }
 
@@ -143,7 +165,7 @@ fn validate_env_var_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_http_url(value: &str) -> Result<(), String> {
+fn validate_http_url(value: &str) -> Result<Url, String> {
     if value.trim() != value || value.is_empty() {
         return Err("L’URL MCP ne peut pas être vide ni contenir d’espaces en bordure".to_string());
     }
@@ -169,7 +191,16 @@ fn validate_http_url(value: &str) -> Result<(), String> {
                 .to_string(),
         );
     }
-    Ok(())
+    Ok(parsed)
+}
+
+fn is_loopback_url(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
 }
 
 /// Existing settings may predate Prime Orbit's validation. Keep the endpoint
@@ -200,7 +231,21 @@ fn safe_public_http_url(value: &str, name: &str) -> Result<String, String> {
 fn validate_save_input(input: &SaveMcpServerInput) -> Result<(), String> {
     validate_server_name(&input.name)?;
     reject_builtin_mutation(&input.name)?;
-    validate_http_url(&input.url)?;
+    let url = validate_http_url(&input.url)?;
+    if url.scheme() == "http" {
+        if !is_loopback_url(&url) {
+            return Err(
+                "Une URL MCP en HTTP clair n’est autorisée que vers localhost ou une adresse IP loopback"
+                    .to_string(),
+            );
+        }
+        if input.auth_kind != McpAuthKind::None {
+            return Err(
+                "OAuth et bearer sont interdits sur HTTP, même en loopback; utilisez HTTPS ou aucune authentification"
+                    .to_string(),
+            );
+        }
+    }
     match input.auth_kind {
         McpAuthKind::BearerEnv => {
             let env_name = input.bearer_token_env_var.as_deref().ok_or_else(|| {
@@ -487,6 +532,43 @@ fn auth_kind(config: &Map<String, Value>, name: &str) -> Result<McpAuthKind, Str
     })
 }
 
+fn same_http_origin(left: &str, right: &str, name: &str) -> Result<bool, String> {
+    let parse = |value: &str| {
+        Url::parse(value).map_err(|error| format!("URL invalide pour mcpServers.{name}: {error}"))
+    };
+    let left = parse(left)?;
+    let right = parse(right)?;
+    Ok(left.scheme() == right.scheme()
+        && left.host_str().map(str::to_ascii_lowercase)
+            == right.host_str().map(str::to_ascii_lowercase)
+        && left.port_or_known_default() == right.port_or_known_default())
+}
+
+fn validate_custom_headers_update(
+    name: &str,
+    config: &Map<String, Value>,
+    server: &SaveMcpServerInput,
+) -> Result<(), String> {
+    if !config.contains_key("headers") {
+        return Ok(());
+    }
+    let current_url = config
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("mcpServers.{name}.url doit être une chaîne"))?;
+    if !same_http_origin(current_url, &server.url, name)? {
+        return Err(format!(
+            "mcpServers.{name} contient des en-têtes configurés hors de Prime Orbit ; son origine ne peut pas être modifiée depuis l’interface"
+        ));
+    }
+    if auth_kind(config, name)? != server.auth_kind {
+        return Err(format!(
+            "mcpServers.{name} contient des en-têtes configurés hors de Prime Orbit ; son authentification ne peut pas être modifiée depuis l’interface"
+        ));
+    }
+    Ok(())
+}
+
 fn public_server(name: &str, config: &Value, scope: McpScope) -> Result<PublicMcpServer, String> {
     let config = config
         .as_object()
@@ -514,6 +596,7 @@ fn public_server(name: &str, config: &Value, scope: McpScope) -> Result<PublicMc
         enabled: server_enabled(config, name)?,
         scope,
         auth_kind: auth_kind(config, name)?,
+        has_custom_headers: config.contains_key("headers"),
         builtin: is_builtin(name),
     })
 }
@@ -551,6 +634,7 @@ fn inspect_documents(
                 enabled: auth_set.contains(format!("mcp:{name}").as_str()),
                 scope: McpScope::Global,
                 auth_kind: McpAuthKind::OAuth,
+                has_custom_headers: false,
                 builtin: true,
             },
         );
@@ -598,6 +682,471 @@ fn write_backup(path: &Path, raw: Option<&[u8]>) -> Result<Option<PathBuf>, Stri
 
 struct CompatibleSettingsLock {
     path: PathBuf,
+    fingerprint: LockFingerprint,
+    owner_path: PathBuf,
+    owner: LockOwner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LockFingerprint {
+    modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+    identity: Option<String>,
+}
+
+impl LockFingerprint {
+    fn read(path: &Path) -> Result<Self, String> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| format!("Impossible d’inspecter {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!(
+                "Le verrou {} doit être un dossier régulier non symbolique",
+                path.display()
+            ));
+        }
+        Ok(Self {
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            identity: lock_file_identity(path, &metadata),
+        })
+    }
+
+    fn is_stale_at(&self, now: SystemTime, stale_after: Duration) -> bool {
+        self.modified
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= stale_after)
+    }
+
+    fn stable_id(&self) -> String {
+        fn nanos(value: Option<SystemTime>) -> u128 {
+            value
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_nanos())
+        }
+        format!(
+            "{}:{}:{}",
+            self.identity.as_deref().unwrap_or("unknown"),
+            nanos(self.created),
+            nanos(self.modified)
+        )
+    }
+}
+
+#[cfg(windows)]
+fn lock_file_identity(path: &Path, _metadata: &fs::Metadata) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: `wide` is NUL-terminated, the output structure is valid, and
+    // the directory handle is closed on every path after a successful open.
+    unsafe {
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut information: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        let read = GetFileInformationByHandle(handle, &mut information) != 0;
+        let _ = CloseHandle(handle);
+        if !read {
+            return None;
+        }
+        let index = ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64;
+        Some(format!(
+            "windows-{}-{index}",
+            information.dwVolumeSerialNumber
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn lock_file_identity(_path: &Path, metadata: &fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(format!("unix-{}-{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(all(not(windows), not(unix)))]
+fn lock_file_identity(_path: &Path, _metadata: &fs::Metadata) -> Option<String> {
+    None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LockOwner {
+    pid: u32,
+    process_start_id: String,
+    acquired_at_millis: u128,
+    lock_id: String,
+    token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProcessProbe {
+    Running(String),
+    Dead,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessLiveness {
+    Alive,
+    Dead,
+    Unknown,
+}
+
+fn current_process_start_id() -> String {
+    match process_probe(std::process::id()) {
+        ProcessProbe::Running(start_id) => start_id,
+        ProcessProbe::Dead | ProcessProbe::Unknown => PROCESS_START_FALLBACK
+            .get_or_init(|| {
+                format!(
+                    "fallback-{}-{}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                )
+            })
+            .clone(),
+    }
+}
+
+#[cfg(windows)]
+fn process_probe(pid: u32) -> ProcessProbe {
+    // SAFETY: the process handle is checked before use, all FILETIME pointers
+    // are valid for the duration of the calls, and the handle is always closed.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // ERROR_INVALID_PARAMETER is the documented result for a PID that
+            // does not exist. Access denied and every other failure are not
+            // proof of death: another instance may simply run elevated.
+            return if std::io::Error::last_os_error().raw_os_error() == Some(87) {
+                ProcessProbe::Dead
+            } else {
+                ProcessProbe::Unknown
+            };
+        }
+        let empty_time = || FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut creation = empty_time();
+        let mut exit = empty_time();
+        let mut kernel = empty_time();
+        let mut user = empty_time();
+        let mut exit_code = 0u32;
+        let exit_code_read = GetExitCodeProcess(handle, &mut exit_code) != 0;
+        let times_read =
+            GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) != 0;
+        let _ = CloseHandle(handle);
+        if !exit_code_read {
+            return ProcessProbe::Unknown;
+        }
+        if exit_code != STILL_ACTIVE as u32 {
+            return ProcessProbe::Dead;
+        }
+        if !times_read {
+            return ProcessProbe::Unknown;
+        }
+        let ticks = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
+        ProcessProbe::Running(format!("windows-filetime-{ticks}"))
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_probe(pid: u32) -> ProcessProbe {
+    if pid == std::process::id() {
+        ProcessProbe::Running(current_process_fallback_without_recursion())
+    } else {
+        // std does not expose a portable Unix process identity probe. Treat an
+        // unobservable foreign PID as unknown rather than risking two writers.
+        ProcessProbe::Unknown
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_probe(pid: u32) -> ProcessProbe {
+    if !Path::new("/proc").is_dir() {
+        return ProcessProbe::Unknown;
+    }
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ProcessProbe::Dead;
+        }
+        Err(_) => return ProcessProbe::Unknown,
+    };
+    let Some((_, fields)) = stat.rsplit_once(')') else {
+        return ProcessProbe::Unknown;
+    };
+    let Some(start_ticks) = fields.split_whitespace().nth(19) else {
+        return ProcessProbe::Unknown;
+    };
+    ProcessProbe::Running(format!("linux-start-ticks-{start_ticks}"))
+}
+
+#[cfg(all(not(windows), not(unix)))]
+fn process_probe(pid: u32) -> ProcessProbe {
+    if pid == std::process::id() {
+        ProcessProbe::Running(current_process_fallback_without_recursion())
+    } else {
+        ProcessProbe::Unknown
+    }
+}
+
+#[cfg(any(all(unix, not(target_os = "linux")), all(not(windows), not(unix))))]
+fn current_process_fallback_without_recursion() -> String {
+    PROCESS_START_FALLBACK
+        .get_or_init(|| {
+            format!(
+                "fallback-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            )
+        })
+        .clone()
+}
+
+fn owner_liveness_from_probe(owner: &LockOwner, probe: ProcessProbe) -> ProcessLiveness {
+    match probe {
+        ProcessProbe::Running(start_id) if start_id == owner.process_start_id => {
+            ProcessLiveness::Alive
+        }
+        // A running process with a different start identity proves that the
+        // recorded process exited and its PID has since been reused.
+        ProcessProbe::Running(_) | ProcessProbe::Dead => ProcessLiveness::Dead,
+        ProcessProbe::Unknown => ProcessLiveness::Unknown,
+    }
+}
+
+fn owner_process_liveness(owner: &LockOwner) -> ProcessLiveness {
+    owner_liveness_from_probe(owner, process_probe(owner.pid))
+}
+
+fn owner_file_prefix(lock_path: &Path) -> Result<String, String> {
+    let name = lock_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("Chemin de verrou invalide: {}", lock_path.display()))?;
+    Ok(format!("{name}.prime-orbit-owner-"))
+}
+
+fn create_lock_owner(
+    lock_path: &Path,
+    fingerprint: &LockFingerprint,
+) -> Result<(PathBuf, LockOwner), String> {
+    let prefix = owner_file_prefix(lock_path)?;
+    for _ in 0..8 {
+        let counter = SETTINGS_LOCK_RECLAIM_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let token = format!("{}-{counter}-{nanos}", std::process::id());
+        let owner = LockOwner {
+            pid: std::process::id(),
+            process_start_id: current_process_start_id(),
+            acquired_at_millis: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            lock_id: fingerprint.stable_id(),
+            token: token.clone(),
+        };
+        let path = lock_path.with_file_name(format!("{prefix}{token}.json"));
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "Impossible de créer le propriétaire du verrou {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        let bytes = serde_json::to_vec(&owner)
+            .map_err(|error| format!("Impossible de sérialiser le verrou MCP: {error}"))?;
+        if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+            let _ = fs::remove_file(&path);
+            return Err(format!(
+                "Impossible d’écrire le propriétaire du verrou {}: {error}",
+                path.display()
+            ));
+        }
+        return Ok((path, owner));
+    }
+    Err("Impossible de réserver un identifiant de propriétaire MCP unique".to_string())
+}
+
+fn read_lock_owner(path: &Path) -> Result<LockOwner, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("Impossible d’inspecter {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 4096 {
+        return Err(format!(
+            "Le propriétaire de verrou {} est invalide",
+            path.display()
+        ));
+    }
+    let bytes = fs::read(path)
+        .map_err(|error| format!("Impossible de lire {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "Propriétaire de verrou invalide dans {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn matching_lock_owners(
+    lock_path: &Path,
+    fingerprint: &LockFingerprint,
+) -> Result<Vec<(PathBuf, LockOwner)>, String> {
+    let prefix = owner_file_prefix(lock_path)?;
+    let parent = lock_path
+        .parent()
+        .ok_or_else(|| format!("Chemin de verrou invalide: {}", lock_path.display()))?;
+    let mut owners = Vec::new();
+    let entries = fs::read_dir(parent)
+        .map_err(|error| format!("Impossible d’inspecter {}: {error}", parent.display()))?;
+    let mut owner_files_seen = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!("Impossible d’inspecter un propriétaire de verrou: {error}")
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(&prefix) || !name.ends_with(".json") {
+            continue;
+        }
+        owner_files_seen += 1;
+        if owner_files_seen > 256 {
+            return Err(format!(
+                "Trop de métadonnées de verrou MCP sont présentes dans {}",
+                parent.display()
+            ));
+        }
+        let path = entry.path();
+        let owner = match read_lock_owner(&path) {
+            Ok(owner) => owner,
+            Err(_) => continue,
+        };
+        if owner.lock_id == fingerprint.stable_id() {
+            owners.push((path, owner));
+        }
+    }
+    owners.sort_by_key(|(_, owner)| owner.acquired_at_millis);
+    Ok(owners)
+}
+
+fn unique_reclaim_path(lock_path: &Path) -> Result<PathBuf, String> {
+    let file_name = lock_path
+        .file_name()
+        .ok_or_else(|| format!("Chemin de verrou invalide: {}", lock_path.display()))?;
+    let counter = SETTINGS_LOCK_RECLAIM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut name = OsString::from(file_name);
+    name.push(format!(
+        ".prime-orbit-reclaim-{}-{counter}-{nanos}",
+        std::process::id()
+    ));
+    Ok(lock_path.with_file_name(name))
+}
+
+/// Atomically moves an observed stale directory out of the well-known lock
+/// name before deleting it. Re-reading the fingerprint after the rename keeps
+/// an ABA replacement from being mistaken for the stale directory we saw.
+fn reclaim_stale_lock(
+    lock_path: &Path,
+    now: SystemTime,
+    stale_after: Duration,
+) -> Result<bool, String> {
+    reclaim_stale_lock_with_probe(lock_path, now, stale_after, owner_process_liveness)
+}
+
+fn reclaim_stale_lock_with_probe<F>(
+    lock_path: &Path,
+    now: SystemTime,
+    stale_after: Duration,
+    probe_owner: F,
+) -> Result<bool, String>
+where
+    F: Fn(&LockOwner) -> ProcessLiveness,
+{
+    let observed = match LockFingerprint::read(lock_path) {
+        Ok(fingerprint) => fingerprint,
+        Err(_) if !lock_path.exists() => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !observed.is_stale_at(now, stale_after) {
+        return Ok(false);
+    }
+    let owners = matching_lock_owners(lock_path, &observed)?;
+    // An unobservable process is not a dead process. Reclaim only when every
+    // valid owner record is positively proven dead; Alive and Unknown both
+    // preserve the lock and force the caller to report it as busy.
+    if !owners
+        .iter()
+        .all(|(_, owner)| probe_owner(owner) == ProcessLiveness::Dead)
+    {
+        return Ok(false);
+    }
+
+    let quarantine = unique_reclaim_path(lock_path)?;
+    match fs::rename(lock_path, &quarantine) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "Impossible d’isoler le verrou expiré {}: {error}",
+                lock_path.display()
+            ));
+        }
+    }
+
+    let moved = LockFingerprint::read(&quarantine)?;
+    if moved != observed {
+        match fs::rename(&quarantine, lock_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!(
+                    "Le verrou {} a changé pendant sa récupération et n’a pas pu être restauré: {error}",
+                    lock_path.display()
+                ));
+            }
+        }
+        return Err(format!(
+            "Le verrou {} a changé pendant sa récupération; réessayez",
+            lock_path.display()
+        ));
+    }
+
+    fs::remove_dir(&quarantine).map_err(|error| {
+        format!(
+            "Impossible de supprimer le verrou expiré isolé {}: {error}",
+            quarantine.display()
+        )
+    })?;
+    for (owner_path, _) in owners {
+        let _ = fs::remove_file(owner_path);
+    }
+    Ok(true)
 }
 
 impl CompatibleSettingsLock {
@@ -610,8 +1159,33 @@ impl CompatibleSettingsLock {
         let lock_path = settings_path.with_file_name(lock_name);
         for attempt in 0..10 {
             match fs::create_dir(&lock_path) {
-                Ok(()) => return Ok(Self { path: lock_path }),
+                Ok(()) => {
+                    let fingerprint = match LockFingerprint::read(&lock_path) {
+                        Ok(fingerprint) => fingerprint,
+                        Err(error) => {
+                            let _ = fs::remove_dir(&lock_path);
+                            return Err(error);
+                        }
+                    };
+                    let (owner_path, owner) = match create_lock_owner(&lock_path, &fingerprint) {
+                        Ok(owner) => owner,
+                        Err(error) => {
+                            let _ = fs::remove_dir(&lock_path);
+                            return Err(error);
+                        }
+                    };
+                    return Ok(Self {
+                        path: lock_path,
+                        fingerprint,
+                        owner_path,
+                        owner,
+                    });
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt < 9 => {
+                    if reclaim_stale_lock(&lock_path, SystemTime::now(), SETTINGS_LOCK_STALE_AFTER)?
+                    {
+                        continue;
+                    }
                     thread::sleep(Duration::from_millis(20));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -634,7 +1208,13 @@ impl CompatibleSettingsLock {
 
 impl Drop for CompatibleSettingsLock {
     fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.path);
+        // A stalled owner can lose a stale lock to another process. Never
+        // remove a replacement lock that no longer has our fingerprint.
+        let still_owned = LockFingerprint::read(&self.path).as_ref() == Ok(&self.fingerprint)
+            && read_lock_owner(&self.owner_path).as_ref() == Ok(&self.owner);
+        if still_owned && fs::remove_dir(&self.path).is_ok() {
+            let _ = fs::remove_file(&self.owner_path);
+        }
     }
 }
 
@@ -704,6 +1284,7 @@ fn save_mcp_server_blocking(
     let servers = settings_servers_mut(&mut document.value)?;
     if let Some(existing) = servers.get_mut(&server.name) {
         let config = ensure_existing_http(&server.name, existing)?;
+        validate_custom_headers_update(&server.name, config, &server)?;
         config.insert("url".to_string(), Value::String(server.url.clone()));
         config.insert("enabled".to_string(), Value::Bool(server.enabled));
         config.remove("oauth");
@@ -881,6 +1462,11 @@ mod tests {
                 "legacy": {
                     "type": "http",
                     "url": "https://user:URL_SECRET@example.test/mcp?token=QUERY_SECRET#fragment"
+                },
+                "header_only": {
+                    "type": "http",
+                    "url": "https://headers.example.test/mcp",
+                    "headers": {"Authorization": "Bearer HEADER_SECRET"}
                 }
             }
         });
@@ -921,6 +1507,13 @@ mod tests {
             .find(|server| server.name == "legacy")
             .unwrap();
         assert_eq!(legacy.url.as_deref(), Some("https://example.test/mcp"));
+        let header_only = result
+            .mcp_servers
+            .iter()
+            .find(|server| server.name == "header_only")
+            .unwrap();
+        assert!(header_only.has_custom_headers);
+        assert_eq!(header_only.auth_kind, McpAuthKind::None);
 
         let serialized = serde_json::to_string(&result).unwrap();
         for secret in [
@@ -930,12 +1523,13 @@ mod tests {
             "secret-command",
             "TOKEN",
             "bearerTokenEnvVar",
-            "headers",
             "URL_SECRET",
             "QUERY_SECRET",
+            "HEADER_SECRET",
         ] {
             assert!(!serialized.contains(secret));
         }
+        assert!(!serialized.contains("\"headers\":"));
     }
 
     #[test]
@@ -965,6 +1559,192 @@ mod tests {
         invalid.bearer_token_env_var = Some("TOKEN".to_string());
         invalid.url = "https://example.test/mcp?token=secret".to_string();
         assert!(validate_save_input(&invalid).is_err());
+
+        let loopback_without_secret = SaveMcpServerInput {
+            name: "local_tools".to_string(),
+            url: "http://127.0.0.1:3000/mcp".to_string(),
+            enabled: true,
+            auth_kind: McpAuthKind::None,
+            bearer_token_env_var: None,
+        };
+        assert!(validate_save_input(&loopback_without_secret).is_ok());
+
+        let mut cleartext_bearer = loopback_without_secret.clone();
+        cleartext_bearer.auth_kind = McpAuthKind::BearerEnv;
+        cleartext_bearer.bearer_token_env_var = Some("LOCAL_TOKEN".to_string());
+        assert!(validate_save_input(&cleartext_bearer).is_err());
+
+        let mut remote_cleartext = loopback_without_secret;
+        remote_cleartext.url = "http://mcp.example.test/mcp".to_string();
+        assert!(validate_save_input(&remote_cleartext).is_err());
+    }
+
+    #[test]
+    fn custom_headers_cannot_move_to_another_origin_or_change_auth() {
+        let config = serde_json::json!({
+            "type": "http",
+            "url": "https://api.example.test/old",
+            "headers": {"Authorization": "Bearer SECRET"}
+        });
+        let config = config.as_object().unwrap();
+        let mut input = SaveMcpServerInput {
+            name: "acme".to_string(),
+            url: "https://api.example.test/new".to_string(),
+            enabled: true,
+            auth_kind: McpAuthKind::None,
+            bearer_token_env_var: None,
+        };
+        assert!(validate_custom_headers_update("acme", config, &input).is_ok());
+
+        input.url = "https://attacker.example/new".to_string();
+        assert!(validate_custom_headers_update("acme", config, &input).is_err());
+
+        input.url = "https://api.example.test/new".to_string();
+        input.auth_kind = McpAuthKind::OAuth;
+        assert!(validate_custom_headers_update("acme", config, &input).is_err());
+    }
+
+    #[test]
+    fn stale_settings_lock_is_quarantined_before_reuse() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock = directory.path().join("settings.json.lock");
+        fs::create_dir(&lock).unwrap();
+
+        assert!(reclaim_stale_lock(&lock, SystemTime::now(), Duration::ZERO).unwrap());
+        assert!(!lock.exists());
+        assert!(fs::read_dir(directory.path()).unwrap().next().is_none());
+
+        let guard = CompatibleSettingsLock::acquire(&directory.path().join("settings.json"))
+            .expect("the reclaimed lock can be acquired again");
+        assert!(lock.is_dir());
+        drop(guard);
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn fresh_settings_lock_is_never_reclaimed() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock = directory.path().join("settings.json.lock");
+        fs::create_dir(&lock).unwrap();
+        assert!(!reclaim_stale_lock(&lock, SystemTime::now(), Duration::from_secs(60)).unwrap());
+        assert!(lock.is_dir());
+    }
+
+    #[test]
+    fn live_owner_prevents_timeout_based_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = directory.path().join("settings.json");
+        let guard = CompatibleSettingsLock::acquire(&settings).unwrap();
+        let lock = directory.path().join("settings.json.lock");
+
+        assert!(!reclaim_stale_lock(&lock, SystemTime::now(), Duration::ZERO).unwrap());
+        assert!(lock.is_dir());
+        drop(guard);
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn process_probe_distinguishes_alive_dead_and_unverifiable_owners() {
+        let owner = LockOwner {
+            pid: 42,
+            process_start_id: "start-a".to_string(),
+            acquired_at_millis: 1,
+            lock_id: "lock".to_string(),
+            token: "owner".to_string(),
+        };
+
+        assert_eq!(
+            owner_liveness_from_probe(&owner, ProcessProbe::Running("start-a".to_string())),
+            ProcessLiveness::Alive
+        );
+        assert_eq!(
+            owner_liveness_from_probe(&owner, ProcessProbe::Running("start-b".to_string())),
+            ProcessLiveness::Dead
+        );
+        assert_eq!(
+            owner_liveness_from_probe(&owner, ProcessProbe::Dead),
+            ProcessLiveness::Dead
+        );
+        assert_eq!(
+            owner_liveness_from_probe(&owner, ProcessProbe::Unknown),
+            ProcessLiveness::Unknown
+        );
+    }
+
+    #[test]
+    fn unverifiable_owner_preserves_an_expired_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock = directory.path().join("settings.json.lock");
+        fs::create_dir(&lock).unwrap();
+        let fingerprint = LockFingerprint::read(&lock).unwrap();
+        let owner = LockOwner {
+            pid: 42,
+            process_start_id: "unverifiable".to_string(),
+            acquired_at_millis: 1,
+            lock_id: fingerprint.stable_id(),
+            token: "unknown-owner".to_string(),
+        };
+        let owner_path = directory
+            .path()
+            .join("settings.json.lock.prime-orbit-owner-unknown-owner.json");
+        fs::write(&owner_path, serde_json::to_vec(&owner).unwrap()).unwrap();
+
+        assert!(
+            !reclaim_stale_lock_with_probe(&lock, SystemTime::now(), Duration::ZERO, |_| {
+                ProcessLiveness::Unknown
+            },)
+            .unwrap()
+        );
+        assert!(lock.is_dir());
+        assert!(owner_path.is_file());
+    }
+
+    #[test]
+    fn expired_dead_owner_is_recovered_with_its_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock = directory.path().join("settings.json.lock");
+        fs::create_dir(&lock).unwrap();
+        let fingerprint = LockFingerprint::read(&lock).unwrap();
+        let owner = LockOwner {
+            pid: u32::MAX,
+            process_start_id: "definitely-not-a-live-process".to_string(),
+            acquired_at_millis: 1,
+            lock_id: fingerprint.stable_id(),
+            token: "dead-owner".to_string(),
+        };
+        let owner_path = directory
+            .path()
+            .join("settings.json.lock.prime-orbit-owner-dead-owner.json");
+        fs::write(&owner_path, serde_json::to_vec(&owner).unwrap()).unwrap();
+
+        assert!(
+            reclaim_stale_lock_with_probe(&lock, SystemTime::now(), Duration::ZERO, |_| {
+                ProcessLiveness::Dead
+            },)
+            .unwrap()
+        );
+        assert!(!lock.exists());
+        assert!(!owner_path.exists());
+    }
+
+    #[test]
+    fn lock_drop_does_not_remove_a_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = directory.path().join("settings.json");
+        let mut guard = CompatibleSettingsLock::acquire(&settings).unwrap();
+        let lock = directory.path().join("settings.json.lock");
+        fs::remove_dir(&lock).unwrap();
+        fs::create_dir(&lock).unwrap();
+        // Make the expected owner identity unambiguously different even on
+        // filesystems with coarse directory timestamp precision.
+        guard.fingerprint = LockFingerprint {
+            modified: Some(UNIX_EPOCH),
+            created: Some(UNIX_EPOCH),
+            identity: None,
+        };
+
+        drop(guard);
+        assert!(lock.is_dir());
     }
 
     #[test]

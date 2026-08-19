@@ -22,6 +22,7 @@ use std::ffi::OsStr;
 pub const OFFICIAL_REPOSITORY_URL: &str = "https://github.com/PrimeIntellect-ai/prime-agent.git";
 pub const SUPPORTED_PRIME_AGENT_TAG: &str = "v0.7.3";
 pub const SUPPORTED_PRIME_AGENT_COMMIT: &str = "61131b2d195ba7a67a4ce8ac60bb10cecae07b67";
+const MINIMUM_PRIME_AGENT_NODE_VERSION: (u64, u64) = (22, 8);
 const STARTUP_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const COMMAND_TERMINATION_GRACE: Duration = Duration::from_millis(500);
@@ -704,7 +705,12 @@ pub async fn diagnose_prerequisites(app: AppHandle) -> Result<PrerequisiteDiagno
         let (prime_agent, _) = detect_internal(&app)?;
         let git = program_diagnostic("git", "Git", true, None);
         let npm = program_diagnostic("npm", "npm", true, None);
-        let node = program_diagnostic("node", "Node.js 22.8+", true, Some((22, 8)));
+        let node = program_diagnostic(
+            "node",
+            "Node.js 22.8+",
+            true,
+            Some(MINIMUM_PRIME_AGENT_NODE_VERSION),
+        );
         let bash = program_diagnostic("bash", "Bash", cfg!(windows), None);
         let can_quick_install =
             git.found && npm.found && node.found && (!cfg!(windows) || bash.found);
@@ -801,7 +807,7 @@ pub fn ensure_supported_node(path: &Path) -> Result<String, String> {
     let version = capture_program_version(path, "Node.js")?;
     let actual = parse_semver_prefix(&version)
         .ok_or_else(|| format!("Version Node.js non reconnue: {version}"))?;
-    if actual < (22, 8) {
+    if actual < MINIMUM_PRIME_AGENT_NODE_VERSION {
         return Err(format!(
             "Prime Agent requiert Node.js 22.8 ou ultérieur; version détectée: {version}"
         ));
@@ -1187,8 +1193,8 @@ mod tests {
     #[cfg(windows)]
     use super::{capture_command_output, external_command, find_program};
     use super::{
-        capture_command_output_with_timeout, detection_from_spec, inspect_launch_candidate,
-        parse_semver_prefix, LaunchSpec,
+        capture_command_output_with_timeout, detection_from_spec, ensure_supported_node,
+        inspect_launch_candidate, parse_semver_prefix, LaunchSpec,
     };
     #[cfg(windows)]
     use std::ffi::OsString;
@@ -1231,6 +1237,17 @@ mod tests {
         assert_eq!(parse_semver_prefix("v22.8.0"), Some((22, 8)));
         assert_eq!(parse_semver_prefix("node 24.3.1"), Some((24, 3)));
         assert_eq!(parse_semver_prefix("unknown"), None);
+    }
+
+    #[test]
+    fn enforces_the_node_version_required_by_prime_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let unsupported = runtime_test_program(directory.path(), "node-old", Some("v22.7.0"));
+        let supported = runtime_test_program(directory.path(), "node-current", Some("v22.8.0"));
+
+        let error = ensure_supported_node(&unsupported).expect_err("22.7 must be rejected");
+        assert!(error.contains("22.8"), "unexpected error: {error}");
+        assert_eq!(ensure_supported_node(&supported).unwrap(), "v22.8.0");
     }
 
     #[test]

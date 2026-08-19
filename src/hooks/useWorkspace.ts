@@ -11,8 +11,10 @@ import type { AppView, Conversation, PersistedAppState, Project } from "../types
 
 const PROJECT_COLORS = ["#7c6cff", "#45c6d8", "#2ecf8f", "#f3b65b", "#f56b79", "#b26cff"];
 const SAVE_DEBOUNCE_MS = 260;
-const SAVE_RETRY_MS = 80;
 const MAX_SAVE_ATTEMPTS = 8;
+const SAVE_RETRY_BASE_MS = 500;
+const SAVE_RETRY_MAX_MS = 30_000;
+const MAX_AUTOMATIC_SAVE_ATTEMPTS = 8;
 
 const newId = (prefix: string) => `${prefix}-${crypto.randomUUID()}`;
 
@@ -20,14 +22,33 @@ function pathName(path: string) {
   return path.split(/[\\/]/).filter(Boolean).at(-1) ?? "Nouveau projet";
 }
 
+function saveRetryDelay(attempt: number) {
+  return Math.min(SAVE_RETRY_BASE_MS * 2 ** Math.min(attempt, 16), SAVE_RETRY_MAX_MS);
+}
+
+function persistenceRetryMessage(language: PersistedAppState["preferences"]["language"]) {
+  return language === "fr"
+    ? "Les modifications restent ouvertes, mais l’espace de travail n’a pas pu être enregistré. Prime Orbit réessaiera avec un délai progressif."
+    : "Your changes remain open, but the workspace could not be saved. Prime Orbit will retry with a progressive delay.";
+}
+
+function persistenceSuspendedMessage(language: PersistedAppState["preferences"]["language"]) {
+  return language === "fr"
+    ? "L’enregistrement automatique est suspendu après plusieurs échecs. Vos modifications restent ouvertes ; utilisez Réessayer pour relancer l’enregistrement."
+    : "Automatic saving is paused after repeated failures. Your changes remain open; use Retry to resume saving.";
+}
+
 export function useWorkspace() {
   const [state, setReactState] = useState<PersistedAppState>(defaultAppState);
   const [view, setView] = useState<AppView>("home");
   const [loaded, setLoaded] = useState(false);
+  const [workspaceSaveError, setWorkspaceSaveError] = useState<string>();
   const stateRef = useRef<PersistedAppState>(defaultAppState);
   const baseSnapshot = useRef<AppStateSnapshot>({ state: durableState(defaultAppState), revision: 0 });
+  const lastObservedDurableState = useRef<PersistedAppState>(durableState(defaultAppState));
   const saveTimer = useRef<number | undefined>(undefined);
   const saveInFlight = useRef(false);
+  const automaticSaveFailures = useRef(0);
   const mounted = useRef(true);
 
   // Keeping the current state in a ref makes a remote event arriving between
@@ -136,15 +157,22 @@ export function useWorkspace() {
   const persistLatestState = useCallback(async () => {
     if (saveInFlight.current) return;
     saveInFlight.current = true;
+    let shouldBackOff = false;
     try {
       for (let attempt = 0; attempt < MAX_SAVE_ATTEMPTS; attempt += 1) {
         const base = baseSnapshot.current;
         const localRuntimeState = stateRef.current;
         const localState = durableState(localRuntimeState);
-        if (statesEqual(localState, base.state)) return;
+        if (statesEqual(localState, base.state)) {
+          automaticSaveFailures.current = 0;
+          if (mounted.current) setWorkspaceSaveError(undefined);
+          return;
+        }
 
         const result = await saveAppState(localState, base.revision);
         if (result.saved) {
+          automaticSaveFailures.current = 0;
+          if (mounted.current) setWorkspaceSaveError(undefined);
           if (result.snapshot.revision >= baseSnapshot.current.revision) {
             baseSnapshot.current = {
               state: durableState(result.snapshot.state),
@@ -169,25 +197,65 @@ export function useWorkspace() {
         };
         setState(restoreRuntimeState(latestRuntimeState, normalizeWorkspaceState(rebased)));
       }
+      shouldBackOff = true;
     } catch {
-      // The normal debounce effect retries on the next state change; the
-      // finally block below also schedules a short retry for transient errors.
+      shouldBackOff = true;
     } finally {
       saveInFlight.current = false;
       const stillDirty = !statesEqual(durableState(stateRef.current), baseSnapshot.current.state);
       if (stillDirty && mounted.current) {
         window.clearTimeout(saveTimer.current);
-        saveTimer.current = window.setTimeout(() => void persistLatestState(), SAVE_RETRY_MS);
+        if (shouldBackOff) {
+          automaticSaveFailures.current += 1;
+          const suspended = automaticSaveFailures.current >= MAX_AUTOMATIC_SAVE_ATTEMPTS;
+          if (mounted.current) {
+            setWorkspaceSaveError((suspended ? persistenceSuspendedMessage : persistenceRetryMessage)(
+              stateRef.current.preferences.language,
+            ));
+          }
+          if (!suspended) {
+            const delay = saveRetryDelay(automaticSaveFailures.current - 1);
+            saveTimer.current = window.setTimeout(() => void persistLatestState(), delay);
+          }
+        } else {
+          saveTimer.current = window.setTimeout(() => void persistLatestState(), SAVE_DEBOUNCE_MS);
+        }
+      } else if (!stillDirty) {
+        automaticSaveFailures.current = 0;
+        window.clearTimeout(saveTimer.current);
+        if (mounted.current) setWorkspaceSaveError(undefined);
       }
     }
   }, [setState]);
 
+  const retryWorkspaceSave = useCallback(() => {
+    automaticSaveFailures.current = 0;
+    setWorkspaceSaveError(persistenceRetryMessage(stateRef.current.preferences.language));
+    window.clearTimeout(saveTimer.current);
+    saveTimer.current = window.setTimeout(() => void persistLatestState(), 0);
+  }, [persistLatestState]);
+
   useEffect(() => {
     if (!loaded) return;
+    const currentDurableState = durableState(state);
+    if (statesEqual(currentDurableState, baseSnapshot.current.state)) {
+      lastObservedDurableState.current = currentDurableState;
+      automaticSaveFailures.current = 0;
+      window.clearTimeout(saveTimer.current);
+      setWorkspaceSaveError(undefined);
+      return;
+    }
+    // Runtime-only updates can re-render this hook many times per second.
+    // Do not let them continually postpone a persistence retry when the
+    // durable workspace itself has not changed.
+    if (statesEqual(currentDurableState, lastObservedDurableState.current)) return;
+    lastObservedDurableState.current = currentDurableState;
+    automaticSaveFailures.current = 0;
+    setWorkspaceSaveError((current) => current
+      ? persistenceRetryMessage(state.preferences.language)
+      : undefined);
     window.clearTimeout(saveTimer.current);
-    if (statesEqual(durableState(state), baseSnapshot.current.state)) return;
     saveTimer.current = window.setTimeout(() => void persistLatestState(), SAVE_DEBOUNCE_MS);
-    return () => window.clearTimeout(saveTimer.current);
   }, [loaded, persistLatestState, state]);
 
   useEffect(() => {
@@ -322,7 +390,7 @@ export function useWorkspace() {
         conversations: current.conversations.map((conversation) => {
           if (conversation.id !== conversationId) return conversation;
           if (typeof updater === "function") return updater(conversation);
-          return { ...conversation, ...updater, updatedAt: updater.updatedAt ?? new Date().toISOString() };
+          return applyConversationPatch(conversation, updater);
         }),
       }));
     },
@@ -384,7 +452,6 @@ export function useWorkspace() {
         selectedConversationId,
       };
     });
-    setView("projects");
   }, []);
 
   const archiveConversation = useCallback(
@@ -419,6 +486,8 @@ export function useWorkspace() {
     view,
     setView,
     loaded,
+    workspaceSaveError,
+    retryWorkspaceSave,
     selectedProject,
     selectedConversation,
     projectConversations,
@@ -539,15 +608,73 @@ function restoreRuntimeState(runtime: PersistedAppState, durable: PersistedAppSt
   };
 }
 
-function valuesEqual(left: unknown, right: unknown) {
-  return JSON.stringify(left) === JSON.stringify(right);
+/**
+ * Compares JSON-compatible values without depending on object insertion order.
+ *
+ * Native state crosses serde_json, whose map representation sorts keys. A
+ * newly-created frontend entity retains its construction order, so comparing
+ * JSON.stringify output directly made the same state look dirty forever after
+ * the first save. Undefined object members are ignored to match JSON
+ * serialization at the IPC boundary.
+ */
+export function jsonValuesEqual(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    return left.every((value, index) => jsonValuesEqual(value, right[index]));
+  }
+  if (left === null || right === null || typeof left !== "object" || typeof right !== "object") {
+    return false;
+  }
+
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord).filter((key) => leftRecord[key] !== undefined);
+  const rightKeys = Object.keys(rightRecord).filter((key) => rightRecord[key] !== undefined);
+  if (leftKeys.length !== rightKeys.length) return false;
+  return leftKeys.every((key) => Object.prototype.hasOwnProperty.call(rightRecord, key)
+    && rightRecord[key] !== undefined
+    && jsonValuesEqual(leftRecord[key], rightRecord[key]));
 }
 
-function statesEqual(left: PersistedAppState, right: PersistedAppState) {
-  return valuesEqual(
+function valuesEqual(left: unknown, right: unknown) {
+  return jsonValuesEqual(left, right);
+}
+
+export function workspaceStatesEqual(left: PersistedAppState, right: PersistedAppState) {
+  return jsonValuesEqual(
     { ...left, selectedProjectId: undefined, selectedConversationId: undefined },
     { ...right, selectedProjectId: undefined, selectedConversationId: undefined },
   );
+}
+
+function statesEqual(left: PersistedAppState, right: PersistedAppState) {
+  return workspaceStatesEqual(left, right);
+}
+
+const RUNTIME_ONLY_CONVERSATION_FIELDS = new Set<keyof Conversation>([
+  "status",
+  "messages",
+  "activities",
+  "lastError",
+]);
+
+/** Applies a partial conversation update without turning runtime-only events into durable writes. */
+export function applyConversationPatch(
+  conversation: Conversation,
+  patch: Partial<Conversation>,
+  timestamp = new Date().toISOString(),
+): Conversation {
+  const durableFieldChanged = (Object.keys(patch) as Array<keyof Conversation>).some((key) =>
+    key !== "updatedAt"
+      && !RUNTIME_ONLY_CONVERSATION_FIELDS.has(key)
+      && !jsonValuesEqual(conversation[key], patch[key]),
+  );
+  return {
+    ...conversation,
+    ...patch,
+    updatedAt: patch.updatedAt ?? (durableFieldChanged ? timestamp : conversation.updatedAt),
+  };
 }
 
 function normalizeWorkspaceState(state: PersistedAppState): PersistedAppState {

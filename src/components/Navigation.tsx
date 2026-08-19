@@ -284,6 +284,8 @@ export function ProjectSidebar(props: ProjectSidebarProps) {
             <button
               key={item.id}
               type="button"
+              data-context-type="project"
+              data-context-id={item.id}
               className={`collapsed-project-dot ${item.id === project?.id ? "is-active" : ""} ${dragItem?.kind === "project" && dragItem.id === item.id ? "is-dragging" : ""} ${dropClass(dropTarget, "project", item.id)}`}
               style={{ "--project-color": item.color } as React.CSSProperties}
               onClick={() => selectProject(item.id)}
@@ -297,6 +299,7 @@ export function ProjectSidebar(props: ProjectSidebarProps) {
                 event.preventDefault();
                 moveProjectByKeyboard(item.id, event.key === "ArrowUp" ? -1 : 1);
               }}
+              aria-haspopup="menu"
               aria-label={t("nav.openProject", { name: item.name })}
               title={item.name}
             />
@@ -337,6 +340,8 @@ export function ProjectSidebar(props: ProjectSidebarProps) {
             <section key={section.project.id} className={`project-section ${isCurrent ? "is-current" : ""} ${dragItem?.kind === "project" && dragItem.id === section.project.id ? "is-dragging" : ""}`}>
               <div
                 className={`project-section-header ${dropClass(dropTarget, "project", section.project.id)}`}
+                data-context-type="project"
+                data-context-id={section.project.id}
                 onDragOver={(event) => updateDropTarget(event, "project", section.project.id)}
                 onDrop={(event) => finishDrop(event, "project", section.project.id)}
               >
@@ -362,6 +367,7 @@ export function ProjectSidebar(props: ProjectSidebarProps) {
                   className="project-tree-select"
                   onClick={() => toggleProject(section.project.id)}
                   aria-current={isCurrent ? "page" : undefined}
+                  aria-haspopup="menu"
                   aria-expanded={expanded}
                   aria-controls={regionId}
                   aria-label={t(expanded ? "nav.collapseProject" : "nav.expandProject", { name: section.project.name })}

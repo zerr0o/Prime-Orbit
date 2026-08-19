@@ -6,19 +6,7 @@
   "permissions": [
     "core:default",
     "core:webview:allow-create-webview-window",
-    "dialog:default",
-    "opener:default",
-    {
-      "identifier": "opener:allow-open-path",
-      "allow": [
-        { "path": "$HOME/**" },
-        { "path": "$DOCUMENT/**" },
-        { "path": "$DESKTOP/**" },
-        { "path": "$DOWNLOAD/**" },
-        { "path": "$TEMP/**" },
-        { "path": "$APPDATA/**" },
-        { "path": "$APPLOCALDATA/**" }
-      ]
-    }
+    "dialog:allow-open",
+    "opener:allow-default-urls"
   ]
 }

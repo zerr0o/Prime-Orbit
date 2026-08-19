@@ -41,7 +41,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { pickAttachmentPaths, readAttachment } from "../lib/bridge";
+import { pickAttachments, releaseAttachmentHandles } from "../lib/bridge";
 import { useDismissableLayer } from "../hooks/useDismissableLayer";
 import { useI18n, type AppLanguage } from "../i18n";
 import type {
@@ -77,6 +77,7 @@ interface ConversationViewProps {
   onToggleInspector: () => void;
   onDraftChange: (draft: string) => void;
   onSend: (message: string, attachments: Attachment[]) => Promise<void>;
+  onRetryMessage: (assistantMessageId: string) => Promise<void>;
   onAbort: () => Promise<void>;
   onModel: (model: ModelInfo) => Promise<void>;
   onThinking: (level: ThinkingLevel) => Promise<void>;
@@ -87,7 +88,7 @@ interface ConversationViewProps {
 }
 
 export function ConversationView(props: ConversationViewProps) {
-  const { project, conversation, models, commands, stats, sessionState, inspectorOpen, changes, onToggleInspector, onDraftChange, onSend, onAbort, onModel, onThinking, onPermissionPreset, onRunCommand, onNewWindow, onOpenTerminal } = props;
+  const { project, conversation, models, commands, stats, sessionState, inspectorOpen, changes, onToggleInspector, onDraftChange, onSend, onRetryMessage, onAbort, onModel, onThinking, onPermissionPreset, onRunCommand, onNewWindow, onOpenTerminal } = props;
   const isRunning = ["starting", "streaming", "tool", "queued"].includes(conversation.status);
   const [inspectorTab, setInspectorTab] = useState<"activity" | "context" | "changes" | "details">("activity");
   const [openPopover, setOpenPopover] = useState<ConversationPopover>(null);
@@ -116,7 +117,7 @@ export function ConversationView(props: ConversationViewProps) {
           onTogglePopover={togglePopover}
           onClosePopover={closePopover}
         />
-        <Transcript conversation={conversation} project={project} onSuggestion={(text) => onDraftChange(text)} onRunCommand={onRunCommand} />
+        <Transcript conversation={conversation} project={project} onSuggestion={(text) => onDraftChange(text)} onRunCommand={onRunCommand} onRetryMessage={onRetryMessage} />
         {isRunning ? <ActiveRunBar conversation={conversation} onAbort={onAbort} onActivity={() => { setInspectorTab("activity"); if (!inspectorOpen) onToggleInspector(); }} /> : null}
         <Composer
           key={conversation.id}
@@ -226,7 +227,7 @@ function SessionActionsPopover({ sessionState, onChoose }: {
   );
 }
 
-function Transcript({ conversation, project, onSuggestion, onRunCommand }: { conversation: Conversation; project: Project; onSuggestion: (text: string) => void; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void> }) {
+function Transcript({ conversation, project, onSuggestion, onRunCommand, onRetryMessage }: { conversation: Conversation; project: Project; onSuggestion: (text: string) => void; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onRetryMessage: (assistantMessageId: string) => Promise<void> }) {
   const { language } = useI18n();
   const viewport = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
@@ -256,8 +257,8 @@ function Transcript({ conversation, project, onSuggestion, onRunCommand }: { con
         <div className="transcript-content">
           <div className="transcript-date"><span>{bi(language, "Aujourd’hui", "Today")}</span></div>
           {entries.map((entry) => entry.kind === "message"
-            ? <MessageItem key={entry.message.id} message={entry.message} onRunCommand={onRunCommand} />
-            : <PythonTranscriptRun key={entry.id} messages={entry.messages} tools={entry.tools} onRunCommand={onRunCommand} />)}
+            ? <MessageItem key={entry.message.id} message={entry.message} onRunCommand={onRunCommand} onRetryMessage={onRetryMessage} />
+            : <PythonTranscriptRun key={entry.id} messages={entry.messages} tools={entry.tools} onRunCommand={onRunCommand} onRetryMessage={onRetryMessage} />)}
           {conversation.lastError ? (
             <div className="inline-error"><Info size={17} /><div><strong>{bi(language, "Prime Agent a besoin d’attention", "Prime Agent needs attention")}</strong><p>{conversation.lastError}</p></div><Button variant="ghost" onClick={() => void onRunCommand("get_state")}>{bi(language, "Réessayer", "Retry")}</Button></div>
           ) : null}
@@ -354,7 +355,7 @@ function ConversationWelcome({ project, onSuggestion }: { project: Project; onSu
   );
 }
 
-function MessageItem({ message, onRunCommand, showTools = true }: { message: ChatMessage; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; showTools?: boolean }) {
+function MessageItem({ message, onRunCommand, onRetryMessage, showTools = true }: { message: ChatMessage; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onRetryMessage: (assistantMessageId: string) => Promise<void>; showTools?: boolean }) {
   const { language, locale } = useI18n();
   const isUser = message.role === "user";
   return (
@@ -374,7 +375,7 @@ function MessageItem({ message, onRunCommand, showTools = true }: { message: Cha
         {!isUser && message.status === "complete" && message.content.trim() ? (
           <footer className="message-actions">
             <IconButton label={bi(language, "Copier la réponse", "Copy response")} onClick={() => void navigator.clipboard.writeText(message.content)}><Copy size={14} /></IconButton>
-            <IconButton label={bi(language, "Relancer", "Retry")}><RefreshCw size={14} /></IconButton>
+            <IconButton label={bi(language, "Réutiliser le texte dans le composeur", "Reuse text in the composer")} onClick={() => void onRetryMessage(message.id)}><RefreshCw size={14} /></IconButton>
             <IconButton label={bi(language, "Créer une branche", "Create branch")} onClick={() => void onRunCommand("clone")}><GitBranch size={14} /></IconButton>
             <span />
             {message.durationMs ? <small><Clock3 size={12} /> {formatDuration(message.durationMs)}</small> : null}
@@ -430,13 +431,13 @@ function isPythonOnlyAssistantMessage(message: ChatMessage) {
   return message.role === "assistant" && Boolean(message.tools?.length) && message.tools!.every(isPythonTool);
 }
 
-function PythonTranscriptRun({ messages, tools, onRunCommand }: { messages: ChatMessage[]; tools: ToolActivity[]; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void> }) {
+function PythonTranscriptRun({ messages, tools, onRunCommand, onRetryMessage }: { messages: ChatMessage[]; tools: ToolActivity[]; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onRetryMessage: (assistantMessageId: string) => Promise<void> }) {
   const { language, locale } = useI18n();
   const visibleMessages = messages.filter((message) => message.content.trim() || (message.attachments?.length ?? 0) > 0);
   const lastMessage = messages.at(-1)!;
   return (
     <>
-      {visibleMessages.map((message) => <MessageItem key={message.id} message={message} onRunCommand={onRunCommand} showTools={false} />)}
+      {visibleMessages.map((message) => <MessageItem key={message.id} message={message} onRunCommand={onRunCommand} onRetryMessage={onRetryMessage} showTools={false} />)}
       <article className="message message-assistant message-python-run">
         <div className="message-avatar"><span className="mini-orbit"><span /></span></div>
         <div className="message-column">
@@ -473,10 +474,8 @@ function AttachmentStrip({ attachments }: { attachments: Attachment[] }) {
   const { language, locale } = useI18n();
   return (
     <div className="message-attachments">
-      {attachments.map((attachment) => attachment.isImage && attachment.previewUrl ? (
-        <figure key={attachment.id}><img src={attachment.previewUrl} alt={attachment.name} /><figcaption>{attachment.name}</figcaption></figure>
-      ) : (
-        <div key={attachment.id} className="file-attachment"><File size={17} /><span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size, language, locale)}</small></span></div>
+      {attachments.map((attachment) => (
+        <div key={attachment.id} className="file-attachment">{attachment.isImage ? <Image size={17} /> : <File size={17} />}<span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size, language, locale)}</small></span></div>
       ))}
     </div>
   );
@@ -621,13 +620,30 @@ function Composer({ project, conversation, models, commands, stats, isRunning, o
 }) {
   const { language, locale } = useI18n();
   const [draft, setDraft] = useState(conversation.draft);
+  const draftRef = useRef(conversation.draft);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const attachmentsRef = useRef<Attachment[]>([]);
+  const submittingRef = useRef(false);
   const [adding, setAdding] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [attachmentError, setAttachmentError] = useState<string>();
   const textarea = useRef<HTMLTextAreaElement>(null);
   const activeModel = models.find((model) => `${model.provider}/${model.id}` === conversation.model);
 
-  useEffect(() => setDraft(conversation.draft), [conversation.draft]);
+  useEffect(() => {
+    setDraft(conversation.draft);
+    draftRef.current = conversation.draft;
+  }, [conversation.draft]);
+  useEffect(() => {
+    const abandonedHandles = attachmentHandles(attachmentsRef.current);
+    attachmentsRef.current = [];
+    setAttachments([]);
+    setAttachmentError(undefined);
+    void releaseAttachmentHandles(abandonedHandles).catch(() => undefined);
+  }, [conversation.id]);
+  useEffect(() => () => {
+    void releaseAttachmentHandles(attachmentHandles(attachmentsRef.current)).catch(() => undefined);
+  }, []);
   useEffect(() => {
     const node = textarea.current;
     if (!node) return;
@@ -637,22 +653,44 @@ function Composer({ project, conversation, models, commands, stats, isRunning, o
 
   const updateDraft = (value: string) => {
     setDraft(value);
+    draftRef.current = value;
     onDraftChange(value);
   };
 
   const submit = async () => {
-    if ((!draft.trim() && attachments.length === 0) || adding) return;
+    if ((!draft.trim() && attachments.length === 0) || adding || submittingRef.current) return;
+    submittingRef.current = true;
     const sentDraft = draft;
     const sentAttachments = attachments;
     setDraft("");
+    draftRef.current = "";
     setAttachments([]);
+    attachmentsRef.current = [];
+    setAttachmentError(undefined);
     onDraftChange("");
     try {
       await onSend(sentDraft, sentAttachments);
-    } catch {
-      setDraft(sentDraft);
-      setAttachments(sentAttachments);
-      onDraftChange(sentDraft);
+    } catch (error) {
+      const currentDraft = draftRef.current;
+      const restoredDraft = !currentDraft.trim() || currentDraft === sentDraft
+        ? sentDraft
+        : [sentDraft, currentDraft].filter(Boolean).join("\n\n");
+      const currentAttachments = attachmentsRef.current.filter(
+        (item) => !sentAttachments.some((sent) => sent.id === item.id),
+      );
+      const restored = mergeAttachmentSelection(sentAttachments, currentAttachments);
+      setDraft(restoredDraft);
+      draftRef.current = restoredDraft;
+      setAttachments(restored.attachments);
+      attachmentsRef.current = restored.attachments;
+      setAttachmentError(
+        restored.issue
+          ? attachmentIssueLabel(restored.issue, language)
+          : attachmentSubmitError(error, language),
+      );
+      onDraftChange(restoredDraft);
+    } finally {
+      submittingRef.current = false;
     }
   };
 
@@ -664,56 +702,75 @@ function Composer({ project, conversation, models, commands, stats, isRunning, o
     if (event.key === "Escape" && isRunning) void onAbort();
   };
 
-  const addPaths = async (paths: string[]) => {
+  const acceptAttachments = (incoming: Attachment[]) => {
+    const result = mergeAttachmentSelection(attachmentsRef.current, incoming);
+    const acceptedIds = new Set(result.attachments.map((attachment) => attachment.id));
+    const rejectedHandles = attachmentHandles(
+      incoming.filter((attachment) => !acceptedIds.has(attachment.id)),
+    );
+    void releaseAttachmentHandles(rejectedHandles).catch(() => undefined);
+    attachmentsRef.current = result.attachments;
+    setAttachments(result.attachments);
+    setAttachmentError(result.issue ? attachmentIssueLabel(result.issue, language) : undefined);
+  };
+
+  const addFiles = async () => {
     setAdding(true);
+    setAttachmentError(undefined);
     try {
-      const results = await Promise.all(paths.map((path) => readAttachment(path)));
-      setAttachments((current) => [
-        ...current,
-        ...results.map((result) => ({
-          id: crypto.randomUUID(),
-          name: result.name,
-          path: result.path,
-          mimeType: result.mimeType,
-          size: result.size,
-          dataBase64: result.isImage ? result.dataBase64 : undefined,
-          previewUrl: result.isImage ? `data:${result.mimeType};base64,${result.dataBase64}` : undefined,
-          isImage: result.isImage,
-        })),
-      ]);
+      const current = attachmentsRef.current;
+      const remainingCount = Math.max(0, MAX_ATTACHMENT_COUNT - current.length);
+      const currentImageBytes = current.reduce(
+        (total, attachment) => total + (attachment.isImage ? attachment.size : 0),
+        0,
+      );
+      if (remainingCount === 0) {
+        setAttachmentError(attachmentIssueLabel("count", language));
+        return;
+      }
+      const results = await pickAttachments(
+        remainingCount,
+        Math.max(0, MAX_TOTAL_IMAGE_BYTES - currentImageBytes),
+      );
+      acceptAttachments(results.map((result) => ({
+        id: crypto.randomUUID(),
+        name: result.name,
+        path: result.path,
+        mimeType: result.mimeType,
+        size: result.size,
+        attachmentHandle: result.attachmentHandle,
+        isImage: result.isImage,
+      })));
+    } catch (error) {
+      setAttachmentError(error instanceof Error ? error.message : String(error));
     } finally {
       setAdding(false);
     }
   };
 
-  const addFiles = async () => {
-    const paths = await pickAttachmentPaths();
-    if (paths.length) await addPaths(paths);
-  };
-
-  const handlePaste = async (event: ClipboardEvent<HTMLTextAreaElement>) => {
-    const files = Array.from(event.clipboardData.files).filter((file) => file.type.startsWith("image/"));
+  const handlePaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = Array.from(event.clipboardData.files);
     if (!files.length) return;
-    const mapped = await Promise.all(files.map((file) => fileToAttachment(file, language)));
-    setAttachments((current) => [...current, ...mapped]);
+    event.preventDefault();
+    setAttachmentError(attachmentIssueLabel("native-picker-required", language));
   };
 
-  const handleDrop = async (event: DragEvent<HTMLDivElement>) => {
+  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault();
     setDragging(false);
     const files = Array.from(event.dataTransfer.files);
     if (!files.length) return;
-    const mapped = await Promise.all(files.map((file) => fileToAttachment(file, language)));
-    setAttachments((current) => [...current, ...mapped]);
+    setAttachmentError(attachmentIssueLabel("native-picker-required", language));
   };
 
   const contextPercent = stats?.contextUsage?.percent;
   return (
-    <div className={`composer-shell ${dragging ? "is-dragging" : ""}`} onDragEnter={(event) => { event.preventDefault(); setDragging(true); }} onDragOver={(event) => event.preventDefault()} onDragLeave={(event) => event.currentTarget === event.target && setDragging(false)} onDrop={(event) => void handleDrop(event)}>
-      {dragging ? <div className="drop-overlay"><Paperclip size={24} /><strong>{bi(language, "Déposez vos fichiers ici", "Drop your files here")}</strong></div> : null}
-      {attachments.length ? <div className="composer-attachments">{attachments.map((attachment) => <div key={attachment.id}>{attachment.previewUrl ? <img src={attachment.previewUrl} alt="" /> : <FileCode2 size={18} />}<span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size, language, locale)}</small></span><IconButton label={`${bi(language, "Retirer", "Remove")} ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))}><X size={14} /></IconButton></div>)}</div> : null}
+    <div className={`composer-shell ${dragging ? "is-dragging" : ""}`} onDragEnter={(event) => { event.preventDefault(); setDragging(true); }} onDragOver={(event) => event.preventDefault()} onDragLeave={(event) => event.currentTarget === event.target && setDragging(false)} onDrop={handleDrop}>
+      {dragging ? <div className="drop-overlay"><Paperclip size={24} /><strong>{bi(language, "Utilisez + pour autoriser ces fichiers", "Use + to authorize these files")}</strong></div> : null}
+      {attachments.length ? <div className="composer-attachments">{attachments.map((attachment) => <div key={attachment.id}>{attachment.isImage ? <Image size={18} /> : <FileCode2 size={18} />}<span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size, language, locale)}</small></span><IconButton label={`${bi(language, "Retirer", "Remove")} ${attachment.name}`} onClick={() => { const removed = attachmentsRef.current.find((item) => item.id === attachment.id); const next = attachmentsRef.current.filter((item) => item.id !== attachment.id); attachmentsRef.current = next; setAttachments(next); setAttachmentError(undefined); if (removed) void releaseAttachmentHandles(attachmentHandles([removed])).catch(() => undefined); }}><X size={14} /></IconButton></div>)}</div> : null}
+      {attachmentError ? <p className="trust-note" role="alert"><Info size={14} />{attachmentError}</p> : null}
       <div className="composer-editor">
-        <textarea ref={textarea} value={draft} onChange={(event) => updateDraft(event.target.value)} onKeyDown={handleKeyDown} onPaste={(event) => void handlePaste(event)} placeholder={isRunning ? bi(language, "Ajoutez une instruction à la suite…", "Add a follow-up instruction…") : `${bi(language, "Demandez quelque chose sur", "Ask something about")} ${project.name}…`} rows={1} aria-label={bi(language, "Message à Prime Agent", "Message Prime Agent")} />
+        <textarea ref={textarea} value={draft} onChange={(event) => updateDraft(event.target.value)} onKeyDown={handleKeyDown} onPaste={handlePaste} placeholder={isRunning ? bi(language, "Ajoutez une instruction à la suite…", "Add a follow-up instruction…") : `${bi(language, "Demandez quelque chose sur", "Ask something about")} ${project.name}…`} rows={1} aria-label={bi(language, "Message à Prime Agent", "Message Prime Agent")} />
       </div>
       <div className="composer-toolbar">
         <div className="composer-tools-left">
@@ -920,15 +977,78 @@ function Stat({ label, value, sub }: { label: string; value: string; sub: string
 
 function FolderIcon() { return <span className="detail-icon"><ListTree size={16} /></span>; }
 
-async function fileToAttachment(file: globalThis.File, language: AppLanguage): Promise<Attachment> {
-  const dataUrl = await new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file);
-  });
-  const dataBase64 = dataUrl.includes(",") ? dataUrl.slice(dataUrl.indexOf(",") + 1) : dataUrl;
-  return { id: crypto.randomUUID(), name: file.name || bi(language, "image-collée.png", "pasted-image.png"), mimeType: file.type || "application/octet-stream", size: file.size, dataBase64, previewUrl: file.type.startsWith("image/") ? dataUrl : undefined, isImage: file.type.startsWith("image/") };
+const MAX_IMAGE_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+const MAX_TOTAL_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_ATTACHMENT_COUNT = 20;
+
+function isSupportedInlineImageMime(mimeType: string) {
+  return ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(mimeType.toLowerCase());
+}
+
+export type AttachmentSelectionIssue = "count" | "image-size" | "image-total" | "missing-image-handle" | "pathless-file" | "unsupported-image" | "native-picker-required";
+
+function attachmentHandles(attachments: Attachment[]) {
+  return attachments.flatMap((attachment) => attachment.attachmentHandle ? [attachment.attachmentHandle] : []);
+}
+
+export function mergeAttachmentSelection(
+  current: Attachment[],
+  incoming: Attachment[],
+): { attachments: Attachment[]; issue?: AttachmentSelectionIssue } {
+  const accepted = [...current];
+  let imageBytes = current.reduce((total, attachment) => total + (attachment.isImage ? attachment.size : 0), 0);
+  let issue: AttachmentSelectionIssue | undefined;
+  for (const attachment of incoming) {
+    if (accepted.length >= MAX_ATTACHMENT_COUNT) {
+      issue ??= "count";
+      continue;
+    }
+    if (!attachment.isImage && !attachment.path) {
+      issue ??= "pathless-file";
+      continue;
+    }
+    if (attachment.isImage && attachment.size > MAX_IMAGE_ATTACHMENT_BYTES) {
+      issue ??= "image-size";
+      continue;
+    }
+    if (attachment.isImage && !isSupportedInlineImageMime(attachment.mimeType)) {
+      issue ??= "unsupported-image";
+      continue;
+    }
+    if (attachment.isImage && !attachment.attachmentHandle) {
+      issue ??= "missing-image-handle";
+      continue;
+    }
+    if (attachment.isImage && imageBytes + attachment.size > MAX_TOTAL_IMAGE_BYTES) {
+      issue ??= "image-total";
+      continue;
+    }
+    accepted.push(attachment);
+    if (attachment.isImage) imageBytes += attachment.size;
+  }
+  return { attachments: accepted, issue };
+}
+
+function attachmentIssueLabel(issue: AttachmentSelectionIssue, language: AppLanguage) {
+  if (issue === "count") return bi(language, "Vous pouvez joindre au maximum 20 fichiers.", "You can attach up to 20 files.");
+  if (issue === "image-size") return bi(language, "Une image dépasse la limite de 8 Mio.", "An image exceeds the 8 MB limit.");
+  if (issue === "image-total") return bi(language, "Le total des images jointes ne peut pas dépasser 10 Mio.", "Attached images cannot exceed 10 MB in total.");
+  if (issue === "missing-image-handle") return bi(language, "Une image a expiré. Sélectionnez-la de nouveau avec le bouton +.", "An image has expired. Select it again with the + button.");
+  if (issue === "unsupported-image") return bi(language, "Seules les images PNG, JPEG, WebP et GIF sont prises en charge.", "Only PNG, JPEG, WebP, and GIF images are supported.");
+  if (issue === "native-picker-required") return bi(language, "Pour joindre un fichier en toute sécurité, utilisez le bouton + et confirmez-le dans le sélecteur système.", "To attach a file securely, use the + button and confirm it in the system picker.");
+  return bi(language, "Pour joindre un document, utilisez le bouton + afin d’autoriser explicitement son chemin local.", "To attach a document, use the + button to explicitly authorize its local path.");
+}
+
+export function attachmentSubmitError(error: unknown, language: AppLanguage) {
+  const detail = error instanceof Error ? error.message : String(error);
+  if (/expir|handle|disponible|available/i.test(detail)) {
+    return bi(
+      language,
+      "L’image jointe n’est plus disponible. Sélectionnez-la de nouveau avec le bouton +.",
+      "The attached image is no longer available. Select it again with the + button.",
+    );
+  }
+  return `${bi(language, "Envoi impossible.", "Could not send.")} ${detail}`.trim();
 }
 
 function statusLabel(status: Conversation["status"], language: AppLanguage) {

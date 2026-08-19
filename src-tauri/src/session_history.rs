@@ -188,6 +188,46 @@ fn synthetic_v1_id(index: usize) -> String {
     format!("legacy-{index:08x}")
 }
 
+fn fold_child_usage_attributions(raw_entries: &mut [Value]) {
+    // Index once so a large child-agent transcript remains linear instead of
+    // scanning every message again for every attribution record.
+    let assistant_messages = raw_entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            if string_field(entry, "type") == Some("message")
+                && entry
+                    .get("message")
+                    .and_then(|message| string_field(message, "role"))
+                    == Some("assistant")
+            {
+                Some((string_field(entry, "id")?.to_string(), index))
+            } else {
+                None
+            }
+        })
+        .collect::<HashMap<_, _>>();
+    let usage_attributions = raw_entries
+        .iter()
+        .filter(|entry| string_field(entry, "type") == Some("child_usage_attributed"))
+        .filter_map(|entry| {
+            Some((
+                *assistant_messages.get(string_field(entry, "targetId")?)?,
+                entry.get("aggregateUsage")?.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    for (message_index, usage) in usage_attributions {
+        if let Some(message) = raw_entries[message_index]
+            .get_mut("message")
+            .and_then(Value::as_object_mut)
+        {
+            message.insert("usage".to_string(), usage);
+        }
+    }
+}
+
 fn parse_session(path: &Path) -> Result<ParsedSession, String> {
     let file = File::open(path)
         .map_err(|error| format!("Impossible d’ouvrir la session {}: {error}", path.display()))?;
@@ -289,30 +329,7 @@ fn parse_session(path: &Path) -> Result<ParsedSession, String> {
     // entries. Fold only the public aggregate counters into their assistant
     // message, exactly as the runtime loader does; never expose the attribution
     // records themselves.
-    let usage_attributions = raw_entries
-        .iter()
-        .filter(|entry| string_field(entry, "type") == Some("child_usage_attributed"))
-        .filter_map(|entry| {
-            Some((
-                string_field(entry, "targetId")?.to_string(),
-                entry.get("aggregateUsage")?.clone(),
-            ))
-        })
-        .collect::<Vec<_>>();
-    for (target_id, usage) in usage_attributions {
-        if let Some(message) = raw_entries.iter_mut().find(|entry| {
-            string_field(entry, "type") == Some("message")
-                && string_field(entry, "id") == Some(target_id.as_str())
-                && entry
-                    .get("message")
-                    .and_then(|message| string_field(message, "role"))
-                    == Some("assistant")
-        }) {
-            if let Some(message) = message.get_mut("message").and_then(Value::as_object_mut) {
-                message.insert("usage".to_string(), usage);
-            }
-        }
-    }
+    fold_child_usage_attributions(&mut raw_entries);
     if version <= 2 {
         for entry in &mut raw_entries {
             if string_field(entry, "type") != Some("message") {
@@ -1017,5 +1034,49 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(!first_line.contains("version"));
+    }
+
+    #[test]
+    fn folds_child_usage_only_into_the_target_assistant_message() {
+        let mut entries = vec![
+            json!({"type":"message","id":"assistant","message":{"role":"assistant","content":"ok"}}),
+            json!({"type":"message","id":"user","message":{"role":"user","content":"question"}}),
+            json!({"type":"child_usage_attributed","targetId":"assistant","aggregateUsage":{"totalTokens":17}}),
+            json!({"type":"child_usage_attributed","targetId":"user","aggregateUsage":{"totalTokens":99}}),
+            json!({"type":"child_usage_attributed","targetId":"missing","aggregateUsage":{"totalTokens":101}}),
+        ];
+
+        fold_child_usage_attributions(&mut entries);
+
+        assert_eq!(entries[0]["message"]["usage"]["totalTokens"], 17);
+        assert!(entries[1]["message"].get("usage").is_none());
+    }
+
+    #[test]
+    fn folds_a_large_usage_set_by_id() {
+        const COUNT: usize = 20_000;
+        let mut entries = Vec::with_capacity(COUNT * 2);
+        for index in 0..COUNT {
+            entries.push(json!({
+                "type":"message",
+                "id":format!("assistant-{index}"),
+                "message":{"role":"assistant","content":"ok"}
+            }));
+        }
+        for index in 0..COUNT {
+            entries.push(json!({
+                "type":"child_usage_attributed",
+                "targetId":format!("assistant-{index}"),
+                "aggregateUsage":{"totalTokens":index}
+            }));
+        }
+
+        fold_child_usage_attributions(&mut entries);
+
+        assert_eq!(entries[0]["message"]["usage"]["totalTokens"], 0);
+        assert_eq!(
+            entries[COUNT - 1]["message"]["usage"]["totalTokens"],
+            COUNT - 1
+        );
     }
 }

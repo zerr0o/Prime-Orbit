@@ -9,6 +9,7 @@ import {
   stopAgent,
   type StartAgentOptions,
 } from "../lib/bridge";
+import { redactText, redactValue } from "../lib/redaction";
 import type {
   ActivityItem,
   AgentSessionState,
@@ -17,6 +18,7 @@ import type {
   Conversation,
   ExtensionUiRequest,
   ModelInfo,
+  PendingExtensionUiRequest,
   Project,
   RpcEnvelope,
   RuntimeDetection,
@@ -70,8 +72,127 @@ const localHistoryIdentity = (conversation: Pick<Conversation, "id" | "sessionPa
 const localHistoryConversationPrefix = (conversationId: string) => `${conversationId}\0`;
 
 const cleanDiagnostic = (value: unknown) => (
-  typeof value === "string" && value.trim() ? value.trim() : undefined
+  typeof value === "string" && value.trim() ? redactText(value.trim()) : undefined
 );
+
+/** Only durable display metadata is allowed into app state. Native image
+ * handles are short-lived capabilities; image bytes/data URLs are never kept
+ * in a ChatMessage, including when an older object still carries such keys. */
+export function durableAttachmentMetadata(attachment: Attachment): Attachment {
+  return {
+    id: attachment.id,
+    name: attachment.name,
+    ...(attachment.path ? { path: attachment.path } : {}),
+    mimeType: attachment.mimeType,
+    size: attachment.size,
+    isImage: attachment.isImage,
+  };
+}
+
+export interface PromptTransaction {
+  conversationId: string;
+  messageId: string;
+  previous: Pick<Conversation, "draft" | "hasContent" | "status" | "title" | "updatedAt">;
+  optimisticStatus: Conversation["status"];
+  optimisticTitle: string;
+  optimisticUpdatedAt: string;
+  previousMessageCount: number;
+  previousActivityCount: number;
+}
+
+export function beginPromptTransaction(
+  conversation: Conversation,
+  input: { message: string; attachments: Attachment[]; messageId: string; createdAt: string },
+): { conversation: Conversation; transaction: PromptTransaction } {
+  const isFirst = conversation.messages.every((item) => item.role !== "user");
+  const title = isFirst && conversation.title === "Nouvelle conversation"
+    ? makeTitle(input.message.trim() || input.attachments[0]?.name || "Nouvelle conversation")
+    : conversation.title;
+  const status = conversation.status === "streaming" || conversation.status === "tool" || conversation.status === "queued"
+    ? "queued"
+    : "streaming";
+  const localMessage: ChatMessage = {
+    id: input.messageId,
+    role: "user",
+    content: input.message.trim() || "Analyse les pièces jointes.",
+    createdAt: input.createdAt,
+    status: "pending",
+    attachments: input.attachments.map(durableAttachmentMetadata),
+  };
+  return {
+    conversation: {
+      ...conversation,
+      title,
+      hasContent: true,
+      status,
+      messages: [...conversation.messages, localMessage],
+      updatedAt: input.createdAt,
+    },
+    transaction: {
+      conversationId: conversation.id,
+      messageId: input.messageId,
+      previous: {
+        draft: conversation.draft,
+        hasContent: conversation.hasContent,
+        status: conversation.status,
+        title: conversation.title,
+        updatedAt: conversation.updatedAt,
+      },
+      optimisticStatus: status,
+      optimisticTitle: title,
+      optimisticUpdatedAt: input.createdAt,
+      previousMessageCount: conversation.messages.length,
+      previousActivityCount: conversation.activities.length,
+    },
+  };
+}
+
+export function commitPromptTransaction(conversation: Conversation, transaction: PromptTransaction): Conversation {
+  if (conversation.id !== transaction.conversationId) return conversation;
+  let changed = false;
+  const messages = conversation.messages.map((message) => {
+    if (message.id !== transaction.messageId || message.status !== "pending") return message;
+    changed = true;
+    return { ...message, status: "complete" as const };
+  });
+  return changed ? { ...conversation, messages } : conversation;
+}
+
+export function rollbackPromptTransaction(conversation: Conversation, transaction: PromptTransaction): Conversation {
+  if (conversation.id !== transaction.conversationId) return conversation;
+  const messages = conversation.messages.filter((message) => message.id !== transaction.messageId);
+  if (messages.length === conversation.messages.length) return conversation;
+  const hasConcurrentContent = messages.length !== transaction.previousMessageCount
+    || conversation.activities.length !== transaction.previousActivityCount;
+  return {
+    ...conversation,
+    messages,
+    status: conversation.status === transaction.optimisticStatus ? transaction.previous.status : conversation.status,
+    title: conversation.title === transaction.optimisticTitle ? transaction.previous.title : conversation.title,
+    hasContent: !hasConcurrentContent && conversation.hasContent === true
+      ? transaction.previous.hasContent
+      : conversation.hasContent,
+    draft: conversation.draft === "" ? transaction.previous.draft : conversation.draft,
+    updatedAt: conversation.updatedAt === transaction.optimisticUpdatedAt
+      ? transaction.previous.updatedAt
+      : conversation.updatedAt,
+  };
+}
+
+export function extensionRequestKey(conversationId: string, requestId: string) {
+  return `${conversationId}\0${requestId}`;
+}
+
+export function enqueueExtensionRequest(
+  requests: PendingExtensionUiRequest[],
+  request: PendingExtensionUiRequest,
+): PendingExtensionUiRequest[] {
+  const existing = requests.findIndex((item) => item.requestKey === request.requestKey);
+  if (existing < 0) return [...requests, request];
+  const next = [...requests];
+  next[existing] = request;
+  return next;
+}
 
 /**
  * Builds the authoritative diagnostic for a process exit. stderr usually
@@ -129,7 +250,7 @@ export function useAgentRuntime(options: {
     onInstallComplete,
   } = options;
   const [runtimes, setRuntimes] = useState<RuntimeMap>({});
-  const [extensionRequest, setExtensionRequest] = useState<(ExtensionUiRequest & { conversationId: string }) | undefined>();
+  const [extensionRequests, setExtensionRequests] = useState<PendingExtensionUiRequest[]>([]);
   const [eventsReady, setEventsReady] = useState(!isNative());
   const started = useRef(new Set<string>());
   const startInFlight = useRef(new Map<string, Promise<void>>());
@@ -146,6 +267,7 @@ export function useAgentRuntime(options: {
   const activeBashActivities = useRef(new Map<string, string>());
   const lastStderr = useRef(new Map<string, string>());
   const processExitErrors = useRef(new Map<string, string>());
+  const extensionResponsesInFlight = useRef(new Set<string>());
   const getConversationRef = useRef(getConversation);
 
   // Event callbacks can run between React's render and effect phases. Keeping
@@ -328,10 +450,10 @@ export function useAgentRuntime(options: {
           updatedAt: eventTime,
           updateCount: previous ? (previous.updateCount ?? 1) + (activity.updateCount ?? 1) : activity.updateCount ?? 1,
           type: activity.type,
-          title: activity.title,
-          detail: activity.detail ?? previous?.detail,
+          title: redactText(activity.title),
+          detail: activity.detail ? redactText(activity.detail) : previous?.detail,
           status: activity.status,
-          raw: activity.raw,
+          raw: activity.raw === undefined ? undefined : redactValue(activity.raw),
         };
         const activities = [...conversation.activities];
         if (index >= 0) activities[index] = next;
@@ -349,7 +471,7 @@ export function useAgentRuntime(options: {
         ...current,
         [conversationId]: {
           ...runtime,
-          logs: [...runtime.logs, { id: uid("log"), stream, text, createdAt: now() }].slice(-500),
+          logs: [...runtime.logs, { id: uid("log"), stream, text: redactText(text), createdAt: now() }].slice(-500),
         },
       };
     });
@@ -374,7 +496,7 @@ export function useAgentRuntime(options: {
       }
 
       if (message.success === false) {
-        const error = message.error ?? `La commande ${message.command ?? "RPC"} a échoué.`;
+        const error = cleanDiagnostic(message.error) ?? `La commande ${message.command ?? "RPC"} a échoué.`;
         updateConversation(conversationId, { status: "error", lastError: error });
         addActivity(conversationId, { type: "error", title: "Prime Agent a signalé une erreur", detail: error, status: "error", raw: message });
         return;
@@ -523,7 +645,12 @@ export function useAgentRuntime(options: {
           });
           void sendRpc(conversationId, { type: "extension_ui_response", id: request.id, cancelled: true }).catch(() => undefined);
         } else if (request.method !== "setStatus" && request.method !== "setWidget" && request.method !== "setTitle" && request.method !== "set_editor_text") {
-          setExtensionRequest({ ...request, conversationId });
+          const pendingRequest: PendingExtensionUiRequest = {
+            ...request,
+            conversationId,
+            requestKey: extensionRequestKey(conversationId, request.id),
+          };
+          setExtensionRequests((current) => enqueueExtensionRequest(current, pendingRequest));
         }
         return;
       }
@@ -682,7 +809,7 @@ export function useAgentRuntime(options: {
         return;
       }
       if (eventType.includes("error") || eventType === "turn_error") {
-        const error = String(event.error ?? event.message ?? "Erreur inconnue");
+        const error = redactText(String(event.error ?? event.message ?? "Erreur inconnue"));
         const boundaryTime = now();
         updateConversation(conversationId, (conversation) => ({
           ...finalizeConversationTools(conversation, "failed", boundaryTime),
@@ -714,7 +841,7 @@ export function useAgentRuntime(options: {
         }
       },
       onStderr: ({ conversationId, line }) => {
-        const detail = line.trim();
+        const detail = redactText(line.trim());
         if (detail) {
           const previous = lastStderr.current.get(conversationId);
           lastStderr.current.set(conversationId, `${previous ? `${previous}\n` : ""}${detail}`.slice(-1_200));
@@ -722,6 +849,7 @@ export function useAgentRuntime(options: {
         addLog(conversationId, "stderr", truncateRuntimeLog(line));
       },
       onExit: ({ conversationId, code, success, error }) => {
+        setExtensionRequests((current) => current.filter((request) => request.conversationId !== conversationId));
         started.current.delete(conversationId);
         startInFlight.current.delete(conversationId);
         const expected = intentionallyStopped.current.delete(conversationId);
@@ -744,8 +872,8 @@ export function useAgentRuntime(options: {
           lastError: exitDiagnostic,
         }));
       },
-      onInstallProgress: ({ phase, message }) => onInstallProgress(phase, message),
-      onInstallComplete,
+      onInstallProgress: ({ phase, message }) => onInstallProgress(phase, redactText(message)),
+      onInstallComplete: (result) => onInstallComplete(redactValue(result)),
     }).then((fn) => {
       if (cancelled) fn();
       else {
@@ -878,10 +1006,10 @@ export function useAgentRuntime(options: {
           // onExit rejects the pending get_messages request synchronously. Its
           // precise stderr diagnostic is authoritative over that derived
           // cancellation error, irrespective of React update ordering.
-          const message = startupErrorMessage(
+          const message = redactText(startupErrorMessage(
             error,
             processExitErrors.current.get(conversation.id),
-          );
+          ));
           updateConversation(conversation.id, { status: "error", lastError: message });
         }
         throw error;
@@ -931,9 +1059,9 @@ export function useAgentRuntime(options: {
         .then(({ localError }) => {
           if (!isCurrentSelection(selectedConversation.id, token.generation)) return;
           const runtimeError = detection.error ?? "Prime Agent est indisponible. L’historique local reste consultable.";
-          const diagnostic = localError
+          const diagnostic = redactText(localError
             ? `${runtimeError}\n\nHistorique local : ${localError}`
-            : runtimeError;
+            : runtimeError);
           updateConversation(selectedConversation.id, (current) => {
             if (current.status === "error" && current.lastError === diagnostic) return current;
             return { ...current, status: "error", lastError: diagnostic };
@@ -955,37 +1083,43 @@ export function useAgentRuntime(options: {
   const sendPrompt = useCallback(
     async (message: string, attachments: Attachment[]) => {
       if (!selectedConversation || !selectedProject) return;
+      const conversationId = selectedConversation.id;
       const trimmed = message.trim();
       if (!trimmed && attachments.length === 0) return;
+      if (attachments.some((item) => item.isImage && !item.attachmentHandle)) {
+        throw new Error("Image attachment handle unavailable; select the image again.");
+      }
       await ensureStarted(selectedConversation, selectedProject);
       const textAttachments = attachments.filter((item) => !item.isImage && item.path);
       const attachmentContext = textAttachments.length
-        ? `\n\nFichiers joints (à lire depuis le projet) :\n${textAttachments.map((item) => `- ${item.path}`).join("\n")}`
+        ? `\n\nFichiers joints explicitement sélectionnés (chemins locaux) :\n${textAttachments.map((item) => `- ${JSON.stringify(item.path)}`).join("\n")}`
         : "";
       const content = `${trimmed}${attachmentContext}`.trim();
-      const localMessage: ChatMessage = {
-        id: uid("user"),
-        role: "user",
-        content: trimmed || "Analyse les pièces jointes.",
-        createdAt: now(),
-        status: "complete",
-        attachments,
-      };
-      updateConversation(selectedConversation.id, (conversation) => {
-        const isFirst = conversation.messages.filter((item) => item.role === "user").length === 0;
-        return {
-          ...conversation,
-          title: isFirst && conversation.title === "Nouvelle conversation" ? makeTitle(trimmed || attachments[0]?.name || "Nouvelle conversation") : conversation.title,
-          hasContent: true,
-          draft: "",
-          status: conversation.status === "streaming" || conversation.status === "tool" ? "queued" : "streaming",
-          messages: [...conversation.messages, localMessage],
-          updatedAt: now(),
-        };
+      const preparation: { value?: ReturnType<typeof beginPromptTransaction> } = {};
+      const messageId = uid("user");
+      const createdAt = now();
+      // useWorkspace evaluates this functional updater against its synchronous
+      // authoritative ref. Building the transaction inside it prevents a
+      // render-stale snapshot from restoring an old draft or dropping a
+      // concurrent runtime event.
+      updateConversation(conversationId, (current) => {
+        const prepared = beginPromptTransaction(current, {
+          message: trimmed,
+          attachments,
+          messageId,
+          createdAt,
+        });
+        preparation.value = prepared;
+        return prepared.conversation;
       });
+      const prepared = preparation.value;
+      if (!prepared) {
+        throw new Error("La conversation n’est plus disponible.");
+      }
       if (!isNative()) {
+        updateConversation(conversationId, (conversation) => commitPromptTransaction(conversation, prepared.transaction));
         window.setTimeout(() => {
-          updateConversation(selectedConversation.id, (conversation) => ({
+          updateConversation(conversationId, (conversation) => ({
             ...conversation,
             status: "idle",
             messages: [
@@ -1003,20 +1137,43 @@ export function useAgentRuntime(options: {
         return;
       }
       const images = attachments
-        .filter((item) => item.isImage && item.dataBase64)
-        .map((item) => ({ type: "image", data: item.dataBase64, mimeType: item.mimeType }));
-      await sendRpc(selectedConversation.id, {
-        id: uid("prompt"),
-        type: "prompt",
-        message: content,
-        ...(images.length ? { images } : {}),
-        ...(selectedConversation.status === "streaming" || selectedConversation.status === "tool"
-          ? { streamingBehavior: "followUp" }
-          : {}),
-      });
+        .filter((item) => item.isImage && item.attachmentHandle)
+        .map((item) => ({ type: "image", attachmentHandle: item.attachmentHandle }));
+      try {
+        await sendRpc(conversationId, {
+          id: uid("prompt"),
+          type: "prompt",
+          message: content,
+          ...(images.length ? { images } : {}),
+          ...(prepared.transaction.previous.status === "streaming" || prepared.transaction.previous.status === "tool" || prepared.transaction.previous.status === "queued"
+            ? { streamingBehavior: "followUp" }
+            : {}),
+        });
+        updateConversation(conversationId, (conversation) => commitPromptTransaction(conversation, prepared.transaction));
+      } catch (error) {
+        updateConversation(conversationId, (conversation) => rollbackPromptTransaction(conversation, prepared.transaction));
+        throw error;
+      }
     },
     [ensureStarted, selectedConversation, selectedProject, updateConversation],
   );
+
+  const retryMessage = useCallback(async (assistantMessageId: string) => {
+    if (!selectedConversation) return;
+    const conversation = getConversationRef.current(selectedConversation.id) ?? selectedConversation;
+    const assistantIndex = conversation.messages.findIndex((message) => message.id === assistantMessageId);
+    if (assistantIndex < 0) return;
+    for (let index = assistantIndex - 1; index >= 0; index -= 1) {
+      const source = conversation.messages[index];
+      if (source?.role !== "user") continue;
+      // A sent image handle is deliberately consumed natively after a
+      // successful write and cannot be replayed. Reuse only the source text
+      // in the composer so the user can review it and explicitly reselect any
+      // attachments, rather than pretending to regenerate a historical turn.
+      updateConversation(conversation.id, (current) => ({ ...current, draft: source.content }));
+      return;
+    }
+  }, [selectedConversation, updateConversation]);
 
   const abort = useCallback(async () => {
     if (!selectedConversation) return;
@@ -1082,11 +1239,33 @@ export function useAgentRuntime(options: {
     [ensureStarted, loadConversationHistory, selectedConversation, selectedProject, sendSelectionRequest],
   );
 
-  const answerExtensionRequest = useCallback(async (response: Record<string, unknown>) => {
-    if (!extensionRequest) return;
-    await sendRpc(extensionRequest.conversationId, { type: "extension_ui_response", id: extensionRequest.id, ...response });
-    setExtensionRequest(undefined);
-  }, [extensionRequest]);
+  const answerExtensionRequest = useCallback(async (
+    request: PendingExtensionUiRequest,
+    response: Record<string, unknown>,
+  ) => {
+    if (extensionResponsesInFlight.current.has(request.requestKey)) return;
+    extensionResponsesInFlight.current.add(request.requestKey);
+    // Close/dequeue first. A failed cancellation must never leave a stale modal
+    // blocking subsequent requests or accidentally target a newer request.
+    setExtensionRequests((current) => current.filter((item) => item.requestKey !== request.requestKey));
+    try {
+      await sendRpc(request.conversationId, {
+        type: "extension_ui_response",
+        id: request.id,
+        ...response,
+      });
+    } catch (error) {
+      addActivity(request.conversationId, {
+        id: `extension-response:${request.id}`,
+        type: "extension_ui_response_error",
+        title: "Réponse à l’extension non transmise",
+        detail: error instanceof Error ? error.message : String(error),
+        status: "warning",
+      });
+    } finally {
+      extensionResponsesInFlight.current.delete(request.requestKey);
+    }
+  }, [addActivity]);
 
   const runtime = selectedConversation ? runtimes[selectedConversation.id] : undefined;
   const groupedModels = useMemo(() => {
@@ -1106,9 +1285,11 @@ export function useAgentRuntime(options: {
     stats: runtime?.stats,
     sessionState: runtime?.state,
     logs: runtime?.logs ?? [],
-    extensionRequest,
+    extensionRequest: extensionRequests[0],
+    extensionRequestCount: extensionRequests.length,
     ensureStarted,
     sendPrompt,
+    retryMessage,
     abort,
     closeRuntime,
     chooseModel,
@@ -1393,12 +1574,15 @@ function applyToolEventToConversation(conversation: Conversation, event: RpcEnve
     id: activityId,
     type: event.type,
     title: toolActivityTitle(reconciled.tool),
-    detail: toolActivityDetail(reconciled.tool) ?? previousActivity?.detail,
+    detail: (() => {
+      const detail = toolActivityDetail(reconciled.tool);
+      return detail ? redactText(detail) : previousActivity?.detail;
+    })(),
     status: toolActivityStatus(reconciled.tool.status),
     createdAt: previousActivity?.createdAt ?? reconciled.tool.startedAt,
     updatedAt: eventTime,
     updateCount: (previousActivity?.updateCount ?? 0) + 1,
-    raw: event,
+    raw: redactValue(event),
   };
   const activities = [...conversation.activities];
   if (activityIndex >= 0) activities[activityIndex] = activity;

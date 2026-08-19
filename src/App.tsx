@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   Activity,
+  Archive,
   Blocks,
   Bot,
   Check,
@@ -21,6 +22,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import { AppContextMenu } from "./components/AppContextMenu";
 import { ConversationView } from "./components/ConversationView";
 import { ConnectionsView, HomeView, Onboarding, ProjectsView, RunsView, SettingsView } from "./components/DashboardViews";
 import { GlobalRail, ProjectSidebar } from "./components/Navigation";
@@ -35,12 +37,15 @@ import {
   openPrimeAgentTerminal,
   pickProjectFolder,
   quickInstallPrimeAgent,
+  openProjectFolder,
   stopAgent,
 } from "./lib/bridge";
+import { redactText } from "./lib/redaction";
 import type { AppView, ExtensionUiRequest, GitChange, PermissionPreset, PersistedAppState, Project, RuntimeDetection } from "./types";
 
 interface InstallState {
   running: boolean;
+  outcome?: "success" | "error";
   phase?: string;
   lines: string[];
 }
@@ -66,6 +71,8 @@ function App() {
     reorderConversation,
     deleteProject,
     archiveConversation,
+    workspaceSaveError,
+    retryWorkspaceSave,
   } = workspace;
   const [detection, setDetection] = useState<RuntimeDetection>();
   const [installState, setInstallState] = useState<InstallState>({ running: false, lines: [] });
@@ -77,6 +84,8 @@ function App() {
   const [onboardingDismissed, setOnboardingDismissed] = useState(false);
   const [toast, setToast] = useState<{ tone: "info" | "success" | "error"; message: string }>();
   const [projectToDelete, setProjectToDelete] = useState<Project>();
+  const [projectToRename, setProjectToRename] = useState<Project>();
+  const [projectToArchive, setProjectToArchive] = useState<Project>();
 
   useEffect(() => {
     setAppLanguage(state.preferences.language);
@@ -95,9 +104,37 @@ function App() {
   }, []);
   const onInstallComplete = useCallback((result: RuntimeDetection) => {
     setDetection(result);
-    setInstallState((current) => ({ ...current, running: false, phase: result.installed ? t("app.installComplete") : t("app.installInterrupted") }));
+    setInstallState((current) => ({
+      ...current,
+      running: false,
+      outcome: result.installed ? "success" : "error",
+      phase: result.installed ? t("app.installComplete") : t("app.installInterrupted"),
+    }));
     setToast({ tone: result.installed ? "success" : "error", message: result.installed ? t("app.agentReady") : result.error ?? t("app.installFailed") });
   }, [t]);
+
+  const installPrimeAgent = useCallback(async () => {
+    if (installState.running) return;
+    setInstallState({
+      running: true,
+      outcome: undefined,
+      phase: t("app.installPreparing"),
+      lines: [t("app.installStarting")],
+    });
+    try {
+      await quickInstallPrimeAgent();
+    } catch (error) {
+      const message = redactText(error instanceof Error ? error.message : String(error));
+      setInstallState((current) => ({
+        ...current,
+        running: false,
+        outcome: "error",
+        phase: t("app.installInterrupted"),
+        lines: [...current.lines, message].slice(-250),
+      }));
+      setToast({ tone: "error", message: t("app.installFailed") + `: ${message}` });
+    }
+  }, [installState.running, t]);
 
   const getProject = useCallback((projectId: string) => state.projects.find((project) => project.id === projectId), [state.projects]);
   const getConversation = useCallback((conversationId: string) => state.conversations.find((conversation) => conversation.id === conversationId), [state.conversations]);
@@ -188,10 +225,51 @@ function App() {
   const removeProject = useCallback(async (project: Project) => {
     const conversations = state.conversations.filter((conversation) => conversation.projectId === project.id);
     await Promise.allSettled(conversations.map((conversation) => stopAgent(conversation.id)));
+    const wasSelected = state.selectedProjectId === project.id;
     deleteProject(project.id);
+    if (wasSelected) setView("projects");
     setProjectToDelete(undefined);
     setToast({ tone: "success", message: t("app.projectRemoved", { name: project.name }) });
-  }, [deleteProject, state.conversations, t]);
+  }, [deleteProject, setView, state.conversations, state.selectedProjectId, t]);
+
+  const toggleProjectPin = useCallback((project: Project) => {
+    updateProject(project.id, { pinned: !project.pinned });
+  }, [updateProject]);
+
+  const renameProject = useCallback((project: Project, name: string) => {
+    updateProject(project.id, { name });
+    setProjectToRename(undefined);
+    setToast({ tone: "success", message: t("app.projectRenamed", { name }) });
+  }, [t, updateProject]);
+
+  const revealProject = useCallback(async (project: Project) => {
+    try {
+      await openProjectFolder(project.path);
+    } catch (error) {
+      setToast({
+        tone: "error",
+        message: t("app.revealProjectFailed", { error: error instanceof Error ? error.message : String(error) }),
+      });
+    }
+  }, [t]);
+
+  const archiveProjectConversations = useCallback(async (project: Project) => {
+    const conversations = state.conversations.filter(
+      (conversation) => conversation.projectId === project.id && !conversation.archived,
+    );
+    const results = await Promise.allSettled(conversations.map((conversation) => stopAgent(conversation.id)));
+    let archivedCount = 0;
+    results.forEach((result, index) => {
+      if (result.status !== "fulfilled") return;
+      archiveConversation(conversations[index]!.id);
+      archivedCount += 1;
+    });
+    const failedCount = conversations.length - archivedCount;
+    setProjectToArchive(undefined);
+    setToast(failedCount > 0
+      ? { tone: "error", message: t(failedCount === 1 ? "app.archiveProjectFailed.one" : "app.archiveProjectFailed.other", { count: failedCount }) }
+      : { tone: "success", message: t(archivedCount === 1 ? "app.projectChatsArchived.one" : "app.projectChatsArchived.other", { count: archivedCount, name: project.name }) });
+  }, [archiveConversation, state.conversations, t]);
 
   useEffect(() => {
     const handleKeydown = (event: globalThis.KeyboardEvent) => {
@@ -222,22 +300,26 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
-  if (!loaded || !detection) return <AppBoot />;
+  if (!loaded || !detection) return <><AppBoot /><AppContextMenu /></>;
 
   const showOnboarding = !onboardingDismissed && !detection.installed;
   if (showOnboarding) {
     return (
-      <Onboarding
-        detection={detection}
-        installState={installState}
-        onInstall={() => { setInstallState({ running: true, phase: t("app.installPreparing"), lines: [t("app.installStarting")] }); void quickInstallPrimeAgent(); }}
-        onUseExisting={() => { setOnboardingDismissed(true); setView("settings"); }}
-        onContinue={() => setOnboardingDismissed(true)}
-      />
+      <>
+        <Onboarding
+          detection={detection}
+          installState={installState}
+          onInstall={() => void installPrimeAgent()}
+          onUseExisting={() => { setOnboardingDismissed(true); setView("settings"); }}
+          onContinue={() => setOnboardingDismissed(true)}
+        />
+        <AppContextMenu />
+      </>
     );
   }
 
   const showProjectSidebar = view === "chat" && Boolean(selectedProject);
+  const extensionRequest = agent.extensionRequest;
   return (
     <div className="app-shell">
       <GlobalRail view={view} onView={setView} onNewConversation={newConversation} onOpenProject={() => void openProject()} onCommandPalette={() => setCommandPalette(true)} activeRuns={activeRuns} />
@@ -264,7 +346,7 @@ function App() {
         {view === "projects" ? <ProjectsView projects={state.projects} conversations={state.conversations} onProject={selectProject} onOpenProject={() => void openProject()} onDeleteProject={(project) => setProjectToDelete(project)} /> : null}
         {view === "runs" ? <RunsView projects={state.projects} conversations={state.conversations} onConversation={selectConversation} /> : null}
         {view === "connections" ? <ConnectionsView models={agent.models} projectPath={terminalProjectPath} onOpenSetup={openSetup} /> : null}
-        {view === "settings" ? <SettingsView state={state} setState={updateState} detection={detection} installState={installState} onRefreshDetection={refreshDetection} /> : null}
+        {view === "settings" ? <SettingsView state={state} setState={updateState} detection={detection} installState={installState} onRefreshDetection={refreshDetection} onInstall={installPrimeAgent} /> : null}
         {view === "chat" && selectedProject && selectedConversation ? (
           <ConversationView
             project={selectedProject}
@@ -278,6 +360,7 @@ function App() {
             onToggleInspector={toggleInspector}
             onDraftChange={(draft) => updateConversation(selectedConversation.id, { draft })}
             onSend={agent.sendPrompt}
+            onRetryMessage={agent.retryMessage}
             onAbort={agent.abort}
             onModel={agent.chooseModel}
             onThinking={agent.setThinking}
@@ -317,10 +400,84 @@ function App() {
           onNewWindow={() => { void createWorkspaceWindow(); setCommandPalette(false); }}
         />
       ) : null}
-      {agent.extensionRequest ? <ExtensionRequestModal request={agent.extensionRequest} onAnswer={agent.answerExtensionRequest} /> : null}
+      {extensionRequest ? (
+        <ExtensionRequestModal
+          key={extensionRequest.requestKey}
+          request={extensionRequest}
+          onAnswer={(response) => agent.answerExtensionRequest(extensionRequest, response)}
+        />
+      ) : null}
+      <AppContextMenu
+        projects={state.projects}
+        conversations={state.conversations}
+        onToggleProjectPin={toggleProjectPin}
+        onRenameProject={setProjectToRename}
+        onRevealProject={revealProject}
+        onArchiveProjectConversations={setProjectToArchive}
+        onDeleteProject={setProjectToDelete}
+      />
+      {projectToRename ? <RenameProjectModal project={projectToRename} onClose={() => setProjectToRename(undefined)} onConfirm={renameProject} /> : null}
+      {projectToArchive ? <ArchiveProjectModal project={projectToArchive} conversationCount={state.conversations.filter((conversation) => conversation.projectId === projectToArchive.id && !conversation.archived).length} onClose={() => setProjectToArchive(undefined)} onConfirm={archiveProjectConversations} /> : null}
       {projectToDelete ? <DeleteProjectModal project={projectToDelete} conversationCount={state.conversations.filter((conversation) => conversation.projectId === projectToDelete.id).length} onClose={() => setProjectToDelete(undefined)} onConfirm={removeProject} /> : null}
       {toast ? <div className={`toast toast-${toast.tone}`}>{toast.tone === "success" ? <Check size={16} /> : toast.tone === "error" ? <CircleAlert size={16} /> : <Sparkles size={16} />}{toast.message}<IconButton label={t("common.close")} onClick={() => setToast(undefined)}><X size={14} /></IconButton></div> : null}
+      {workspaceSaveError ? (
+        <div className="toast toast-error" role="alert" title={workspaceSaveError} style={{ bottom: toast ? 94 : 42 }}>
+          <CircleAlert size={16} />
+          <span>{state.preferences.language === "en" ? "Workspace changes could not be saved." : "Les modifications de l’espace de travail n’ont pas pu être enregistrées."}</span>
+          <Button variant="ghost" onClick={retryWorkspaceSave}>{state.preferences.language === "en" ? "Retry" : "Réessayer"}</Button>
+        </div>
+      ) : null}
     </div>
+  );
+}
+
+function RenameProjectModal({ project, onClose, onConfirm }: { project: Project; onClose: () => void; onConfirm: (project: Project, name: string) => void }) {
+  const { t } = useI18n();
+  const [name, setName] = useState(project.name);
+  const normalized = name.trim();
+  const confirm = () => {
+    if (!normalized) return;
+    onConfirm(project, normalized);
+  };
+  return (
+    <Modal
+      title={t("app.renameProjectTitle")}
+      description={t("app.renameProjectDescription")}
+      onClose={onClose}
+      footer={<><Button variant="secondary" onClick={onClose}>{t("common.cancel")}</Button><Button variant="primary" disabled={!normalized} onClick={confirm}>{t("app.renameProjectAction")}</Button></>}
+    >
+      <label className="confirmation-field">
+        <span>{t("app.projectName")}</span>
+        <input value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") confirm(); }} autoFocus autoComplete="off" />
+      </label>
+    </Modal>
+  );
+}
+
+function ArchiveProjectModal({ project, conversationCount, onClose, onConfirm }: { project: Project; conversationCount: number; onClose: () => void; onConfirm: (project: Project) => Promise<void> }) {
+  const { t } = useI18n();
+  const [archiving, setArchiving] = useState(false);
+  const confirm = async () => {
+    if (archiving || conversationCount === 0) return;
+    setArchiving(true);
+    try {
+      await onConfirm(project);
+    } finally {
+      setArchiving(false);
+    }
+  };
+  return (
+    <Modal
+      title={t("app.archiveProjectTitle", { name: project.name })}
+      description={t("app.archiveProjectDescription")}
+      onClose={onClose}
+      footer={<><Button variant="secondary" onClick={onClose} disabled={archiving}>{t("common.cancel")}</Button><Button variant="primary" loading={archiving} disabled={conversationCount === 0} onClick={() => void confirm()}><Archive size={15} />{t("app.archiveProjectAction")}</Button></>}
+    >
+      <div className="delete-project-warning">
+        <Archive size={20} />
+        <div><strong>{t(conversationCount === 1 ? "app.archiveProjectConversations.one" : "app.archiveProjectConversations.other", { count: conversationCount })}</strong><p>{t("app.archiveProjectFilesKept")}</p></div>
+      </div>
+    </Modal>
   );
 }
 

@@ -1598,6 +1598,10 @@ kbd { padding: 2px 5px; border: 1px solid var(--border); border-radius: 5px; col
   outline: none;
 }
 
+.app-context-item.is-danger { color: var(--danger); }
+.app-context-item.is-danger:hover,
+.app-context-item.is-danger:focus-visible { background: color-mix(in srgb, var(--danger) 10%, transparent); }
+
 .app-context-item:disabled {
   color: var(--text-faint);
   cursor: default;

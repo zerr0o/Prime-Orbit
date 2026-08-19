@@ -61,10 +61,10 @@ Prime Agent's interactive `/login`, `/logout`, and OAuth MCP flows still run in 
 4. Let the onboarding flow detect Prime Agent, or use **Quick install** to install it from the official repository.
 5. Configure a provider, create a conversation, and start working.
 
-The 0.1.9 desktop build is validated on Windows 10/11 x64. Microsoft Edge WebView2 is normally already present on supported Windows installations.
+The 0.1.10 desktop build is validated on Windows 10/11 x64. Microsoft Edge WebView2 is normally already present on supported Windows installations.
 
 > [!IMPORTANT]
-> The 0.1.9 installers are not code-signed yet. Windows SmartScreen may display an unknown-publisher warning. Verify the SHA-256 values in the release notes before running a downloaded installer.
+> The 0.1.10 installers are not code-signed yet. Windows SmartScreen may display an unknown-publisher warning. Verify the SHA-256 values in the release notes before running a downloaded installer.
 
 ### Prime Agent requirements
 
@@ -76,6 +76,8 @@ For an existing or managed Prime Agent installation, Prime Orbit checks for:
 - Bash (Git Bash is supported on Windows).
 
 The managed installer clones only the official Prime Agent repository. It refuses an unexpected origin, an unsafe target path, or unrecognized local changes, and pins the runtime to an exact verified stable tag and commit.
+
+Prime Orbit's development and Vite 8 build toolchain has a separate Node.js 22.12 minimum, declared in `package.json` and enforced by CI.
 
 ## Core capabilities
 
@@ -142,9 +144,9 @@ The renderer never launches child processes directly. The Rust backend validates
 
 ### Prerequisites
 
-- Node.js 22.8+
+- Node.js 22.12+
 - npm
-- Rust stable
+- Rust 1.88 or newer (the version declared and tested by the project)
 - [Tauri 2 system dependencies](https://v2.tauri.app/start/prerequisites/)
 - Git and Bash for the managed Prime Agent installation flow
 
@@ -174,7 +176,7 @@ Tauri writes platform bundles under `src-tauri/target/release/bundle/`.
 
 ## Release status
 
-Prime Orbit is an early desktop release. Version 0.1.9 ships Windows x64 NSIS and MSI installers. macOS and Linux code paths exist, but official binaries have not yet been validated or published.
+Prime Orbit is an early desktop release. Version 0.1.10 ships Windows x64 NSIS and MSI installers. macOS and Linux code paths exist, but official binaries have not yet been validated or published.
 
 See [CHANGELOG.md](CHANGELOG.md) for release details.
 

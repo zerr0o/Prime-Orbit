@@ -1,11 +1,11 @@
 [package]
 name = "prime-orbit"
-version = "0.1.9"
+version = "0.1.10"
 description = "Prime Orbit desktop client for Prime Agent"
 authors = ["Prime Orbit contributors"]
 edition = "2021"
 license = "MIT"
-rust-version = "1.77.2"
+rust-version = "1.88"
 
 [lib]
 name = "prime_orbit_lib"
@@ -27,6 +27,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
 url = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

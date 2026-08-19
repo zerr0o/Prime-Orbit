@@ -1,7 +1,20 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ClipboardPaste, Copy, ExternalLink, Scissors, TextSelect } from "lucide-react";
+import {
+  Archive,
+  ClipboardPaste,
+  Copy,
+  ExternalLink,
+  FolderOpen,
+  Pencil,
+  Pin,
+  PinOff,
+  Scissors,
+  TextSelect,
+  Trash2,
+} from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useI18n } from "../i18n";
+import type { Conversation, Project } from "../types";
 
 const VIEWPORT_MARGIN = 8;
 
@@ -20,6 +33,7 @@ interface EditableContext {
 interface ContextTarget {
   x: number;
   y: number;
+  projectId?: string;
   editable?: EditableContext;
   selectedText?: string;
   link?: {
@@ -33,8 +47,19 @@ interface MenuAction {
   shortcut?: string;
   icon: typeof Copy;
   disabled?: boolean;
-  group: "edit" | "selection" | "link";
+  group: "edit" | "selection" | "link" | "project" | "location" | "archive" | "danger";
+  tone?: "default" | "danger";
   run: () => void | Promise<void>;
+}
+
+interface AppContextMenuProps {
+  projects?: Project[];
+  conversations?: Conversation[];
+  onToggleProjectPin?: (project: Project) => void;
+  onRenameProject?: (project: Project) => void;
+  onRevealProject?: (project: Project) => void | Promise<void>;
+  onArchiveProjectConversations?: (project: Project) => void;
+  onDeleteProject?: (project: Project) => void;
 }
 
 function isTextControl(element: Element): element is TextControl {
@@ -163,7 +188,15 @@ async function openExternalLink(href: string) {
  * context menu globally and renders a focused app menu only when the target has
  * useful contextual actions.
  */
-export function AppContextMenu() {
+export function AppContextMenu({
+  projects = [],
+  conversations = [],
+  onToggleProjectPin,
+  onRenameProject,
+  onRevealProject,
+  onArchiveProjectConversations,
+  onDeleteProject,
+}: AppContextMenuProps = {}) {
   const { t } = useI18n();
   const [context, setContext] = useState<ContextTarget>();
   const [position, setPosition] = useState({ x: 0, y: 0 });
@@ -181,6 +214,20 @@ export function AppContextMenu() {
       const target = event.target;
       if (!(target instanceof Element)) {
         setContext(undefined);
+        return;
+      }
+
+      const projectTarget = target.closest<HTMLElement>('[data-context-type="project"][data-context-id]');
+      const projectId = projectTarget?.dataset.contextId;
+      if (projectId) {
+        restoreFocusRef.current = target.closest<HTMLElement>("button, [tabindex]")
+          ?? projectTarget.querySelector<HTMLElement>("button:not([tabindex='-1']), [tabindex]:not([tabindex='-1'])")
+          ?? undefined;
+        const rect = projectTarget.getBoundingClientRect();
+        const x = event.clientX || rect.left;
+        const y = event.clientY || rect.bottom;
+        setPosition({ x, y });
+        setContext({ x, y, projectId });
         return;
       }
 
@@ -246,6 +293,52 @@ export function AppContextMenu() {
 
   const actions = useMemo<MenuAction[]>(() => {
     if (!context) return [];
+    if (context.projectId) {
+      const project = projects.find((item) => item.id === context.projectId);
+      if (!project) return [];
+      const visibleConversationCount = conversations.filter(
+        (conversation) => conversation.projectId === project.id && !conversation.archived,
+      ).length;
+      return [
+        {
+          id: project.pinned ? "unpin-project" : "pin-project",
+          label: t(project.pinned ? "context.unpinProject" : "context.pinProject"),
+          icon: project.pinned ? PinOff : Pin,
+          group: "project",
+          run: () => onToggleProjectPin?.(project),
+        },
+        {
+          id: "rename-project",
+          label: t("context.renameProject"),
+          icon: Pencil,
+          group: "project",
+          run: () => onRenameProject?.(project),
+        },
+        {
+          id: "reveal-project",
+          label: t("context.revealProject"),
+          icon: FolderOpen,
+          group: "location",
+          run: () => onRevealProject?.(project),
+        },
+        {
+          id: "archive-project-conversations",
+          label: t("context.archiveProjectConversations"),
+          icon: Archive,
+          disabled: visibleConversationCount === 0,
+          group: "archive",
+          run: () => onArchiveProjectConversations?.(project),
+        },
+        {
+          id: "delete-project",
+          label: t("context.deleteProject"),
+          icon: Trash2,
+          group: "danger",
+          tone: "danger",
+          run: () => onDeleteProject?.(project),
+        },
+      ];
+    }
     const result: MenuAction[] = [];
     const editable = context.editable;
     if (editable) {
@@ -340,7 +433,7 @@ export function AppContextMenu() {
       );
     }
     return result;
-  }, [context, t]);
+  }, [context, conversations, onArchiveProjectConversations, onDeleteProject, onRenameProject, onRevealProject, onToggleProjectPin, projects, t]);
 
   useLayoutEffect(() => {
     if (!context || !menuRef.current) return;
@@ -382,7 +475,7 @@ export function AppContextMenu() {
           <div key={action.id}>
             {previous && previous.group !== action.group ? <div className="app-context-separator" role="separator" /> : null}
             <button
-              className="app-context-item"
+              className={`app-context-item ${action.tone === "danger" ? "is-danger" : ""}`}
               type="button"
               role="menuitem"
               disabled={action.disabled}

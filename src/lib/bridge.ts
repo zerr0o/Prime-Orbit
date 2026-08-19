@@ -2,7 +2,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { open } from "@tauri-apps/plugin-dialog";
-import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import type {
   AgentExitPayload,
   AttachmentReadResult,
@@ -171,8 +170,9 @@ export function durableState(state: PersistedAppState): PersistedAppState {
 
 export async function saveAppState(state: PersistedAppState, expectedRevision: number): Promise<SaveAppStateResult> {
   if (!isNative()) {
-    localStorage.setItem("prime-orbit-state", JSON.stringify(state));
-    return { saved: true, snapshot: { state: durableState(state), revision: expectedRevision + 1 } };
+    const durable = durableState(state);
+    localStorage.setItem("prime-orbit-state", JSON.stringify(durable));
+    return { saved: true, snapshot: { state: durable, revision: expectedRevision + 1 } };
   }
   const result = await invoke<{ saved: boolean; snapshot: { state: PersistedAppState | null; revision: number } }>("save_app_state", {
     state: durableState(state),
@@ -269,22 +269,17 @@ export async function pickProjectFolder(): Promise<string | null> {
   return typeof result === "string" ? result : null;
 }
 
-export async function pickAttachmentPaths(): Promise<string[]> {
+export async function pickAttachments(
+  remainingCount: number,
+  remainingImageBytes: number,
+): Promise<AttachmentReadResult[]> {
   if (!isNative()) return [];
-  const result = await open({
-    multiple: true,
-    directory: false,
-    title: "Joindre des fichiers",
-    filters: [
-      { name: "Images et documents", extensions: ["png", "jpg", "jpeg", "webp", "gif", "md", "txt", "json", "ts", "tsx", "js", "jsx", "py", "rs", "toml", "yaml", "yml", "pdf"] },
-    ],
-  });
-  if (Array.isArray(result)) return result;
-  return result ? [result] : [];
+  return invoke<AttachmentReadResult[]>("pick_attachments", { remainingCount, remainingImageBytes });
 }
 
-export async function readAttachment(path: string): Promise<AttachmentReadResult> {
-  return invoke("read_attachment", { path });
+export async function releaseAttachmentHandles(handles: string[]): Promise<void> {
+  if (!isNative() || handles.length === 0) return;
+  await invoke("release_attachment_handles", { handles });
 }
 
 export async function listGitChanges(cwd: string): Promise<GitChange[]> {
@@ -299,19 +294,14 @@ export async function listGitChanges(cwd: string): Promise<GitChange[]> {
   return result.files.map((file) => ({ path: file.path, status: file.status.trim() || "M" }));
 }
 
-export async function showInFolder(path: string): Promise<void> {
-  if (!isNative()) return;
-  await revealItemInDir(path);
-}
-
-export async function openLocalPath(path: string): Promise<void> {
-  if (!isNative()) return;
-  await openPath(path);
-}
-
 export async function openPrimeAgentTerminal(cwd: string): Promise<void> {
   if (!isNative()) return;
   await invoke("open_prime_agent_terminal", { cwd });
+}
+
+export async function openProjectFolder(path: string): Promise<void> {
+  if (!isNative()) return;
+  await invoke("open_project_folder", { path });
 }
 
 export async function inspectPrimeAgentConnections(cwd?: string): Promise<PrimeAgentConnections> {
@@ -319,8 +309,8 @@ export async function inspectPrimeAgentConnections(cwd?: string): Promise<PrimeA
     return {
       providerIds: ["anthropic:oauth", "openai-codex:oauth"],
       mcpServers: [
-        { name: "linear", url: null, enabled: false, scope: "global", authKind: "oauth", builtin: true },
-        { name: "notion", url: null, enabled: false, scope: "global", authKind: "oauth", builtin: true },
+        { name: "linear", url: null, enabled: false, scope: "global", authKind: "oauth", hasCustomHeaders: false, builtin: true },
+        { name: "notion", url: null, enabled: false, scope: "global", authKind: "oauth", hasCustomHeaders: false, builtin: true },
       ],
     };
   }
@@ -328,7 +318,7 @@ export async function inspectPrimeAgentConnections(cwd?: string): Promise<PrimeA
 }
 
 export async function saveMcpServer(cwd: string | undefined, scope: McpScope, server: McpServerInput): Promise<{ path: string; backupPath: string | null; server: McpServerSummary }> {
-  if (!isNative()) return { path: scope === "project" ? `${cwd}/.prime/agent/settings.json` : "~/.prime/agent/settings.json", backupPath: null, server: { name: server.name, url: server.url, enabled: server.enabled ?? true, scope, authKind: server.authKind ?? "none", builtin: false } };
+  if (!isNative()) return { path: scope === "project" ? `${cwd}/.prime/agent/settings.json` : "~/.prime/agent/settings.json", backupPath: null, server: { name: server.name, url: server.url, enabled: server.enabled ?? true, scope, authKind: server.authKind ?? "none", hasCustomHeaders: false, builtin: false } };
   return invoke("save_mcp_server", { cwd: cwd ?? null, scope, server });
 }
 
