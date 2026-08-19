@@ -798,9 +798,14 @@ mod tests {
         let home = tempfile::tempdir().expect("temporary home");
         let managed = resolve_models_path_from_home(home.path(), None, true)
             .expect("managed path is created");
+        let canonical_home =
+            crate::paths::canonicalize(home.path()).expect("canonical temporary home");
         assert_eq!(
             managed,
-            home.path().join(".prime").join("agent").join("models.json")
+            canonical_home
+                .join(".prime")
+                .join("agent")
+                .join("models.json")
         );
         assert_eq!(
             resolve_models_path_from_home(home.path(), managed.to_str(), true)
