@@ -11,9 +11,10 @@ use std::{
     ffi::OsString,
     fs::{self, File},
     io::Read,
-    path::{Path, PathBuf},
-    process::Output,
+    path::{Component, Path, PathBuf},
+    process::{ExitStatus, Output, Stdio},
     sync::Arc,
+    thread,
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Manager, WebviewWindow};
@@ -27,6 +28,9 @@ const MAX_ATTACHMENT_COUNT: usize = 20;
 const MAX_CACHED_IMAGE_BYTES: u64 = 40 * 1024 * 1024;
 const MAX_CACHED_IMAGE_COUNT: usize = 80;
 const CACHED_IMAGE_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_GIT_DIFF_BYTES: usize = 192 * 1024;
+const MAX_GIT_ERROR_BYTES: usize = 32 * 1024;
+const MAX_UNTRACKED_STAT_BYTES: u64 = 2 * 1024 * 1024;
 
 fn supported_inline_image(mime_type: &str) -> bool {
     matches!(
@@ -113,6 +117,9 @@ pub struct GitChangedFile {
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub original_path: Option<String>,
+    pub additions: u64,
+    pub deletions: u64,
+    pub binary: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -124,6 +131,39 @@ pub struct GitChangesResult {
     pub files: Vec<GitChangedFile>,
     pub diff_stat: String,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitFileDiffResult {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_path: Option<String>,
+    pub patch: String,
+    pub binary: bool,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct GitFileStat {
+    additions: u64,
+    deletions: u64,
+    binary: bool,
+}
+
+impl GitFileStat {
+    fn merge(&mut self, other: Self) {
+        self.additions = self.additions.saturating_add(other.additions);
+        self.deletions = self.deletions.saturating_add(other.deletions);
+        self.binary |= other.binary;
+    }
+}
+
+struct LimitedOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
 }
 
 fn regular_file(path: PathBuf) -> Result<PathBuf, String> {
@@ -801,10 +841,191 @@ fn parse_porcelain_z(bytes: &[u8]) -> Vec<GitChangedFile> {
             status,
             path,
             original_path,
+            additions: 0,
+            deletions: 0,
+            binary: false,
         });
         index += 1;
     }
     files
+}
+
+fn parse_numstat_z(bytes: &[u8]) -> HashMap<String, GitFileStat> {
+    let mut stats = HashMap::new();
+    for record in bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let mut fields = record.splitn(3, |byte| *byte == b'\t');
+        let Some(additions) = fields.next() else {
+            continue;
+        };
+        let Some(deletions) = fields.next() else {
+            continue;
+        };
+        let Some(path) = fields.next() else {
+            continue;
+        };
+        let binary = additions == b"-" || deletions == b"-";
+        let stat = GitFileStat {
+            additions: if binary {
+                0
+            } else {
+                String::from_utf8_lossy(additions).parse().unwrap_or(0)
+            },
+            deletions: if binary {
+                0
+            } else {
+                String::from_utf8_lossy(deletions).parse().unwrap_or(0)
+            },
+            binary,
+        };
+        stats
+            .entry(String::from_utf8_lossy(path).into_owned())
+            .or_insert_with(GitFileStat::default)
+            .merge(stat);
+    }
+    stats
+}
+
+fn safe_git_relative_path(value: &str) -> Result<PathBuf, String> {
+    if value.trim().is_empty() {
+        return Err("Le chemin Git ne peut pas être vide".to_string());
+    }
+    let path = PathBuf::from(value);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(format!("Le chemin Git {value} est invalide"));
+    }
+    Ok(path)
+}
+
+fn untracked_file_stat(cwd: &Path, relative: &str) -> GitFileStat {
+    let Ok(relative) = safe_git_relative_path(relative) else {
+        return GitFileStat {
+            binary: true,
+            ..GitFileStat::default()
+        };
+    };
+    let path = cwd.join(relative);
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return GitFileStat::default();
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return GitFileStat {
+            binary: true,
+            ..GitFileStat::default()
+        };
+    }
+    let Ok(resolved) = canonicalize(&path) else {
+        return GitFileStat::default();
+    };
+    if !resolved.starts_with(cwd) {
+        return GitFileStat {
+            binary: true,
+            ..GitFileStat::default()
+        };
+    }
+    let Ok(file) = File::open(resolved) else {
+        return GitFileStat::default();
+    };
+    let mut bytes =
+        Vec::with_capacity((metadata.len() as usize).min(MAX_UNTRACKED_STAT_BYTES as usize + 1));
+    if file
+        .take(MAX_UNTRACKED_STAT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return GitFileStat::default();
+    }
+    if bytes.len() as u64 > MAX_UNTRACKED_STAT_BYTES {
+        return GitFileStat {
+            binary: true,
+            ..GitFileStat::default()
+        };
+    }
+    if bytes.contains(&0) {
+        return GitFileStat {
+            binary: true,
+            ..GitFileStat::default()
+        };
+    }
+    let additions = if bytes.is_empty() {
+        0
+    } else {
+        bytes.iter().filter(|byte| **byte == b'\n').count() as u64
+            + u64::from(!bytes.ends_with(b"\n"))
+    };
+    GitFileStat {
+        additions,
+        ..GitFileStat::default()
+    }
+}
+
+fn read_stream_limited(mut stream: impl Read, limit: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut stored = Vec::with_capacity(limit.min(16 * 1024));
+    let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
+    loop {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(stored.len());
+        let keep = remaining.min(read);
+        stored.extend_from_slice(&buffer[..keep]);
+        truncated |= keep < read;
+    }
+    Ok((stored, truncated))
+}
+
+fn git_output_limited(
+    git: &Path,
+    cwd: &Path,
+    arguments: &[OsString],
+) -> Result<LimitedOutput, String> {
+    let mut all_arguments = vec![OsString::from("-C"), cwd.as_os_str().to_owned()];
+    all_arguments.extend(arguments.iter().cloned());
+    let mut command = external_command(git, &all_arguments);
+    command
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_PAGER", "cat")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Impossible de lancer Git: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Impossible de lire la sortie Git".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Impossible de lire les erreurs Git".to_string())?;
+    let stdout_reader = thread::spawn(move || read_stream_limited(stdout, MAX_GIT_DIFF_BYTES));
+    let stderr_reader = thread::spawn(move || read_stream_limited(stderr, MAX_GIT_ERROR_BYTES));
+    let status = child
+        .wait()
+        .map_err(|error| format!("Impossible d’attendre Git: {error}"))?;
+    let (stdout, stdout_truncated) = stdout_reader
+        .join()
+        .map_err(|_| "La lecture de la sortie Git a échoué".to_string())?
+        .map_err(|error| format!("Impossible de lire la sortie Git: {error}"))?;
+    let (stderr, _) = stderr_reader
+        .join()
+        .map_err(|_| "La lecture des erreurs Git a échoué".to_string())?
+        .map_err(|error| format!("Impossible de lire les erreurs Git: {error}"))?;
+    Ok(LimitedOutput {
+        status,
+        stdout,
+        stderr,
+        stdout_truncated,
+    })
 }
 
 fn list_git_changes_blocking(cwd: String) -> Result<GitChangesResult, String> {
@@ -855,13 +1076,60 @@ fn list_git_changes_blocking(cwd: String) -> Result<GitChangesResult, String> {
             .then(|| format!("detached@{}", output_text(&detached)))
     };
 
+    let mut files = parse_porcelain_z(&status.stdout);
+    let mut file_stats: HashMap<String, GitFileStat> = HashMap::new();
+    let head = git_output(&git, &cwd, &["rev-parse", "--verify", "HEAD"])?;
+    let stat_outputs = if head.status.success() {
+        vec![git_output(
+            &git,
+            &cwd,
+            &["diff", "HEAD", "--numstat", "--no-renames", "-z", "--"],
+        )?]
+    } else {
+        vec![
+            git_output(
+                &git,
+                &cwd,
+                &["diff", "--cached", "--numstat", "--no-renames", "-z", "--"],
+            )?,
+            git_output(
+                &git,
+                &cwd,
+                &["diff", "--numstat", "--no-renames", "-z", "--"],
+            )?,
+        ]
+    };
+    let mut errors = Vec::new();
+    for output in stat_outputs {
+        if output.status.success() {
+            for (path, stat) in parse_numstat_z(&output.stdout) {
+                file_stats.entry(path).or_default().merge(stat);
+            }
+        } else {
+            errors.push(format!("Statistiques Git: {}", output_error(&output)));
+        }
+    }
+    for file in &mut files {
+        let mut stat = file_stats.get(&file.path).copied().unwrap_or_default();
+        if let Some(original_path) = file.original_path.as_ref() {
+            if let Some(original_stat) = file_stats.get(original_path).copied() {
+                stat.merge(original_stat);
+            }
+        }
+        if file.status.trim() == "??" {
+            stat = untracked_file_stat(&cwd, &file.path);
+        }
+        file.additions = stat.additions;
+        file.deletions = stat.deletions;
+        file.binary = stat.binary;
+    }
+
     let unstaged = git_output(&git, &cwd, &["diff", "--stat", "--no-color", "--"])?;
     let staged = git_output(
         &git,
         &cwd,
         &["diff", "--cached", "--stat", "--no-color", "--"],
     )?;
-    let mut errors = Vec::new();
     if !unstaged.status.success() {
         errors.push(format!("Diff non indexé: {}", output_error(&unstaged)));
     }
@@ -882,9 +1150,169 @@ fn list_git_changes_blocking(cwd: String) -> Result<GitChangesResult, String> {
         cwd: cwd.to_string_lossy().into_owned(),
         is_repository: true,
         branch,
-        files: parse_porcelain_z(&status.stdout),
+        files,
         diff_stat: sections.join("\n\n"),
         error: (!errors.is_empty()).then(|| errors.join("; ")),
+    })
+}
+
+fn limited_output_error(output: &LimitedOutput) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        format!("Git a quitté avec le statut {}", output.status)
+    } else {
+        stderr
+    }
+}
+
+fn git_path_is_tracked(git: &Path, cwd: &Path, path: &str, has_head: bool) -> Result<bool, String> {
+    let index_arguments = vec![
+        OsString::from("ls-files"),
+        OsString::from("--error-unmatch"),
+        OsString::from("--"),
+        OsString::from(path),
+    ];
+    if git_output_limited(git, cwd, &index_arguments)?
+        .status
+        .success()
+    {
+        return Ok(true);
+    }
+    if !has_head {
+        return Ok(false);
+    }
+    let head_arguments = vec![
+        OsString::from("ls-tree"),
+        OsString::from("--name-only"),
+        OsString::from("HEAD"),
+        OsString::from("--"),
+        OsString::from(path),
+    ];
+    let output = git_output_limited(git, cwd, &head_arguments)?;
+    Ok(output.status.success() && !output.stdout.is_empty())
+}
+
+fn truncate_utf8(value: &mut String, limit: usize) -> bool {
+    if value.len() <= limit {
+        return false;
+    }
+    let mut boundary = limit;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+    true
+}
+
+fn untracked_file_patch(cwd: &Path, relative: &str) -> Result<(String, bool, bool), String> {
+    let relative_path = safe_git_relative_path(relative)?;
+    let path = cwd.join(&relative_path);
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| format!("Impossible d’inspecter {relative}: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok((String::new(), true, false));
+    }
+    let resolved = canonicalize(&path)
+        .map_err(|error| format!("Impossible de résoudre {relative}: {error}"))?;
+    if !resolved.starts_with(cwd) {
+        return Err(format!("Le fichier {relative} sort du projet Git"));
+    }
+    let file = File::open(&resolved)
+        .map_err(|error| format!("Impossible d’ouvrir {relative}: {error}"))?;
+    let mut bytes = Vec::with_capacity(MAX_GIT_DIFF_BYTES.min(metadata.len() as usize));
+    file.take(MAX_GIT_DIFF_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Impossible de lire {relative}: {error}"))?;
+    let truncated = bytes.len() > MAX_GIT_DIFF_BYTES;
+    bytes.truncate(MAX_GIT_DIFF_BYTES);
+    if bytes.contains(&0) {
+        return Ok((String::new(), true, truncated));
+    }
+    let content = String::from_utf8_lossy(&bytes);
+    let line_count = if content.is_empty() {
+        0
+    } else {
+        content.lines().count()
+    };
+    let mut patch = format!(
+        "diff --git a/{relative} b/{relative}\nnew file mode 100644\n--- /dev/null\n+++ b/{relative}\n@@ -0,0 +1,{line_count} @@\n"
+    );
+    for line in content.lines() {
+        patch.push('+');
+        patch.push_str(line);
+        patch.push('\n');
+    }
+    let patch_truncated = truncate_utf8(&mut patch, MAX_GIT_DIFF_BYTES);
+    Ok((patch, false, truncated || patch_truncated))
+}
+
+fn get_git_file_diff_blocking(
+    cwd: String,
+    path: String,
+    original_path: Option<String>,
+) -> Result<GitFileDiffResult, String> {
+    let cwd = validated_git_cwd(cwd)?;
+    let Some(git) = find_program("git") else {
+        return Err("Git est introuvable dans PATH".to_string());
+    };
+    safe_git_relative_path(&path)?;
+    if let Some(original) = original_path.as_deref() {
+        safe_git_relative_path(original)?;
+    }
+
+    let repository = git_output(&git, &cwd, &["rev-parse", "--is-inside-work-tree"])?;
+    if !repository.status.success() || output_text(&repository) != "true" {
+        return Err("Ce dossier n’appartient pas à un dépôt Git".to_string());
+    }
+    let head = git_output(&git, &cwd, &["rev-parse", "--verify", "HEAD"])?;
+    let has_head = head.status.success();
+    let tracked = git_path_is_tracked(&git, &cwd, &path, has_head)?;
+    let original_tracked = if tracked {
+        false
+    } else if let Some(original) = original_path.as_ref() {
+        git_path_is_tracked(&git, &cwd, original, has_head)?
+    } else {
+        false
+    };
+    if !tracked && !original_tracked {
+        let (patch, binary, truncated) = untracked_file_patch(&cwd, &path)?;
+        return Ok(GitFileDiffResult {
+            path,
+            original_path,
+            patch,
+            binary,
+            truncated,
+        });
+    }
+
+    let mut arguments = vec![
+        OsString::from("diff"),
+        OsString::from("--no-ext-diff"),
+        OsString::from("--no-color"),
+        OsString::from("--unified=3"),
+    ];
+    if has_head {
+        arguments.push(OsString::from("HEAD"));
+    } else {
+        arguments.push(OsString::from("--cached"));
+    }
+    arguments.push(OsString::from("--"));
+    if let Some(original) = original_path.as_ref() {
+        arguments.push(OsString::from(original));
+    }
+    arguments.push(OsString::from(&path));
+    let output = git_output_limited(&git, &cwd, &arguments)?;
+    if !output.status.success() {
+        return Err(limited_output_error(&output));
+    }
+    let patch = String::from_utf8_lossy(&output.stdout).into_owned();
+    let binary = patch.contains("Binary files ") || patch.contains("GIT binary patch");
+    Ok(GitFileDiffResult {
+        path,
+        original_path,
+        patch,
+        binary,
+        truncated: output.stdout_truncated,
     })
 }
 
@@ -893,10 +1321,36 @@ pub async fn list_git_changes(cwd: String) -> Result<GitChangesResult, String> {
     crate::run_blocking(move || list_git_changes_blocking(cwd)).await
 }
 
+#[tauri::command(rename_all = "camelCase")]
+pub async fn get_git_file_diff(
+    cwd: String,
+    path: String,
+    original_path: Option<String>,
+) -> Result<GitFileDiffResult, String> {
+    crate::run_blocking(move || get_git_file_diff_blocking(cwd, path, original_path)).await
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_porcelain_z, validated_project_folder};
-    use std::fs;
+    use super::{
+        get_git_file_diff_blocking, list_git_changes_blocking, parse_numstat_z, parse_porcelain_z,
+        safe_git_relative_path, validated_project_folder,
+    };
+    use std::{fs, path::Path, process::Command};
+
+    fn run_git(cwd: &Path, arguments: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(arguments)
+            .output()
+            .expect("run git test command");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn parses_modified_renamed_and_untracked_records() {
@@ -908,6 +1362,85 @@ mod tests {
         assert_eq!(files[1].original_path.as_deref(), Some("old name.rs"));
         assert_eq!(files[2].status, "??");
         assert_eq!(files[2].path, "note.md");
+    }
+
+    #[test]
+    fn parses_text_and_binary_numstat_records() {
+        let stats = parse_numstat_z(b"12\t3\tsrc/lib.rs\0-\t-\tassets/logo.png\0");
+        assert_eq!(stats["src/lib.rs"].additions, 12);
+        assert_eq!(stats["src/lib.rs"].deletions, 3);
+        assert!(!stats["src/lib.rs"].binary);
+        assert!(stats["assets/logo.png"].binary);
+    }
+
+    #[test]
+    fn git_paths_stay_relative_to_the_project() {
+        assert!(safe_git_relative_path("src/lib.rs").is_ok());
+        assert!(safe_git_relative_path("../outside.txt").is_err());
+        assert!(safe_git_relative_path("C:\\outside.txt").is_err());
+    }
+
+    #[test]
+    fn git_changes_include_per_file_stats_and_clickable_text_diffs() {
+        let directory = tempfile::tempdir().expect("temporary repository");
+        let root = directory.path();
+        run_git(root, &["init"]);
+        fs::write(root.join("tracked.txt"), b"one\ntwo\n").expect("tracked fixture");
+        fs::write(root.join("deleted.txt"), b"remove me\n").expect("deleted fixture");
+        run_git(root, &["add", "."]);
+        run_git(
+            root,
+            &[
+                "-c",
+                "user.name=Prime Orbit Tests",
+                "-c",
+                "user.email=tests@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+
+        fs::write(root.join("tracked.txt"), b"one\nchanged\nthree\n").expect("modify fixture");
+        fs::remove_file(root.join("deleted.txt")).expect("delete fixture");
+        fs::write(root.join("untracked.txt"), b"alpha\nbeta\n").expect("untracked fixture");
+
+        let result = list_git_changes_blocking(root.to_string_lossy().into_owned())
+            .expect("list git changes");
+        let tracked = result
+            .files
+            .iter()
+            .find(|file| file.path == "tracked.txt")
+            .expect("tracked change");
+        assert_eq!((tracked.additions, tracked.deletions), (2, 1));
+        let untracked = result
+            .files
+            .iter()
+            .find(|file| file.path == "untracked.txt")
+            .expect("untracked change");
+        assert_eq!((untracked.additions, untracked.deletions), (2, 0));
+
+        let tracked_diff = get_git_file_diff_blocking(
+            root.to_string_lossy().into_owned(),
+            "tracked.txt".to_string(),
+            None,
+        )
+        .expect("tracked diff");
+        assert!(tracked_diff.patch.contains("+changed"));
+        let deleted_diff = get_git_file_diff_blocking(
+            root.to_string_lossy().into_owned(),
+            "deleted.txt".to_string(),
+            None,
+        )
+        .expect("deleted diff");
+        assert!(deleted_diff.patch.contains("-remove me"));
+        let untracked_diff = get_git_file_diff_blocking(
+            root.to_string_lossy().into_owned(),
+            "untracked.txt".to_string(),
+            None,
+        )
+        .expect("untracked diff");
+        assert!(untracked_diff.patch.contains("+alpha"));
     }
 
     #[test]

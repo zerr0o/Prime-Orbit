@@ -81,6 +81,7 @@ pub fn run() {
             files::pick_attachments,
             files::release_attachment_handles,
             files::list_git_changes,
+            files::get_git_file_diff,
             files::open_project_folder,
             connections::inspect_prime_agent_connections,
             connections::save_mcp_server,

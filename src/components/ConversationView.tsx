@@ -19,6 +19,7 @@ import {
   File,
   FileCode2,
   GitBranch,
+  GitCommitHorizontal,
   Image,
   Info,
   Layers3,
@@ -32,6 +33,7 @@ import {
   Play,
   Plus,
   RefreshCw,
+  Rocket,
   Search,
   Send,
   ShieldCheck,
@@ -41,7 +43,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { pickAttachments, releaseAttachmentHandles } from "../lib/bridge";
+import { getGitFileDiff, pickAttachments, releaseAttachmentHandles } from "../lib/bridge";
 import { useDismissableLayer } from "../hooks/useDismissableLayer";
 import { useI18n, type AppLanguage } from "../i18n";
 import type {
@@ -51,6 +53,7 @@ import type {
   ChatMessage,
   Conversation,
   GitChange,
+  GitFileDiff,
   ModelInfo,
   PermissionPreset,
   Project,
@@ -59,7 +62,7 @@ import type {
   ThinkingLevel,
   ToolActivity,
 } from "../types";
-import { Badge, Button, IconButton } from "./Ui";
+import { Badge, Button, IconButton, Modal } from "./Ui";
 
 function bi(language: AppLanguage, french: string, english: string) {
   return language === "en" ? english : french;
@@ -90,7 +93,7 @@ interface ConversationViewProps {
 export function ConversationView(props: ConversationViewProps) {
   const { project, conversation, models, commands, stats, sessionState, inspectorOpen, changes, onToggleInspector, onDraftChange, onSend, onRetryMessage, onAbort, onModel, onThinking, onPermissionPreset, onRunCommand, onNewWindow, onOpenTerminal } = props;
   const isRunning = ["starting", "streaming", "tool", "queued"].includes(conversation.status);
-  const [inspectorTab, setInspectorTab] = useState<"activity" | "context" | "changes" | "details">("activity");
+  const [inspectorTab, setInspectorTab] = useState<"activity" | "context" | "changes" | "details">("changes");
   const [openPopover, setOpenPopover] = useState<ConversationPopover>(null);
   const closePopover = useCallback(() => setOpenPopover(null), []);
   const togglePopover = useCallback((popover: Exclude<ConversationPopover, null>) => {
@@ -150,6 +153,7 @@ export function ConversationView(props: ConversationViewProps) {
           onTab={setInspectorTab}
           onClose={onToggleInspector}
           onRunCommand={onRunCommand}
+          onDraftChange={onDraftChange}
         />
       ) : null}
     </div>
@@ -802,7 +806,7 @@ function Composer({ project, conversation, models, commands, stats, isRunning, o
   );
 }
 
-function RunInspector({ project, conversation, stats, sessionState, changes, tab, onTab, onClose, onRunCommand }: {
+function RunInspector({ project, conversation, stats, sessionState, changes, tab, onTab, onClose, onRunCommand, onDraftChange }: {
   project: Project;
   conversation: Conversation;
   stats?: SessionStats;
@@ -812,12 +816,13 @@ function RunInspector({ project, conversation, stats, sessionState, changes, tab
   onTab: (tab: "activity" | "context" | "changes" | "details") => void;
   onClose: () => void;
   onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>;
+  onDraftChange: (draft: string) => void;
 }) {
   const { language } = useI18n();
   const tabs = [
+    { id: "changes" as const, label: bi(language, "Modifs", "Changes"), icon: Code2, count: changes.length },
     { id: "activity" as const, label: bi(language, "Activité", "Activity"), icon: Activity },
     { id: "context" as const, label: bi(language, "Contexte", "Context"), icon: Layers3 },
-    { id: "changes" as const, label: bi(language, "Modifs", "Changes"), icon: Code2, count: changes.length },
     { id: "details" as const, label: bi(language, "Détails", "Details"), icon: Info },
   ];
   return (
@@ -827,7 +832,7 @@ function RunInspector({ project, conversation, stats, sessionState, changes, tab
       <div className="inspector-content">
         {tab === "activity" ? <ActivityPanel activities={conversation.activities} conversation={conversation} /> : null}
         {tab === "context" ? <ContextPanel project={project} conversation={conversation} sessionState={sessionState} onRunCommand={onRunCommand} /> : null}
-        {tab === "changes" ? <ChangesPanel changes={changes} /> : null}
+        {tab === "changes" ? <ChangesPanel projectPath={project.path} changes={changes} draft={conversation.draft} onDraftChange={onDraftChange} /> : null}
         {tab === "details" ? <DetailsPanel project={project} conversation={conversation} stats={stats} sessionState={sessionState} onRunCommand={onRunCommand} /> : null}
       </div>
     </aside>
@@ -875,12 +880,90 @@ function ContextPanel({ project, conversation, sessionState, onRunCommand }: { p
   );
 }
 
-function ChangesPanel({ changes }: { changes: GitChange[] }) {
+type GitPromptAction = "commit-push" | "release";
+
+function ChangesPanel({ projectPath, changes, draft, onDraftChange }: { projectPath: string; changes: GitChange[]; draft: string; onDraftChange: (draft: string) => void }) {
   const { language } = useI18n();
-  const totals = changes.reduce((sum, change) => ({ additions: sum.additions + (change.additions ?? 0), deletions: sum.deletions + (change.deletions ?? 0) }), { additions: 0, deletions: 0 });
+  const [expandedPath, setExpandedPath] = useState<string>();
+  const [diff, setDiff] = useState<GitFileDiff>();
+  const [loadingPath, setLoadingPath] = useState<string>();
+  const [diffError, setDiffError] = useState<string>();
+  const [pendingPrompt, setPendingPrompt] = useState<GitPromptAction>();
+  const diffRequest = useRef(0);
+  const totals = changes.reduce((sum, change) => ({ additions: sum.additions + change.additions, deletions: sum.deletions + change.deletions }), { additions: 0, deletions: 0 });
+  const binaryCount = changes.filter((change) => change.binary).length;
+
+  const applyPrompt = (action: GitPromptAction) => {
+    onDraftChange(gitActionPrompt(action, language));
+    setPendingPrompt(undefined);
+    requestAnimationFrame(() => {
+      const composer = document.querySelector<HTMLTextAreaElement>(".composer-shell textarea");
+      composer?.focus();
+      composer?.setSelectionRange(composer.value.length, composer.value.length);
+    });
+  };
+
+  const preparePrompt = (action: GitPromptAction) => {
+    if (draft.trim()) {
+      setPendingPrompt(action);
+      return;
+    }
+    applyPrompt(action);
+  };
+
+  useEffect(() => {
+    diffRequest.current += 1;
+    setExpandedPath(undefined);
+    setDiff(undefined);
+    setLoadingPath(undefined);
+    setDiffError(undefined);
+  }, [projectPath]);
+
+  useEffect(() => {
+    if (expandedPath && !changes.some((change) => change.path === expandedPath)) {
+      diffRequest.current += 1;
+      setExpandedPath(undefined);
+      setDiff(undefined);
+      setLoadingPath(undefined);
+      setDiffError(undefined);
+    }
+  }, [changes, expandedPath]);
+
+  const toggleDiff = async (change: GitChange) => {
+    const request = ++diffRequest.current;
+    if (expandedPath === change.path) {
+      setExpandedPath(undefined);
+      setDiff(undefined);
+      setLoadingPath(undefined);
+      setDiffError(undefined);
+      return;
+    }
+    setExpandedPath(change.path);
+    setDiff(undefined);
+    setDiffError(undefined);
+    setLoadingPath(change.path);
+    try {
+      const result = await getGitFileDiff(projectPath, change);
+      if (request === diffRequest.current) setDiff(result);
+    } catch (error) {
+      if (request === diffRequest.current) setDiffError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (request === diffRequest.current) setLoadingPath(undefined);
+    }
+  };
+
   return (
     <div className="inspector-section">
-      {changes.length ? <><div className="changes-summary"><div><strong>{changes.length}</strong><span>{changes.length === 1 ? bi(language, "fichier modifié", "modified file") : bi(language, "fichiers modifiés", "modified files")}</span></div><div className="diff-count"><b>+{totals.additions}</b><em>-{totals.deletions}</em></div></div><div className="change-list">{changes.map((change) => <button type="button" key={change.path}><span className={`change-status status-${change.status.toLowerCase()}`}>{change.status}</span><FileCode2 size={15} /><span><strong>{fileName(change.path)}</strong><small>{parentPath(change.path)}</small></span><span className="change-stats"><b>+{change.additions ?? 0}</b><em>-{change.deletions ?? 0}</em></span><ChevronRight size={14} /></button>)}</div><p className="trust-note"><Info size={14} />{bi(language, "Les changements sont lus depuis Git. Prime Agent s’exécute avec vos droits utilisateur, sans sandbox intégrée.", "Changes are read from Git. Prime Agent runs with your user permissions, without an integrated sandbox.")}</p></> : <InspectorEmpty icon={<Code2 size={22} />} text={bi(language, "Aucun changement Git détecté dans ce projet.", "No Git changes detected in this project.")} />}
+      <div className="changes-actions">
+        <Button variant="secondary" onClick={() => preparePrompt("commit-push")}><GitCommitHorizontal size={14} />Commit + push</Button>
+        <Button variant="secondary" onClick={() => preparePrompt("release")}><Rocket size={14} />{bi(language, "Publier une release", "Publish release")}</Button>
+      </div>
+      {changes.length ? <><div className="changes-summary"><div><strong>{changes.length}</strong><span>{changes.length === 1 ? bi(language, "fichier modifié", "modified file") : bi(language, "fichiers modifiés", "modified files")}{binaryCount ? ` · ${binaryCount} ${bi(language, "binaire", "binary")}` : ""}</span></div><div className="diff-count"><b>+{totals.additions}</b><em>-{totals.deletions}</em></div></div><div className="change-list">{changes.map((change) => {
+        const expanded = expandedPath === change.path;
+        const loading = loadingPath === change.path;
+        return <div className={`change-item ${expanded ? "is-expanded" : ""}`} key={`${change.originalPath ?? ""}:${change.path}`}><button type="button" aria-expanded={expanded} onClick={() => void toggleDiff(change)} title={bi(language, "Afficher le diff", "Show diff")}><span className={`change-status ${changeStatusClass(change.status)}`} title={changeStatusTitle(change.status, language)}>{changeStatusLabel(change.status)}</span><FileCode2 size={15} /><span><strong>{fileName(change.path)}</strong><small>{change.originalPath ? `${change.originalPath} → ${parentPath(change.path) || "."}` : parentPath(change.path)}</small></span>{change.binary ? <span className="change-binary">{bi(language, "Binaire", "Binary")}</span> : change.additions || change.deletions ? <span className="change-stats"><b>+{change.additions}</b><em>-{change.deletions}</em></span> : <span className="change-metadata">{bi(language, "Métadonnées", "Metadata")}</span>}{loading ? <LoaderCircle size={14} className="spin" /> : expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</button>{expanded ? <div className="change-preview" aria-live="polite">{loading ? <div className="diff-loading"><LoaderCircle size={15} className="spin" />{bi(language, "Chargement du diff…", "Loading diff…")}</div> : diffError ? <div className="diff-error"><CircleAlert size={15} />{diffError}</div> : diff?.binary ? <div className="diff-empty"><FileCode2 size={18} />{bi(language, "Fichier binaire : aucun aperçu textuel disponible.", "Binary file: no text preview available.")}</div> : diff?.patch ? <><pre className="git-diff" aria-label={bi(language, `Diff de ${change.path}`, `Diff for ${change.path}`)}>{diff.patch.split("\n").map((line, index) => <span className={`diff-line ${diffLineClass(line)}`} key={`${index}:${line.slice(0, 24)}`}>{line || " "}</span>)}</pre>{diff.truncated ? <p className="diff-truncated"><Info size={13} />{bi(language, "Aperçu tronqué pour préserver les performances.", "Preview truncated to preserve performance.")}</p> : null}</> : <div className="diff-empty"><Check size={18} />{bi(language, "Aucune différence textuelle à afficher.", "No textual difference to display.")}</div>}</div> : null}</div>;
+      })}</div><p className="trust-note"><Info size={14} />{bi(language, "Cliquez sur un fichier pour afficher son diff Git. Les aperçus volumineux sont tronqués automatiquement.", "Click a file to view its Git diff. Large previews are truncated automatically.")}</p></> : <InspectorEmpty icon={<Code2 size={22} />} text={bi(language, "Aucun changement Git détecté dans ce projet.", "No Git changes detected in this project.")} />}
+      {pendingPrompt ? <Modal title={bi(language, "Remplacer le message en cours ?", "Replace the current message?")} description={bi(language, "Le texte déjà saisi sera effacé et remplacé par l’instruction préparée.", "The text already entered will be erased and replaced by the prepared instruction.")} width="470px" onClose={() => setPendingPrompt(undefined)} footer={<><Button variant="secondary" onClick={() => setPendingPrompt(undefined)}>{bi(language, "Conserver mon texte", "Keep my text")}</Button><Button variant="danger" onClick={() => applyPrompt(pendingPrompt)}>{bi(language, "Effacer et remplacer", "Erase and replace")}</Button></>}><div className="draft-replace-warning"><CircleAlert size={20} /><div><strong>{bi(language, "Cette action ne peut pas être annulée.", "This action cannot be undone.")}</strong><p>{bi(language, "L’instruction sera seulement préparée dans le champ de saisie : elle ne sera pas envoyée automatiquement.", "The instruction will only be prepared in the composer; it will not be sent automatically.")}</p></div></div></Modal> : null}
     </div>
   );
 }
@@ -1264,3 +1347,57 @@ function activityGroupKey(activity: ActivityItem): string | undefined {
 }
 function fileName(path: string) { return path.split(/[\\/]/).at(-1) ?? path; }
 function parentPath(path: string) { const parts = path.split(/[\\/]/); return parts.slice(0, -1).join("/") || "/"; }
+function changeStatusLabel(status: string) {
+  const normalized = status.replace(/\s/g, "");
+  if (normalized === "??") return "U";
+  if (normalized.includes("U") || normalized === "AA" || normalized === "DD") return "!";
+  if (normalized.includes("R")) return "R";
+  if (normalized.includes("C")) return "C";
+  if (normalized.includes("A")) return "A";
+  if (normalized.includes("D")) return "D";
+  return "M";
+}
+function changeStatusClass(status: string) {
+  const label = changeStatusLabel(status);
+  if (label === "U") return "status-untracked";
+  if (label === "!") return "status-conflict";
+  if (label === "R" || label === "C") return "status-renamed";
+  if (label === "A") return "status-added";
+  if (label === "D") return "status-deleted";
+  return "status-modified";
+}
+function changeStatusTitle(status: string, language: AppLanguage) {
+  const label = changeStatusLabel(status);
+  const titles: Record<string, [string, string]> = {
+    U: ["Non suivi", "Untracked"],
+    "!": ["Conflit Git", "Git conflict"],
+    R: ["Renommé", "Renamed"],
+    C: ["Copié", "Copied"],
+    A: ["Ajouté", "Added"],
+    D: ["Supprimé", "Deleted"],
+    M: ["Modifié", "Modified"],
+  };
+  const title = titles[label] ?? titles.M;
+  return language === "en" ? title[1] : title[0];
+}
+function diffLineClass(line: string) {
+  if (line.startsWith("@@")) return "is-hunk";
+  if (/^(diff --git|index |--- |\+\+\+ |new file |deleted file |similarity |rename )/.test(line)) return "is-header";
+  if (line.startsWith("+")) return "is-added";
+  if (line.startsWith("-")) return "is-deleted";
+  return "is-context";
+}
+function gitActionPrompt(action: GitPromptAction, language: AppLanguage) {
+  if (action === "commit-push") {
+    return bi(
+      language,
+      "Analyse les changements Git actuels de ce projet à partir du diff réel. Rédige un message de commit clair et concis, exécute les vérifications adaptées, puis commit les changements pertinents et pousse la branche courante vers son remote. Préserve les fichiers hors périmètre, ne publie aucun secret et n’écrase aucun changement existant. Si le commit ou le push est impossible, explique précisément le blocage.",
+      "Analyze this project’s current Git changes from the actual diff. Write a clear, concise commit message, run the appropriate checks, then commit the relevant changes and push the current branch to its remote. Preserve out-of-scope files, publish no secrets, and do not overwrite existing changes. If committing or pushing is impossible, explain the blocker precisely.",
+    );
+  }
+  return bi(
+    language,
+    "Prépare et publie une nouvelle release GitHub à partir de l’état actuel du projet. Analyse les changements depuis la dernière release, choisis la prochaine version SemVer appropriée, mets à jour les versions et les notes nécessaires, exécute les validations et le build, puis commit, pousse, crée le tag et publie la release GitHub avec des notes claires et les artefacts installables attendus. Vérifie qu’aucun secret ni fichier hors périmètre n’est inclus et n’écrase jamais un tag existant. Si une étape est bloquée, explique précisément pourquoi.",
+    "Prepare and publish a new GitHub release from the project’s current state. Analyze changes since the previous release, choose the appropriate next SemVer version, update the required versions and notes, run validation and the build, then commit, push, create the tag, and publish the GitHub release with clear notes and the expected installable artifacts. Verify that no secrets or out-of-scope files are included, and never overwrite an existing tag. If a step is blocked, explain exactly why.",
+  );
+}

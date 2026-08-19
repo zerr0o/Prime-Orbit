@@ -2,6 +2,22 @@
 
 All notable changes to Prime Orbit are documented in this file.
 
+## [0.1.11] - 2026-08-19
+
+### Git workflow
+
+- Moved the Changes inspector to the first tab and made it the default view for project conversations.
+- Replaced placeholder `+0 -0` counters with bounded Git numstat data for tracked, staged, renamed, deleted, binary, and untracked files.
+- Added expandable, syntax-colored per-file diff previews with explicit binary, metadata-only, error, loading, and truncation states.
+- Added top-level **Commit + push** and **Publish release** actions that prepare precise Prime Agent instructions without sending them automatically.
+- Protected existing composer text with a styled confirmation before a prepared Git instruction can replace it.
+
+### Safety and validation
+
+- Confined diff requests to validated repository-relative paths and bounded Git stdout, stderr, and untracked-file reads.
+- Kept all Git mutations under Prime Agent control: the inspector itself remains read-only and never commits, pushes, tags, or publishes automatically.
+- Added Rust coverage for Git parsing, path traversal, untracked files, and per-file diffs.
+
 ## [0.1.10] - 2026-08-19
 
 ### Reliability and persistence
@@ -70,6 +86,7 @@ All notable changes to Prime Orbit are documented in this file.
 - TypeScript build and checks.
 - Strict Rust Clippy validation with warnings denied.
 
+[0.1.11]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.11
 [0.1.10]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.10
 [0.1.9]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.9
 [0.1.8]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.8

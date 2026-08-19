@@ -296,6 +296,16 @@ export interface AttachmentReadResult {
 export interface GitChange {
   path: string;
   status: string;
-  additions?: number;
-  deletions?: number;
+  originalPath?: string;
+  additions: number;
+  deletions: number;
+  binary: boolean;
+}
+
+export interface GitFileDiff {
+  path: string;
+  originalPath?: string;
+  patch: string;
+  binary: boolean;
+  truncated: boolean;
 }

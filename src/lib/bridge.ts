@@ -6,6 +6,7 @@ import type {
   AgentExitPayload,
   AttachmentReadResult,
   GitChange,
+  GitFileDiff,
   InstallProgressPayload,
   NativeEventPayload,
   McpScope,
@@ -70,7 +71,7 @@ interface NativeGitChanges {
   cwd: string;
   isRepository: boolean;
   branch?: string;
-  files: Array<{ path: string; status: string; originalPath?: string }>;
+  files: Array<{ path: string; status: string; originalPath?: string; additions: number; deletions: number; binary: boolean }>;
   diffStat: string;
   error?: string;
 }
@@ -285,13 +286,37 @@ export async function releaseAttachmentHandles(handles: string[]): Promise<void>
 export async function listGitChanges(cwd: string): Promise<GitChange[]> {
   if (!isNative()) {
     return [
-      { path: "src/App.tsx", status: "M", additions: 182, deletions: 12 },
-      { path: "src/styles.css", status: "M", additions: 346, deletions: 0 },
-      { path: "src-tauri/src/lib.rs", status: "A", additions: 418, deletions: 0 },
+      { path: "src/App.tsx", status: "M", additions: 182, deletions: 12, binary: false },
+      { path: "src/styles.css", status: "M", additions: 346, deletions: 0, binary: false },
+      { path: "src-tauri/src/lib.rs", status: "A", additions: 418, deletions: 0, binary: false },
     ];
   }
   const result = await invoke<NativeGitChanges>("list_git_changes", { cwd });
-  return result.files.map((file) => ({ path: file.path, status: file.status.trim() || "M" }));
+  return result.files.map((file) => ({
+    path: file.path,
+    status: file.status.trim() || "M",
+    originalPath: file.originalPath,
+    additions: file.additions,
+    deletions: file.deletions,
+    binary: file.binary,
+  }));
+}
+
+export async function getGitFileDiff(cwd: string, change: GitChange): Promise<GitFileDiff> {
+  if (!isNative()) {
+    return {
+      path: change.path,
+      originalPath: change.originalPath,
+      patch: `diff --git a/${change.path} b/${change.path}\n--- a/${change.path}\n+++ b/${change.path}\n@@ -1,2 +1,2 @@\n-old value\n+new value`,
+      binary: change.binary,
+      truncated: false,
+    };
+  }
+  return invoke<GitFileDiff>("get_git_file_diff", {
+    cwd,
+    path: change.path,
+    originalPath: change.originalPath,
+  });
 }
 
 export async function openPrimeAgentTerminal(cwd: string): Promise<void> {
