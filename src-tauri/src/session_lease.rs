@@ -81,7 +81,7 @@ pub(crate) fn reclaim_stale_session_lease(
     }
 }
 
-fn resolve_agent_dir(home: &Path, cwd: &Path, configured: Option<&OsStr>) -> PathBuf {
+pub(crate) fn resolve_agent_dir(home: &Path, cwd: &Path, configured: Option<&OsStr>) -> PathBuf {
     let Some(configured) = configured.filter(|value| !value.is_empty()) else {
         return home.join(".prime").join("agent");
     };

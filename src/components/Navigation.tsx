@@ -80,7 +80,7 @@ export function GlobalRail({ view, onView, onNewConversation, onOpenProject, onC
       <button className={`rail-item ${view === "settings" ? "is-active" : ""}`} type="button" onClick={() => onView("settings")} aria-label={t("nav.settings")} title={t("nav.settings")}>
         <Settings size={20} strokeWidth={1.8} />
       </button>
-      <button className="user-avatar" type="button" aria-label={t("nav.profile")} title={t("nav.userProfile")}>ZE</button>
+      <span className="user-avatar" role="img" aria-label={t("nav.userProfile")} title={t("nav.userProfile")}>ZE</span>
     </nav>
   );
 }
@@ -427,7 +427,7 @@ export function ProjectSidebar(props: ProjectSidebarProps) {
       <footer className="sidebar-footer">
         <div className="project-health">
           <span className="health-icon"><Gauge size={15} /></span>
-          <span><strong>{t("nav.localProject")}</strong><small>{t(project?.permissionPreset === "autonomous" ? "nav.modeAutonomous" : project?.permissionPreset === "guarded" ? "nav.modeGuarded" : "nav.modeStandard")}</small></span>
+          <span><strong>{t("nav.localProject")}</strong><small>{t("nav.userPermissions")}</small></span>
           <span className="status-dot is-online" />
         </div>
       </footer>
@@ -582,6 +582,7 @@ const NAV_COPY = {
   "nav.noResult": ["Aucun résultat", "No results"],
   "nav.noProject": ["Aucun projet", "No projects"],
   "nav.localProject": ["Projet local", "Local project"],
+  "nav.userPermissions": ["Prime Agent · droits utilisateur", "Prime Agent · user permissions"],
   "nav.modeAutonomous": ["Mode autonome", "Autonomous mode"],
   "nav.modeGuarded": ["Accès prudent", "Guarded access"],
   "nav.modeStandard": ["Accès standard", "Standard access"],

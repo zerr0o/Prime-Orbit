@@ -84,7 +84,7 @@ export const demoAppState: PersistedAppState = {
         {
           id: "message-agent-demo",
           role: "assistant",
-          content: "Le socle est prêt. L’application se connecte au mode RPC de Prime Agent : chaque conversation possède son propre processus, son dossier de travail et sa session persistante.\n\nJ’ai structuré l’expérience autour de trois couches : la conversation au centre, l’activité des outils dans l’inspecteur, et les réglages de modèle ou de permissions toujours accessibles sans interrompre le travail.",
+          content: "Le socle est prêt. L’application se connecte au mode RPC de Prime Agent : chaque conversation possède son propre processus, son dossier de travail et sa session persistante.\n\nJ’ai structuré l’expérience autour de trois couches : la conversation au centre, l’activité des outils dans l’inspecteur, et les réglages réellement pris en charge par Prime Agent accessibles sans interrompre le travail.",
           createdAt: minutesAgo(3),
           status: "complete",
           model: "qwen3.8-27b-dev",

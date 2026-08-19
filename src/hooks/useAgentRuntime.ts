@@ -3,16 +3,20 @@ import {
   isNative,
   listenToAgentEvents,
   loadSessionHistory,
-  releaseAgent,
+  mutateAgentQueue,
   sendRpc,
   startAgent,
   stopAgent,
+  type QueueMutation,
   type StartAgentOptions,
 } from "../lib/bridge";
 import { redactText, redactValue } from "../lib/redaction";
 import type {
   ActivityItem,
+  AgentRlmChild,
   AgentSessionState,
+  AgentSchedule,
+  AgentHeartbeatSummary,
   Attachment,
   ChatMessage,
   Conversation,
@@ -23,6 +27,7 @@ import type {
   RpcEnvelope,
   RuntimeDetection,
   SessionStats,
+  SessionActionSnapshot,
   SlashCommand,
   ThinkingLevel,
   ToolActivity,
@@ -33,6 +38,16 @@ interface ConversationRuntime {
   models: ModelInfo[];
   commands: SlashCommand[];
   stats?: SessionStats;
+  schedules?: AgentSchedule[];
+  heartbeat?: AgentSchedule | null;
+  heartbeats?: AgentHeartbeatSummary[];
+  subagents?: AgentRlmChild[];
+  observedSubagent?: {
+    activeSessionId: string;
+    messages: ChatMessage[];
+    closed?: boolean;
+    error?: string;
+  };
   logs: Array<{ id: string; stream: "rpc" | "stderr"; text: string; createdAt: string }>;
 }
 
@@ -63,6 +78,15 @@ const SELECTION_SCOPED_COMMANDS = new Set([
   "get_commands",
   "get_session_stats",
 ]);
+const ACKNOWLEDGED_COMMANDS = new Set([
+  "add_schedule",
+  "cancel_schedule",
+  "set_heartbeat",
+  "update_heartbeat",
+  "manage_heartbeat",
+  "observe",
+  "unobserve",
+]);
 
 const now = () => new Date().toISOString();
 const uid = (prefix: string) => `${prefix}-${crypto.randomUUID()}`;
@@ -76,8 +100,8 @@ const cleanDiagnostic = (value: unknown) => (
 );
 
 /** Only durable display metadata is allowed into app state. Native image
- * handles are short-lived capabilities; image bytes/data URLs are never kept
- * in a ChatMessage, including when an older object still carries such keys. */
+ * handles are short-lived capabilities. The optional preview is a bounded
+ * thumbnail generated natively, never the original image bytes. */
 export function durableAttachmentMetadata(attachment: Attachment): Attachment {
   return {
     id: attachment.id,
@@ -86,6 +110,7 @@ export function durableAttachmentMetadata(attachment: Attachment): Attachment {
     mimeType: attachment.mimeType,
     size: attachment.size,
     isImage: attachment.isImage,
+    ...(attachment.previewDataUrl ? { previewDataUrl: attachment.previewDataUrl } : {}),
   };
 }
 
@@ -102,13 +127,17 @@ export interface PromptTransaction {
 
 export function beginPromptTransaction(
   conversation: Conversation,
-  input: { message: string; attachments: Attachment[]; messageId: string; createdAt: string },
+  input: { message: string; attachments: Attachment[]; messageId: string; createdAt: string; queuedPayload?: string; forceQueued?: boolean; queuedDelivery?: "steer" | "follow_up" },
 ): { conversation: Conversation; transaction: PromptTransaction } {
   const isFirst = conversation.messages.every((item) => item.role !== "user");
   const title = isFirst && conversation.title === "Nouvelle conversation"
     ? makeTitle(input.message.trim() || input.attachments[0]?.name || "Nouvelle conversation")
     : conversation.title;
-  const status = conversation.status === "streaming" || conversation.status === "tool" || conversation.status === "queued"
+  const queued = input.forceQueued === true
+    || conversation.status === "streaming"
+    || conversation.status === "tool"
+    || conversation.status === "queued";
+  const status = queued
     ? "queued"
     : "streaming";
   const localMessage: ChatMessage = {
@@ -118,6 +147,11 @@ export function beginPromptTransaction(
     createdAt: input.createdAt,
     status: "pending",
     attachments: input.attachments.map(durableAttachmentMetadata),
+    ...(queued ? {
+      queueDelivery: input.queuedDelivery ?? "follow_up",
+      queueObserved: false,
+      queueText: input.queuedPayload ?? input.message.trim(),
+    } : {}),
   };
   return {
     conversation: {
@@ -147,15 +181,174 @@ export function beginPromptTransaction(
   };
 }
 
+/** Reconciles optimistic queue rows with Prime Agent's authoritative lanes.
+ * A row stays out of the transcript while queued, then becomes a normal user
+ * turn only after Prime Agent has exposed it in the queue and later removes it,
+ * or explicitly marks it as the active action. Merely accepting the prompt is
+ * not delivery evidence: the queue snapshot can lag just after the RPC reply. */
+export function reconcileQueuedMessages(
+  conversation: Conversation,
+  actions: AgentSessionState["sessionActions"] | undefined,
+): Conversation {
+  if (!actions || !conversation.messages.some((message) => message.queueDelivery)) return conversation;
+  const available = {
+    steer: [...(actions.steering ?? [])],
+    follow_up: [...(actions.followUps ?? [])],
+  };
+  let changed = false;
+  let activeConsumed = false;
+  const activeLabel = actions.active?.kind === "turn" ? normalizeQueuedText(actions.active.label ?? "") : "";
+  const messages: ChatMessage[] = [];
+  const delivered: ChatMessage[] = [];
+  for (const message of conversation.messages) {
+    const lane = message.queueDelivery;
+    if (!lane) {
+      messages.push(message);
+      continue;
+    }
+    const payload = message.queueText ?? message.content;
+    const index = available[lane].findIndex((text) => text === payload);
+    if (index >= 0) {
+      available[lane].splice(index, 1);
+      if (message.queueObserved) messages.push(message);
+      else {
+        changed = true;
+        messages.push({ ...message, queueObserved: true });
+      }
+      continue;
+    }
+    const isActive: boolean = !activeConsumed
+      && activeLabel.length > 0
+      && activeLabel === normalizeQueuedText(payload);
+    if (!message.queueObserved && !isActive) {
+      messages.push(message);
+      continue;
+    }
+    if (isActive) activeConsumed = true;
+    changed = true;
+    delivered.push(withoutQueueMetadata(message));
+  }
+  return changed ? { ...conversation, messages: [...messages, ...delivered] } : conversation;
+}
+
+function normalizeQueuedText(value: string) {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function withoutQueueMetadata(message: ChatMessage): ChatMessage {
+  const {
+    queueDelivery: _delivery,
+    queueObserved: _observed,
+    queueAccepted: _accepted,
+    queueText: _queueText,
+    ...delivered
+  } = message;
+  return { ...delivered, status: "complete" };
+}
+
+/** Places a queued user turn at its authoritative delivery position.
+ * Prime Agent emits a user message_start immediately before the assistant turn;
+ * using that event avoids exposing accepted prompts before they are consumed. */
+export function applyAuthoritativeUserMessageStart(
+  conversation: Conversation,
+  text: string,
+  createdAt: string,
+): Conversation {
+  const normalized = normalizeQueuedText(text);
+  if (!normalized) return conversation;
+  const queuedIndex = conversation.messages.findIndex((message) => message.queueDelivery
+    && normalizeQueuedText(message.queueText ?? message.content) === normalized);
+  if (queuedIndex >= 0) {
+    const messages = [...conversation.messages];
+    const [queued] = messages.splice(queuedIndex, 1);
+    if (!queued) return conversation;
+    messages.push(withoutQueueMetadata(queued));
+    return { ...conversation, hasContent: true, messages };
+  }
+
+  let pendingIndex = -1;
+  for (let index = conversation.messages.length - 1; index >= 0; index -= 1) {
+    const message = conversation.messages[index]!;
+    if (message.role === "user"
+      && message.status === "pending"
+      && normalizeQueuedText(message.content) === normalized) {
+      pendingIndex = index;
+      break;
+    }
+  }
+  if (pendingIndex >= 0) {
+    const messages = [...conversation.messages];
+    messages[pendingIndex] = { ...messages[pendingIndex]!, status: "complete" };
+    return { ...conversation, hasContent: true, messages };
+  }
+
+  const lastVisible = [...conversation.messages].reverse().find((message) => !message.queueDelivery);
+  if (lastVisible?.role === "user" && normalizeQueuedText(lastVisible.content) === normalized) {
+    return conversation;
+  }
+
+  return {
+    ...conversation,
+    hasContent: true,
+    messages: [...conversation.messages, {
+      id: uid("user"),
+      role: "user",
+      content: text,
+      createdAt,
+      status: "complete",
+    }],
+  };
+}
+
 export function commitPromptTransaction(conversation: Conversation, transaction: PromptTransaction): Conversation {
   if (conversation.id !== transaction.conversationId) return conversation;
   let changed = false;
   const messages = conversation.messages.map((message) => {
     if (message.id !== transaction.messageId || message.status !== "pending") return message;
     changed = true;
-    return { ...message, status: "complete" as const };
+    return {
+      ...message,
+      status: "complete" as const,
+      ...(message.queueDelivery ? { queueAccepted: true } : {}),
+    };
   });
   return changed ? { ...conversation, messages } : conversation;
+}
+
+export function applyQueueMutationSnapshot(
+  actions: SessionActionSnapshot,
+  lane: "steering" | "followUp",
+  index: number,
+  expectedText: string,
+  mutation: QueueMutation,
+): SessionActionSnapshot {
+  const steering = [...(actions.steering ?? [])];
+  const followUps = [...(actions.followUps ?? [])];
+  const source = lane === "steering" ? steering : followUps;
+  const actualIndex = source[index] === expectedText ? index : source.indexOf(expectedText);
+  if (actualIndex < 0) return actions;
+
+  if (mutation.type === "delete") {
+    source.splice(actualIndex, 1);
+  } else if (mutation.type === "move") {
+    const destination = actualIndex + mutation.direction;
+    if (destination < 0 || destination >= source.length) return actions;
+    [source[actualIndex], source[destination]] = [source[destination]!, source[actualIndex]!];
+  } else {
+    const destination = mutation.lane === "steering" ? steering : followUps;
+    if (destination === source) {
+      source.splice(actualIndex, 1, mutation.text);
+    } else {
+      source.splice(actualIndex, 1);
+      destination.push(mutation.text);
+    }
+  }
+  return {
+    ...actions,
+    steering,
+    followUps,
+    queuedCount: steering.length + followUps.length,
+  };
 }
 
 export function rollbackPromptTransaction(conversation: Conversation, transaction: PromptTransaction): Conversation {
@@ -235,6 +428,8 @@ export function useAgentRuntime(options: {
   selectedConversation?: Conversation;
   getProject: (projectId: string) => Project | undefined;
   getConversation: (conversationId: string) => Conversation | undefined;
+  preserveSessionReference: (conversationId: string, title: string) => string | undefined;
+  discardSessionReference: (conversationId: string) => void;
   updateConversation: (id: string, updater: Partial<Conversation> | ((current: Conversation) => Conversation)) => void;
   onInstallProgress: (phase: string, message: string) => void;
   onInstallComplete: (detection: RuntimeDetection) => void;
@@ -245,6 +440,8 @@ export function useAgentRuntime(options: {
     selectedProject,
     selectedConversation,
     getConversation,
+    preserveSessionReference,
+    discardSessionReference,
     updateConversation,
     onInstallProgress,
     onInstallComplete,
@@ -267,6 +464,10 @@ export function useAgentRuntime(options: {
   const activeBashActivities = useRef(new Map<string, string>());
   const lastStderr = useRef(new Map<string, string>());
   const processExitErrors = useRef(new Map<string, string>());
+  // React state can lag by one render between two very fast submissions. This
+  // process-local marker closes that gap so the second prompt is represented
+  // as queued even when both handlers crossed ensureStarted concurrently.
+  const activePromptRuns = useRef(new Set<string>());
   const extensionResponsesInFlight = useRef(new Set<string>());
   const getConversationRef = useRef(getConversation);
 
@@ -309,6 +510,7 @@ export function useAgentRuntime(options: {
     generation: number,
     type: string,
     waitForResponse = false,
+    fields: Record<string, unknown> = {},
   ): Promise<RpcEnvelope | void> => {
     if (!isCurrentSelection(conversationId, generation)) return Promise.resolve();
     const requestId = uid(type);
@@ -333,7 +535,7 @@ export function useAgentRuntime(options: {
       resolve: resolveResponse,
       reject: rejectResponse,
     });
-    return sendRpc(conversationId, { id: requestId, type })
+    return sendRpc(conversationId, { id: requestId, type, ...fields })
       .then(() => response as Promise<RpcEnvelope | void>)
       .catch((error) => {
         clearPendingRequest(requestId);
@@ -402,12 +604,17 @@ export function useAgentRuntime(options: {
         const currentMetadata = getConversationRef.current(conversation.id);
         if (!currentMetadata || localHistoryIdentity(currentMetadata) !== identity) return;
         localHistoryLoaded.current.add(identity);
-        // A runtime response is authoritative. The local reader only fills an
-        // otherwise empty transcript while Prime Agent starts (or is broken).
-        if (historyLoaded.current.has(conversation.id)) return;
         const mapped = mapAgentMessages(history.messages);
         updateConversation(conversation.id, (current) => {
-          if (historyLoaded.current.has(conversation.id)) return current;
+          // RPC text remains authoritative, but the bounded local-history
+          // reader is the only source of safe historical image thumbnails.
+          // Merge those previews regardless of which asynchronous load wins.
+          if (historyLoaded.current.has(conversation.id)) {
+            return {
+              ...current,
+              messages: mergeHistoricalAttachmentPreviews(current.messages, mapped),
+            };
+          }
           const previousLocalIdentity = localHistoryApplied.current.get(conversation.id);
           // Preserve live/user messages, while allowing a newly selected local
           // session to replace a transcript known to come from an older path.
@@ -481,18 +688,22 @@ export function useAgentRuntime(options: {
     (conversationId: string, message: RpcEnvelope) => {
       const requestId = textValue(message.id);
       const scopedCommand = SELECTION_SCOPED_COMMANDS.has(message.command ?? "");
-      if (scopedCommand) {
-        const pending = requestId ? pendingSelectionRequests.current.get(requestId) : undefined;
-        // Bootstrap responses are accepted only when issued for the current
-        // selection. This also drops late responses after rapid navigation.
-        if (!pending) return;
+      const pending = requestId ? pendingSelectionRequests.current.get(requestId) : undefined;
+      if (pending) {
         pendingSelectionRequests.current.delete(requestId!);
         window.clearTimeout(pending.timeout);
-        pending.resolve?.(message);
         if (
           pending.conversationId !== conversationId
           || !isCurrentSelection(conversationId, pending.generation)
-        ) return;
+        ) {
+          pending.reject?.(new Error("La conversation active a changé avant la réponse de Prime Agent."));
+          return;
+        }
+        pending.resolve?.(message);
+      } else if (scopedCommand) {
+        // Bootstrap responses are accepted only when issued for the current
+        // selection. This also drops late responses after rapid navigation.
+        return;
       }
 
       if (message.success === false) {
@@ -509,8 +720,11 @@ export function useAgentRuntime(options: {
           ...current,
           [conversationId]: { ...(current[conversationId] ?? { models: [], commands: [], logs: [] }), state: sessionState },
         }));
-        updateConversation(conversationId, (conversation) => ({
+        updateConversation(conversationId, (conversation) => reconcileQueuedMessages({
           ...conversation,
+          title: !conversation.sessionNameSyncPending && sessionState.sessionName?.trim()
+            ? sessionState.sessionName.trim()
+            : conversation.title,
           sessionPath: sessionState.sessionFile ?? conversation.sessionPath,
           sessionId: sessionState.sessionId ?? conversation.sessionId,
           model: sessionState.model ? `${sessionState.model.provider}/${sessionState.model.id}` : conversation.model,
@@ -519,7 +733,7 @@ export function useAgentRuntime(options: {
           // actually populated the transcript.
           status: sessionState.isStreaming ? "streaming" : conversation.status === "starting" ? "starting" : "idle",
           lastError: undefined,
-        }));
+        }, sessionState.sessionActions));
         return;
       }
 
@@ -530,7 +744,7 @@ export function useAgentRuntime(options: {
         const sourceMessageCount = data.messages.length;
         updateConversation(conversationId, (conversation) => ({
           ...conversation,
-          messages: mapped,
+          messages: mergeHistoricalAttachmentPreviews(mapped, conversation.messages),
           hasContent: sourceMessageCount > 0 ? true : conversation.hasContent,
           status: conversation.status === "starting" || conversation.status === "offline" || conversation.status === "error"
             ? "idle"
@@ -573,6 +787,66 @@ export function useAgentRuntime(options: {
         return;
       }
 
+      if (message.command === "list_schedules" && data && Array.isArray(data.jobs)) {
+        setRuntimes((current) => ({
+          ...current,
+          [conversationId]: {
+            ...(current[conversationId] ?? { models: [], commands: [], logs: [] }),
+            schedules: data.jobs as AgentSchedule[],
+          },
+        }));
+        return;
+      }
+
+      if (message.command === "list_heartbeats" && data && Array.isArray(data.heartbeats)) {
+        setRuntimes((current) => ({
+          ...current,
+          [conversationId]: {
+            ...(current[conversationId] ?? { models: [], commands: [], logs: [] }),
+            heartbeats: data.heartbeats as AgentHeartbeatSummary[],
+          },
+        }));
+        return;
+      }
+
+      if (message.command === "get_heartbeat" && data && "heartbeat" in data) {
+        setRuntimes((current) => ({
+          ...current,
+          [conversationId]: {
+            ...(current[conversationId] ?? { models: [], commands: [], logs: [] }),
+            heartbeat: (data.heartbeat ?? null) as AgentSchedule | null,
+          },
+        }));
+        return;
+      }
+
+      if (["add_schedule", "cancel_schedule", "set_heartbeat", "update_heartbeat", "manage_heartbeat"].includes(String(message.command))) {
+        window.setTimeout(() => {
+          const token = activeSelection.current;
+          if (token.conversationId !== conversationId) return;
+          void sendSelectionRequest(conversationId, token.generation, "list_schedules", true, { includeInactive: false }).catch(() => undefined);
+          void sendSelectionRequest(conversationId, token.generation, "get_heartbeat").catch(() => undefined);
+          void sendSelectionRequest(conversationId, token.generation, "list_heartbeats").catch(() => undefined);
+        }, 100);
+        return;
+      }
+
+      if (message.command === "set_session_name") {
+        const current = getConversationRef.current(conversationId);
+        if (current) {
+          updateConversation(conversationId, { sessionNameSyncPending: false });
+          setRuntimes((runtimes) => {
+            const runtime = runtimes[conversationId];
+            if (!runtime?.state) return runtimes;
+            return {
+              ...runtimes,
+              [conversationId]: { ...runtime, state: { ...runtime.state, sessionName: current.title } },
+            };
+          });
+        }
+        return;
+      }
+
       if (message.command === "export_html" && data && typeof data.path === "string") {
         addActivity(conversationId, {
           type: "export",
@@ -583,11 +857,11 @@ export function useAgentRuntime(options: {
         return;
       }
 
-      if ((message.command === "new_session" || message.command === "clone" || message.command === "switch_session") && data?.cancelled !== true) {
+      if (["new_session", "fork", "clone", "switch_session"].includes(String(message.command)) && data?.cancelled !== true) {
         updateConversation(conversationId, {
           messages: [],
           activities: [],
-          hasContent: message.command === "new_session" ? false : undefined,
+          hasContent: message.command === "new_session" ? false : true,
           status: "idle",
           sessionPath: undefined,
           sessionId: undefined,
@@ -655,11 +929,13 @@ export function useAgentRuntime(options: {
         return;
       }
       if (eventType === "agent_start") {
+        activePromptRuns.current.add(conversationId);
         updateConversation(conversationId, { status: "streaming", lastError: undefined });
         addActivity(conversationId, { type: eventType, title: "Prime Agent réfléchit", status: "running", raw: event });
         return;
       }
       if (eventType === "agent_end") {
+        activePromptRuns.current.delete(conversationId);
         const boundaryTime = now();
         updateConversation(conversationId, (conversation) => {
           const finalized = finalizeConversationTools(conversation, "completed", boundaryTime);
@@ -706,14 +982,62 @@ export function useAgentRuntime(options: {
           status: presentation.status,
           raw: event,
         });
+        if (child && textValue(child.id)) {
+          const snapshot = redactValue(child) as unknown as AgentRlmChild;
+          setRuntimes((current) => {
+            const runtime = current[conversationId] ?? { models: [], commands: [], logs: [] };
+            const children = runtime.subagents ?? [];
+            const index = children.findIndex((item) => item.id === snapshot.id);
+            const subagents = [...children];
+            if (index >= 0) subagents[index] = { ...subagents[index], ...snapshot };
+            else subagents.push(snapshot);
+            return { ...current, [conversationId]: { ...runtime, subagents } };
+          });
+        }
         return;
       }
       if (eventType === "session_action_update") {
+        const actions = event.actions as AgentSessionState["sessionActions"];
+        setRuntimes((current) => {
+          const runtime = current[conversationId];
+          if (!runtime?.state) return current;
+          return {
+            ...current,
+            [conversationId]: {
+              ...runtime,
+              state: { ...runtime.state, sessionActions: actions },
+            },
+          };
+        });
+        updateConversation(conversationId, (conversation) => reconcileQueuedMessages(conversation, actions));
         addActivity(conversationId, {
           id: "session-actions",
           type: eventType,
           title: "File d’actions mise à jour",
           detail: summarizeSessionActions(event.actions),
+          status: "info",
+          raw: event,
+        });
+        return;
+      }
+      if (eventType === "session_info_changed") {
+        const sessionName = textValue(event.name)?.trim();
+        if (sessionName) {
+          updateConversation(conversationId, { title: sessionName, sessionNameSyncPending: false });
+          setRuntimes((current) => {
+            const runtime = current[conversationId];
+            if (!runtime?.state) return current;
+            return {
+              ...current,
+              [conversationId]: { ...runtime, state: { ...runtime.state, sessionName } },
+            };
+          });
+        }
+        addActivity(conversationId, {
+          id: "session-info",
+          type: eventType,
+          title: sessionName ? "Nom de session synchronisé" : "Informations de session mises à jour",
+          detail: sessionName,
           status: "info",
           raw: event,
         });
@@ -733,10 +1057,46 @@ export function useAgentRuntime(options: {
       if (eventType === "observed_session_event") {
         const observed = observedSessionActivity(event);
         if (observed) addActivity(conversationId, observed);
+        const activeSessionId = textValue(event.activeSessionId);
+        const nested = asRecord(event.event);
+        if (activeSessionId && nested?.type === "message_end" && nested.message) {
+          const mapped = mapAgentMessages([nested.message]);
+          if (mapped.length) {
+            setRuntimes((current) => {
+              const runtime = current[conversationId];
+              if (!runtime?.observedSubagent || runtime.observedSubagent.activeSessionId !== activeSessionId) return current;
+              return {
+                ...current,
+                [conversationId]: {
+                  ...runtime,
+                  observedSubagent: {
+                    ...runtime.observedSubagent,
+                    messages: [...runtime.observedSubagent.messages, ...mapped].slice(-160),
+                  },
+                },
+              };
+            });
+          }
+        }
         return;
       }
       if (eventType === "observed_session_closed") {
         const activeSessionId = textValue(event.activeSessionId) ?? "unknown";
+        setRuntimes((current) => {
+          const runtime = current[conversationId];
+          if (!runtime?.observedSubagent || runtime.observedSubagent.activeSessionId !== activeSessionId) return current;
+          return {
+            ...current,
+            [conversationId]: {
+              ...runtime,
+              observedSubagent: {
+                ...runtime.observedSubagent,
+                closed: true,
+                error: cleanDiagnostic(event.error),
+              },
+            },
+          };
+        });
         addActivity(conversationId, {
           id: `observed-session:${activeSessionId}:closed`,
           type: eventType,
@@ -849,6 +1209,7 @@ export function useAgentRuntime(options: {
         addLog(conversationId, "stderr", truncateRuntimeLog(line));
       },
       onExit: ({ conversationId, code, success, error }) => {
+        activePromptRuns.current.delete(conversationId);
         setExtensionRequests((current) => current.filter((request) => request.conversationId !== conversationId));
         started.current.delete(conversationId);
         startInFlight.current.delete(conversationId);
@@ -932,36 +1293,6 @@ export function useAgentRuntime(options: {
     [detection?.error, detection?.installed, ensureRuntime],
   );
 
-  const releaseRuntimeLease = useCallback(async (conversationId: string) => {
-    cancelConversationRequests(conversationId, "La conversation active a changé.");
-    const pendingStart = startInFlight.current.get(conversationId);
-    if (pendingStart) {
-      try {
-        await pendingStart;
-      } catch {
-        return;
-      }
-    }
-    // A fast A -> B -> A navigation can make the original start current again
-    // before it resolves. Never release that newly-current lease.
-    if (activeSelection.current.conversationId === conversationId) return;
-    if (!started.current.has(conversationId)) return;
-
-    intentionallyStopped.current.add(conversationId);
-    started.current.delete(conversationId);
-    try {
-      const releaseScheduled = await releaseAgent(conversationId);
-      if (!releaseScheduled) {
-        // New runtimes start conservatively as busy. Asking for state proves an
-        // idle runtime can be released, while a genuinely working agent remains
-        // alive until its normal agent_end boundary.
-        await sendRpc(conversationId, { id: uid("release-state"), type: "get_state" }).catch(() => undefined);
-      }
-    } catch {
-      intentionallyStopped.current.delete(conversationId);
-    }
-  }, [cancelConversationRequests]);
-
   const ensureStarted = useCallback(
     async (conversation: Conversation, project: Project) => {
       const token = activeSelection.current;
@@ -984,7 +1315,6 @@ export function useAgentRuntime(options: {
       try {
         await ensureProcessStarted(conversation, project);
         if (!isCurrentSelection(conversation.id, token.generation)) {
-          void releaseRuntimeLease(conversation.id);
           throw new DOMException("Le chargement a été remplacé par une autre conversation.", "AbortError");
         }
 
@@ -996,10 +1326,33 @@ export function useAgentRuntime(options: {
           await sendSelectionRequest(conversation.id, token.generation, "get_state");
         }
         await loadConversationHistory(conversation.id, token.generation);
+        const currentConversation = getConversationRef.current(conversation.id);
+        if (currentConversation?.sessionNameSyncPending && currentConversation.title.trim()) {
+          try {
+            const response = await sendSelectionRequest(
+              conversation.id,
+              token.generation,
+              "set_session_name",
+              true,
+              { name: currentConversation.title.trim() },
+            );
+            if (response?.success === false) throw new Error(response.error ?? "Le nom de session a été refusé.");
+          } catch (error) {
+            addActivity(conversation.id, {
+              type: "session_name_sync",
+              title: "Nom local non synchronisé",
+              detail: error instanceof Error ? error.message : String(error),
+              status: "warning",
+            });
+          }
+        }
         if (isCurrentSelection(conversation.id, token.generation)) {
           void sendSelectionRequest(conversation.id, token.generation, "get_available_models").catch(() => undefined);
           void sendSelectionRequest(conversation.id, token.generation, "get_commands").catch(() => undefined);
           void sendSelectionRequest(conversation.id, token.generation, "get_session_stats").catch(() => undefined);
+          void sendSelectionRequest(conversation.id, token.generation, "list_schedules", true, { includeInactive: false }).catch(() => undefined);
+          void sendSelectionRequest(conversation.id, token.generation, "get_heartbeat").catch(() => undefined);
+          void sendSelectionRequest(conversation.id, token.generation, "list_heartbeats").catch(() => undefined);
         }
       } catch (error) {
         if (isCurrentSelection(conversation.id, token.generation)) {
@@ -1015,7 +1368,7 @@ export function useAgentRuntime(options: {
         throw error;
       }
     },
-    [active, ensureProcessStarted, ensureRuntime, eventsReady, isCurrentSelection, loadConversationHistory, releaseRuntimeLease, sendSelectionRequest, updateConversation],
+    [active, addActivity, ensureProcessStarted, ensureRuntime, eventsReady, isCurrentSelection, loadConversationHistory, sendSelectionRequest, updateConversation],
   );
 
   // Selection ownership is intentionally keyed only by IDs. Session metadata
@@ -1028,9 +1381,14 @@ export function useAgentRuntime(options: {
     activeSelection.current = { conversationId: nextConversationId, generation };
 
     if (previous.conversationId && previous.conversationId !== nextConversationId) {
-      void releaseRuntimeLease(previous.conversationId);
+      // Keep the native lease: Prime Orbit is a multi-session client and an
+      // agent must continue working when its transcript is no longer visible.
+      // Only selection-scoped bootstrap requests are cancelled here. Native
+      // leases are released safely when the window is destroyed, or explicitly
+      // by closeRuntime/stop_agent.
+      cancelConversationRequests(previous.conversationId, "La conversation active a changé.");
     }
-  }, [active, releaseRuntimeLease, selectedConversation?.id, selectedProject?.id]);
+  }, [active, cancelConversationRequests, selectedConversation?.id, selectedProject?.id]);
 
   // Local history is deliberately independent from runtime health. A
   // broken/missing Prime Agent must not make a valid saved transcript
@@ -1077,11 +1435,11 @@ export function useAgentRuntime(options: {
     const conversationId = activeSelection.current.conversationId;
     selectedConversationId.current = undefined;
     activeSelection.current = { generation: activeSelection.current.generation + 1 };
-    if (conversationId) void releaseRuntimeLease(conversationId);
-  }, [releaseRuntimeLease]);
+    if (conversationId) cancelConversationRequests(conversationId, "La fenêtre se ferme.");
+  }, [cancelConversationRequests]);
 
   const sendPrompt = useCallback(
-    async (message: string, attachments: Attachment[]) => {
+    async (message: string, attachments: Attachment[], requestedDelivery?: "steer" | "follow_up") => {
       if (!selectedConversation || !selectedProject) return;
       const conversationId = selectedConversation.id;
       const trimmed = message.trim();
@@ -1089,7 +1447,19 @@ export function useAgentRuntime(options: {
       if (attachments.some((item) => item.isImage && !item.attachmentHandle)) {
         throw new Error("Image attachment handle unavailable; select the image again.");
       }
-      await ensureStarted(selectedConversation, selectedProject);
+      const beforeStart = getConversationRef.current(conversationId) ?? selectedConversation;
+      const forceQueued = requestedDelivery !== undefined
+        || activePromptRuns.current.has(conversationId)
+        || beforeStart.status === "streaming"
+        || beforeStart.status === "tool"
+        || beforeStart.status === "queued";
+      activePromptRuns.current.add(conversationId);
+      try {
+        await ensureStarted(selectedConversation, selectedProject);
+      } catch (error) {
+        if (!forceQueued) activePromptRuns.current.delete(conversationId);
+        throw error;
+      }
       const textAttachments = attachments.filter((item) => !item.isImage && item.path);
       const attachmentContext = textAttachments.length
         ? `\n\nFichiers joints explicitement sélectionnés (chemins locaux) :\n${textAttachments.map((item) => `- ${JSON.stringify(item.path)}`).join("\n")}`
@@ -1108,6 +1478,9 @@ export function useAgentRuntime(options: {
           attachments,
           messageId,
           createdAt,
+          queuedPayload: content,
+          forceQueued,
+          queuedDelivery: requestedDelivery,
         });
         preparation.value = prepared;
         return prepared.conversation;
@@ -1119,20 +1492,26 @@ export function useAgentRuntime(options: {
       if (!isNative()) {
         updateConversation(conversationId, (conversation) => commitPromptTransaction(conversation, prepared.transaction));
         window.setTimeout(() => {
-          updateConversation(conversationId, (conversation) => ({
-            ...conversation,
-            status: "idle",
-            messages: [
-              ...conversation.messages,
-              {
-                id: uid("assistant"),
-                role: "assistant",
-                content: "Mode aperçu actif. Dans l’application Tauri, ce message est envoyé au processus RPC de Prime Agent et sa réponse apparaît ici en streaming.",
-                createdAt: now(),
-                status: "complete",
-              },
-            ],
-          }));
+          activePromptRuns.current.delete(conversationId);
+          updateConversation(conversationId, (conversation) => {
+            const delivered = forceQueued
+              ? applyAuthoritativeUserMessageStart(conversation, content, now())
+              : conversation;
+            return {
+              ...delivered,
+              status: "idle",
+              messages: [
+                ...delivered.messages,
+                {
+                  id: uid("assistant"),
+                  role: "assistant",
+                  content: "Mode aperçu actif. Dans l’application Tauri, ce message est envoyé au processus RPC de Prime Agent et sa réponse apparaît ici en streaming.",
+                  createdAt: now(),
+                  status: "complete",
+                },
+              ],
+            };
+          });
         }, 700);
         return;
       }
@@ -1145,18 +1524,96 @@ export function useAgentRuntime(options: {
           type: "prompt",
           message: content,
           ...(images.length ? { images } : {}),
-          ...(prepared.transaction.previous.status === "streaming" || prepared.transaction.previous.status === "tool" || prepared.transaction.previous.status === "queued"
-            ? { streamingBehavior: "followUp" }
+          ...(forceQueued
+            ? { streamingBehavior: requestedDelivery === "steer" ? "steer" : "followUp" }
             : {}),
         });
         updateConversation(conversationId, (conversation) => commitPromptTransaction(conversation, prepared.transaction));
+        if (forceQueued) {
+          const token = activeSelection.current;
+          window.setTimeout(() => {
+            if (!isCurrentSelection(conversationId, token.generation)) return;
+            void sendSelectionRequest(conversationId, token.generation, "get_state").catch(() => undefined);
+          }, 50);
+        }
       } catch (error) {
+        if (!forceQueued) activePromptRuns.current.delete(conversationId);
         updateConversation(conversationId, (conversation) => rollbackPromptTransaction(conversation, prepared.transaction));
         throw error;
       }
     },
-    [ensureStarted, selectedConversation, selectedProject, updateConversation],
+    [ensureStarted, isCurrentSelection, selectedConversation, selectedProject, sendSelectionRequest, updateConversation],
   );
+
+  const mutateQueuedMessage = useCallback(async (input: {
+    messageId: string;
+    lane: "steering" | "followUp";
+    index: number;
+    expectedText: string;
+    mutation: QueueMutation;
+  }) => {
+    if (!selectedConversation || !selectedProject) return;
+    const conversationId = selectedConversation.id;
+    await ensureStarted(selectedConversation, selectedProject);
+    const status = await mutateAgentQueue({ conversationId, ...input });
+    const token = activeSelection.current;
+    const refresh = () => {
+      if (!isCurrentSelection(conversationId, token.generation)) return;
+      void sendSelectionRequest(conversationId, token.generation, "get_state").catch(() => undefined);
+    };
+    if (status !== "applied") {
+      refresh();
+      if (status === "unsupported") {
+        throw new Error("Ce runtime Prime Agent ne permet pas encore de modifier sa file d’attente.");
+      }
+      throw new Error(status === "rejected"
+        ? "La file a changé entre-temps. Elle vient d’être resynchronisée."
+        : "Prime Agent a refusé cette modification de la file.");
+    }
+
+    const previousActions = runtimes[conversationId]?.state?.sessionActions;
+    const nextActions = previousActions
+      ? applyQueueMutationSnapshot(previousActions, input.lane, input.index, input.expectedText, input.mutation)
+      : undefined;
+    setRuntimes((current) => {
+      const runtime = current[conversationId];
+      if (!runtime?.state) return current;
+      const sessionActions = applyQueueMutationSnapshot(
+        runtime.state.sessionActions,
+        input.lane,
+        input.index,
+        input.expectedText,
+        input.mutation,
+      );
+      if (sessionActions === runtime.state.sessionActions) return current;
+      return {
+        ...current,
+        [conversationId]: {
+          ...runtime,
+          state: { ...runtime.state, sessionActions },
+        },
+      };
+    });
+    updateConversation(conversationId, (conversation) => {
+      let messages = conversation.messages;
+      if (input.mutation.type === "delete") {
+        messages = messages.filter((message) => message.id !== input.messageId);
+      } else if (input.mutation.type === "replace") {
+        const replacement = input.mutation;
+        messages = messages.map((message) => message.id === input.messageId ? {
+          ...message,
+          content: replacement.text,
+          queueText: replacement.text,
+          queueDelivery: replacement.lane === "steering" ? "steer" as const : "follow_up" as const,
+          queueAccepted: true,
+          queueObserved: true,
+        } : message);
+      }
+      const updated = messages === conversation.messages ? conversation : { ...conversation, messages };
+      return nextActions ? reconcileQueuedMessages(updated, nextActions) : updated;
+    });
+    window.setTimeout(refresh, 50);
+  }, [ensureStarted, isCurrentSelection, runtimes, selectedConversation, selectedProject, sendSelectionRequest, updateConversation]);
 
   const retryMessage = useCallback(async (assistantMessageId: string) => {
     if (!selectedConversation) return;
@@ -1180,6 +1637,7 @@ export function useAgentRuntime(options: {
     try {
       await sendRpc(selectedConversation.id, { id: uid("abort"), type: "abort" });
     } finally {
+      activePromptRuns.current.delete(selectedConversation.id);
       updateConversation(selectedConversation.id, (conversation) => ({
         ...finalizeConversationTools(conversation, "cancelled", now()),
         status: "idle",
@@ -1193,6 +1651,7 @@ export function useAgentRuntime(options: {
     try {
       await stopAgent(selectedConversation.id);
     } finally {
+      activePromptRuns.current.delete(selectedConversation.id);
       updateConversation(selectedConversation.id, (conversation) => ({
         ...finalizeConversationTools(conversation, "cancelled", now()),
         status: "idle",
@@ -1234,10 +1693,137 @@ export function useAgentRuntime(options: {
         }
         return;
       }
+      if (ACKNOWLEDGED_COMMANDS.has(type)) {
+        const response = await sendSelectionRequest(selectedConversation.id, token.generation, type, true, fields);
+        if (response?.success === false) throw new Error(response.error ?? `La commande ${type} a échoué.`);
+        return;
+      }
       await sendRpc(selectedConversation.id, { id: uid(type), type, ...fields });
     },
     [ensureStarted, loadConversationHistory, selectedConversation, selectedProject, sendSelectionRequest],
   );
+
+  const observeSubagent = useCallback(async (activeSessionId?: string) => {
+    if (!selectedConversation || !selectedProject) return;
+    await ensureStarted(selectedConversation, selectedProject);
+    const conversationId = selectedConversation.id;
+    const currentRuntime = runtimes[conversationId];
+    const currentId = currentRuntime?.observedSubagent?.activeSessionId;
+    const token = activeSelection.current;
+    if (currentId && currentId !== activeSessionId) {
+      const response = await sendSelectionRequest(
+        conversationId,
+        token.generation,
+        "unobserve",
+        true,
+        { activeSessionId: currentId },
+      );
+      if (response?.success === false) throw new Error(response.error ?? "Impossible d’arrêter l’observation du sous-agent.");
+    }
+    if (!activeSessionId || activeSessionId === currentId) {
+      setRuntimes((current) => {
+        const runtime = current[conversationId];
+        if (!runtime) return current;
+        return { ...current, [conversationId]: { ...runtime, observedSubagent: undefined } };
+      });
+      return;
+    }
+    const response = await sendSelectionRequest(
+      conversationId,
+      token.generation,
+      "observe",
+      true,
+      { activeSessionId },
+    );
+    if (response?.success === false) throw new Error(response.error ?? "Impossible d’observer ce sous-agent.");
+    const messages = asRecord(response?.data)?.messages;
+    const mapped = Array.isArray(messages) ? mapAgentMessages(messages) : [];
+    setRuntimes((current) => {
+      const runtime = current[conversationId] ?? { models: [], commands: [], logs: [] };
+      return {
+        ...current,
+        [conversationId]: {
+          ...runtime,
+          observedSubagent: { activeSessionId, messages: mapped },
+        },
+      };
+    });
+  }, [ensureStarted, runtimes, selectedConversation, selectedProject, sendSelectionRequest]);
+
+  const renameSession = useCallback(async (name: string) => {
+    if (!selectedConversation || !selectedProject) return;
+    const trimmed = name.trim();
+    if (!trimmed) throw new Error("Le nom de session ne peut pas être vide.");
+    updateConversation(selectedConversation.id, { title: trimmed, sessionNameSyncPending: true });
+    await ensureStarted(selectedConversation, selectedProject);
+    const token = activeSelection.current;
+    const response = await sendSelectionRequest(
+      selectedConversation.id,
+      token.generation,
+      "set_session_name",
+      true,
+      { name: trimmed },
+    );
+    if (response?.success === false) throw new Error(response.error ?? "Prime Agent a refusé le nom de session.");
+  }, [ensureStarted, selectedConversation, selectedProject, sendSelectionRequest, updateConversation]);
+
+  const forkFromMessage = useCallback(async (assistantMessageId: string) => {
+    if (!selectedConversation || !selectedProject) return;
+    await ensureStarted(selectedConversation, selectedProject);
+    const conversation = getConversationRef.current(selectedConversation.id) ?? selectedConversation;
+    const token = activeSelection.current;
+    const response = await sendSelectionRequest(
+      conversation.id,
+      token.generation,
+      "get_fork_messages",
+      true,
+    );
+    if (response?.success === false) throw new Error(response.error ?? "Impossible de lire les points de branchement.");
+    const records = asRecord(response?.data)?.messages;
+    const candidates = Array.isArray(records)
+      ? records.flatMap((value) => {
+          const record = asRecord(value);
+          const entryId = textValue(record?.entryId);
+          const text = textValue(record?.text);
+          return entryId && text ? [{ entryId, text }] : [];
+        })
+      : [];
+    const entryId = selectForkEntryId(conversation.messages, assistantMessageId, candidates);
+    if (!entryId) throw new Error("Prime Agent n’a pas trouvé le tour correspondant dans l’arbre de session.");
+    const preservedId = preserveSessionReference(conversation.id, `${conversation.title} · origine`);
+    if (!preservedId) throw new Error("La session source n’est pas encore persistée ; réessayez après son chargement.");
+    try {
+      const fork = await sendSelectionRequest(
+        conversation.id,
+        token.generation,
+        "fork",
+        true,
+        { entryId },
+      );
+      if (fork?.success === false) throw new Error(fork.error ?? "La création de la branche a échoué.");
+      if (asRecord(fork?.data)?.cancelled === true) discardSessionReference(preservedId);
+    } catch (error) {
+      discardSessionReference(preservedId);
+      throw error;
+    }
+  }, [discardSessionReference, ensureStarted, preserveSessionReference, selectedConversation, selectedProject, sendSelectionRequest]);
+
+  const cloneSession = useCallback(async () => {
+    if (!selectedConversation || !selectedProject) return;
+    await ensureStarted(selectedConversation, selectedProject);
+    const conversation = getConversationRef.current(selectedConversation.id) ?? selectedConversation;
+    const token = activeSelection.current;
+    const preservedId = preserveSessionReference(conversation.id, `${conversation.title} · origine`);
+    if (!preservedId) throw new Error("La session source n’est pas encore persistée ; réessayez après son chargement.");
+    try {
+      const clone = await sendSelectionRequest(conversation.id, token.generation, "clone", true);
+      if (clone?.success === false) throw new Error(clone.error ?? "La duplication de la session a échoué.");
+      if (asRecord(clone?.data)?.cancelled === true) discardSessionReference(preservedId);
+    } catch (error) {
+      discardSessionReference(preservedId);
+      throw error;
+    }
+  }, [discardSessionReference, ensureStarted, preserveSessionReference, selectedConversation, selectedProject, sendSelectionRequest]);
 
   const answerExtensionRequest = useCallback(async (
     request: PendingExtensionUiRequest,
@@ -1284,19 +1870,46 @@ export function useAgentRuntime(options: {
     commands: runtime?.commands ?? [],
     stats: runtime?.stats,
     sessionState: runtime?.state,
+    schedules: runtime?.schedules ?? [],
+    heartbeat: runtime?.heartbeat,
+    heartbeats: runtime?.heartbeats ?? [],
+    subagents: runtime?.subagents ?? [],
+    observedSubagent: runtime?.observedSubagent,
     logs: runtime?.logs ?? [],
     extensionRequest: extensionRequests[0],
     extensionRequestCount: extensionRequests.length,
     ensureStarted,
     sendPrompt,
+    mutateQueuedMessage,
     retryMessage,
     abort,
     closeRuntime,
     chooseModel,
     setThinking,
     runCommand,
+    observeSubagent,
+    renameSession,
+    forkFromMessage,
+    cloneSession,
     answerExtensionRequest,
   };
+}
+
+export function selectForkEntryId(
+  messages: ChatMessage[],
+  assistantMessageId: string,
+  candidates: Array<{ entryId: string; text: string }>,
+): string | undefined {
+  const assistantIndex = messages.findIndex((message) => message.id === assistantMessageId);
+  if (assistantIndex < 0) return undefined;
+  const users = messages.slice(0, assistantIndex).filter((message) => message.role === "user");
+  const source = users.at(-1);
+  if (!source) return undefined;
+  const normalize = (value: string) => value.replace(/\s+/g, " ").trim();
+  const sourceText = normalize(source.content);
+  const occurrence = users.filter((message) => normalize(message.content) === sourceText).length - 1;
+  const exact = candidates.filter((candidate) => normalize(candidate.text) === sourceText);
+  return exact[occurrence]?.entryId ?? candidates[users.length - 1]?.entryId;
 }
 
 function handleMessageEvent(
@@ -1306,9 +1919,22 @@ function handleMessageEvent(
 ) {
   const rawMessage = event.message as Record<string, unknown> | undefined;
   const role = String(rawMessage?.role ?? "assistant");
+  const extracted = extractMessageText(rawMessage);
+  if (role === "user") {
+    if (event.type !== "message_start" || !extracted) return;
+    const timestamp = typeof rawMessage?.timestamp === "number" ? rawMessage.timestamp : undefined;
+    const createdAt = timestamp && Number.isFinite(timestamp)
+      ? new Date(timestamp).toISOString()
+      : now();
+    updateConversation(conversationId, (conversation) => applyAuthoritativeUserMessageStart(
+      conversation,
+      extracted,
+      createdAt,
+    ));
+    return;
+  }
   if (role !== "assistant") return;
   const eventId = String(rawMessage?.id ?? event.messageId ?? "");
-  const extracted = extractMessageText(rawMessage);
   const assistantEvent = event.assistantMessageEvent as Record<string, unknown> | undefined;
   const isTextDelta = assistantEvent?.type === "text_delta";
   const delta = isTextDelta && typeof assistantEvent.delta === "string" ? assistantEvent.delta : "";
@@ -1737,12 +2363,14 @@ export function mapAgentMessages(messages: unknown[]): ChatMessage[] {
     if (role === "user" || role === "system") {
       const content = extractMessageText(message) || (containsImageContent(message.content) ? "Image jointe" : "");
       if (!content) continue;
+      const attachments = historicalImageAttachments(message.content, index);
       mapped.push({
         id: String(message.id ?? `history-${index}`),
         role,
         content,
         createdAt,
         status: "complete",
+        attachments: attachments.length ? attachments : undefined,
       });
       continue;
     }
@@ -1785,6 +2413,44 @@ export function mapAgentMessages(messages: unknown[]): ChatMessage[] {
     }
   }
   return mapped;
+}
+
+function historicalImageAttachments(value: unknown, messageIndex: number): Attachment[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((block, blockIndex): Attachment[] => {
+    const record = asRecord(block);
+    if (!record || !["image", "image_url"].includes(String(record.type))) return [];
+    const mimeType = textValue(record.mimeType) ?? "image/png";
+    const previewDataUrl = textValue(record.previewDataUrl);
+    const size = numberValue(record.size) ?? 0;
+    return [{
+      id: `history-image-${messageIndex}-${blockIndex}`,
+      name: `image-${blockIndex + 1}.${mimeType.split("/")[1] ?? "png"}`,
+      mimeType,
+      size,
+      isImage: true,
+      ...(previewDataUrl ? { previewDataUrl } : {}),
+    }];
+  });
+}
+
+export function mergeHistoricalAttachmentPreviews(next: ChatMessage[], previous: ChatMessage[]): ChatMessage[] {
+  const previousUsers = previous.filter((message) => message.role === "user");
+  let userIndex = 0;
+  return next.map((message) => {
+    if (message.role !== "user") return message;
+    const old = previousUsers[userIndex++];
+    if (message.attachments?.some((attachment) => attachment.previewDataUrl) || !old?.attachments?.length) return message;
+    const oldImages = old.attachments.filter((attachment) => attachment.isImage);
+    if (!oldImages.length) return message;
+    const attachments = (message.attachments ?? oldImages).map((attachment, index) => ({
+      ...attachment,
+      ...(oldImages[index]?.name ? { name: oldImages[index]!.name } : {}),
+      ...(oldImages[index]?.size ? { size: oldImages[index]!.size } : {}),
+      ...(oldImages[index]?.previewDataUrl ? { previewDataUrl: oldImages[index]!.previewDataUrl } : {}),
+    }));
+    return { ...message, attachments };
+  });
 }
 
 function historyTimestamp(value: unknown): string {

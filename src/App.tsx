@@ -34,6 +34,7 @@ import {
   createWorkspaceWindow,
   detectPrimeAgent,
   listGitChanges,
+  listPrimeAgentSessions,
   openPrimeAgentTerminal,
   pickProjectFolder,
   quickInstallPrimeAgent,
@@ -41,7 +42,7 @@ import {
   stopAgent,
 } from "./lib/bridge";
 import { redactText } from "./lib/redaction";
-import type { AppView, ExtensionUiRequest, GitChange, PermissionPreset, PersistedAppState, Project, RuntimeDetection } from "./types";
+import type { AppView, ExtensionUiRequest, GitChange, PersistedAppState, Project, RuntimeDetection } from "./types";
 
 interface InstallState {
   running: boolean;
@@ -64,6 +65,9 @@ function App() {
     addProject,
     selectProject,
     createConversation,
+    importPrimeAgentSessions,
+    preserveConversationReference,
+    discardConversationReference,
     selectConversation,
     updateConversation,
     updateProject,
@@ -74,6 +78,27 @@ function App() {
     workspaceSaveError,
     retryWorkspaceSave,
   } = workspace;
+
+  useEffect(() => {
+    if (!loaded) return;
+    let cancelled = false;
+    const refreshCatalog = async () => {
+      try {
+        const sessions = await listPrimeAgentSessions(state.projects.map((project) => project.path));
+        if (!cancelled) importPrimeAgentSessions(sessions);
+      } catch {
+        // The catalog is additive and optional. Runtime diagnostics remain in
+        // Settings; a transient scan failure must not block the workspace.
+      }
+    };
+    const onFocus = () => void refreshCatalog();
+    void refreshCatalog();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [importPrimeAgentSessions, loaded, state.projects]);
   const [detection, setDetection] = useState<RuntimeDetection>();
   const [installState, setInstallState] = useState<InstallState>({ running: false, lines: [] });
   const [commandPalette, setCommandPalette] = useState(false);
@@ -146,6 +171,11 @@ function App() {
     selectedConversation,
     getProject,
     getConversation,
+    preserveSessionReference: (conversationId, title) => preserveConversationReference(
+      conversationId,
+      state.preferences.language === "en" ? title.replace(/ · origine$/, " · source") : title,
+    ),
+    discardSessionReference: discardConversationReference,
     updateConversation,
     onInstallProgress,
     onInstallComplete,
@@ -336,7 +366,17 @@ function App() {
           onNewConversation={newConversation}
           onPinConversation={(id, pinned) => updateConversation(id, { pinned })}
           onArchiveConversation={archiveConversationAndStop}
-          onRenameConversation={(id, title) => updateConversation(id, { title })}
+          onRenameConversation={(id, title) => {
+            updateConversation(id, { title, sessionNameSyncPending: true });
+            if (id === selectedConversation?.id) {
+              void agent.renameSession(title).catch((error) => setToast({
+                tone: "error",
+                message: state.preferences.language === "en"
+                  ? `Session renamed locally, but Prime Agent could not be updated: ${error instanceof Error ? error.message : String(error)}`
+                  : `Session renommée localement, mais Prime Agent n’a pas pu être mis à jour : ${error instanceof Error ? error.message : String(error)}`,
+              }));
+            }
+          }}
           onReorderProject={reorderProject}
           onReorderConversation={reorderConversation}
         />
@@ -355,17 +395,35 @@ function App() {
             commands={agent.commands}
             stats={agent.stats}
             sessionState={agent.sessionState}
+            schedules={agent.schedules}
+            heartbeat={agent.heartbeat}
+            heartbeats={agent.heartbeats}
+            subagents={agent.subagents}
+            observedSubagent={agent.observedSubagent}
             inspectorOpen={state.preferences.inspectorOpen}
             changes={changes}
             onToggleInspector={toggleInspector}
             onDraftChange={(draft) => updateConversation(selectedConversation.id, { draft })}
             onSend={agent.sendPrompt}
+            onMutateQueuedMessage={agent.mutateQueuedMessage}
             onRetryMessage={agent.retryMessage}
             onAbort={agent.abort}
             onModel={agent.chooseModel}
             onThinking={agent.setThinking}
-            onPermissionPreset={async (preset: PermissionPreset) => updateProject(selectedProject.id, { permissionPreset: preset })}
             onRunCommand={agent.runCommand}
+            onObserveSubagent={agent.observeSubagent}
+            onForkMessage={(messageId) => agent.forkFromMessage(messageId).catch((error) => setToast({
+              tone: "error",
+              message: state.preferences.language === "en"
+                ? `Prime Agent could not create this branch: ${error instanceof Error ? error.message : String(error)}`
+                : `Prime Agent n’a pas pu créer cette branche : ${error instanceof Error ? error.message : String(error)}`,
+            }))}
+            onCloneSession={() => agent.cloneSession().catch((error) => setToast({
+              tone: "error",
+              message: state.preferences.language === "en"
+                ? `Prime Agent could not duplicate this session: ${error instanceof Error ? error.message : String(error)}`
+                : `Prime Agent n’a pas pu dupliquer cette session : ${error instanceof Error ? error.message : String(error)}`,
+            }))}
             onNewWindow={() => void createWorkspaceWindow(selectedProject.id, selectedConversation.id)}
             onOpenTerminal={() => { setDockMode("terminal"); setBottomDock(true); }}
           />

@@ -2,6 +2,33 @@
 
 All notable changes to Prime Orbit are documented in this file.
 
+## [Unreleased]
+
+## [0.1.12] - 2026-08-19
+
+### Prime Agent fidelity
+
+- Replaced the UI-only supervision selector with Prime Agent's real steering and follow-up queue modes and live queued instructions.
+- Added real Prime Agent heartbeat and scheduled-job controls, including cross-session pause, resume, stop, and cancellation actions.
+- Discovered top-level sessions created by the classic Prime Agent terminal and imported their metadata lazily into linked Orbit projects.
+- Kept started sessions alive while navigating between conversations and pages, while preserving native multi-window ownership.
+- Added true session branching from a selected turn through `get_fork_messages` and `fork`, while keeping session duplication clearly labeled as a clone.
+- Synchronized conversation renames with Prime Agent session names and retried pending names when a session is next opened.
+- Renamed Orbit-only activity views and permission labels so they no longer imply global Prime Agent discovery or sandboxing.
+- Read the application version from package metadata instead of displaying a stale hard-coded version.
+
+### Queue and conversation flow
+
+- Replaced optimistic transcript rows with a discreet Prime Agent queue that exposes real steering and follow-up lanes.
+- Added native editing and deletion for queued daemon messages with exact lane, index, and expected-text validation.
+- Kept accepted prompts queued until Prime Agent emits their authoritative user turn, preserving the correct user/assistant order across consecutive turns.
+- Prevented consumed messages from remaining stuck in the queue and kept duplicate queue entries independently addressable.
+
+### Attachments and history
+
+- Replaced generic image icons with bounded native-generated thumbnails in the composer, transcript, and Session inspector.
+- Rehydrated image previews from saved Prime Agent histories without exposing original image bytes or paths to the renderer.
+
 ## [0.1.11] - 2026-08-19
 
 ### Git workflow
@@ -86,6 +113,7 @@ All notable changes to Prime Orbit are documented in this file.
 - TypeScript build and checks.
 - Strict Rust Clippy validation with warnings denied.
 
+[0.1.12]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.12
 [0.1.11]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.11
 [0.1.10]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.10
 [0.1.9]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.9

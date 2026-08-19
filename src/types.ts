@@ -26,6 +26,8 @@ export interface Attachment {
   size: number;
   /** Ephemeral, owner-scoped native cache key. Never persisted after submit. */
   attachmentHandle?: string;
+  /** Bounded native-generated thumbnail. Never contains the original image. */
+  previewDataUrl?: string;
   isImage: boolean;
 }
 
@@ -42,6 +44,8 @@ export interface ToolActivity {
 
 export interface ChatMessage {
   id: string;
+  /** Prime Agent session-tree entry used for real forks when available. */
+  entryId?: string;
   role: "user" | "assistant" | "system";
   content: string;
   createdAt: string;
@@ -56,6 +60,14 @@ export interface ChatMessage {
     cacheRead?: number;
     total?: number;
   };
+  /** A user turn accepted by Prime Agent but not delivered to the model yet. */
+  queueDelivery?: "steer" | "follow_up";
+  /** Set after the turn has appeared in Prime Agent's authoritative queue snapshot. */
+  queueObserved?: boolean;
+  /** Set once Prime Agent has accepted the queued prompt over RPC. */
+  queueAccepted?: boolean;
+  /** Exact payload used to reconcile the optimistic row with Prime Agent's queue. */
+  queueText?: string;
 }
 
 export interface ActivityItem {
@@ -85,6 +97,8 @@ export interface Conversation {
   status: ConversationStatus;
   sessionPath?: string;
   sessionId?: string;
+  /** A local rename that still needs to be mirrored to Prime Agent. */
+  sessionNameSyncPending?: boolean;
   model?: string;
   thinkingLevel: ThinkingLevel;
   /** Durable marker used to distinguish a never-submitted draft from a real session. */
@@ -124,11 +138,24 @@ export interface AgentSessionState {
   sessionName?: string;
   autoCompactionEnabled: boolean;
   messageCount: number;
-  sessionActions?: unknown;
+  sessionActions: SessionActionSnapshot;
   goal?: GoalState;
 }
 
+export interface SessionActionSnapshot {
+  queuedCount: number;
+  steering: string[];
+  followUps: string[];
+  active?: {
+    kind: "turn" | "session_command";
+    phase: "preparing" | "committing" | "running";
+    label?: string;
+  };
+}
+
 export interface GoalState {
+  active?: boolean;
+  goalId?: string;
   status: "idle" | "active" | "paused" | "budget_limited" | "complete" | "error";
   objective?: string;
   tokensUsed?: number;
@@ -136,6 +163,54 @@ export interface GoalState {
   continuationsUsed?: number;
   timeUsedSeconds?: number;
   lastReason?: string;
+  lastError?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface AgentRlmChild {
+  id: string;
+  parentId?: string;
+  activeSessionId?: string;
+  sessionName?: string;
+  model?: string;
+  label: string;
+  status: "queued" | "running" | "done" | "error" | "cancelled";
+  durationMs?: number;
+  answerPreview?: string;
+  repliedSinceTask?: boolean;
+  toolUseCount?: number;
+  tokenCount?: number;
+  recap?: string;
+  sessionDir?: string;
+  activity?: { kind: "waiting" | "writing" | "executing"; toolName?: string };
+  error?: string;
+}
+
+export interface AgentSchedule {
+  id: string;
+  status: "active" | "paused" | "completed" | "cancelled";
+  source?: "cron" | "heartbeat" | "rlm_heartbeat";
+  deliveryMode?: "steer" | "follow_up";
+  activeSessionId: string;
+  sessionId: string;
+  sessionFile: string;
+  cwd: string;
+  label?: string;
+  prompt: string;
+  schedule: { kind: "once" | "cron" | "interval"; expression: string; intervalMs?: number };
+  createdAt: string;
+  updatedAt: string;
+  nextRunAt?: string;
+  lastRunAt?: string;
+  lastError?: string;
+  runCount: number;
+}
+
+export interface AgentHeartbeatSummary {
+  job: AgentSchedule;
+  sessionName?: string;
+  firstMessage?: string;
 }
 
 export interface SessionStats {
@@ -289,8 +364,22 @@ export interface AttachmentReadResult {
   name: string;
   mimeType: string;
   attachmentHandle?: string;
+  previewDataUrl?: string;
   size: number;
   isImage: boolean;
+}
+
+export interface PrimeAgentSessionSummary {
+  sessionPath: string;
+  sessionId: string;
+  cwd: string;
+  sessionName?: string;
+  firstMessage?: string;
+  messageCount: number;
+  rlmDepth: number;
+  parentSessionPath?: string;
+  createdAt?: string;
+  updatedAtMs: number;
 }
 
 export interface GitChange {

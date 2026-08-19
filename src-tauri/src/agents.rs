@@ -1,13 +1,11 @@
-#[cfg(windows)]
-use crate::runtime::LaunchSpec;
 use crate::{
     files::{hydrate_prompt_images, AttachmentCache},
     paths::canonicalize,
-    runtime::{detect_internal, now_millis},
+    runtime::{capture_command_output, detect_internal, external_command, now_millis, LaunchSpec},
     session_lease::reclaim_stale_session_lease,
 };
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
@@ -29,6 +27,8 @@ const MAX_RPC_BYTES: usize = 16 * 1024 * 1024;
 const IDLE_RELEASE_GRACE: Duration = Duration::from_millis(350);
 const MAX_EXIT_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(350);
+const QUEUE_BRIDGE_SCRIPT: &str = include_str!("../assets/prime-agent-queue-bridge.cjs");
+const MAX_QUEUED_MESSAGE_TEXT: usize = 128 * 1024;
 
 #[derive(Clone)]
 pub struct AgentsState(Arc<Mutex<HashMap<String, RunningAgent>>>);
@@ -42,6 +42,7 @@ impl Default for AgentsState {
 #[derive(Clone)]
 struct RunningAgent {
     info: RunningAgentInfo,
+    launch_spec: LaunchSpec,
     child: Arc<Mutex<Child>>,
     stdin: Arc<Mutex<ChildStdin>>,
     exit_emitted: Arc<AtomicBool>,
@@ -78,6 +79,30 @@ struct AgentExitEvent {
     code: Option<i32>,
     success: bool,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum QueuedMessageMutation {
+    Delete,
+    Move { direction: i8 },
+    Replace { text: String, lane: String },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueMutationResult {
+    status: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueBridgeRequest {
+    session_file: String,
+    lane: String,
+    index: usize,
+    expected_text: String,
+    mutation: QueuedMessageMutation,
 }
 
 fn validated_identifier(value: String) -> Result<String, String> {
@@ -670,6 +695,7 @@ fn start_agent_blocking(
         conversation_id.clone(),
         RunningAgent {
             info: info.clone(),
+            launch_spec,
             child: Arc::clone(&child),
             stdin: Arc::new(Mutex::new(stdin)),
             exit_emitted: Arc::clone(&exit_emitted),
@@ -864,6 +890,107 @@ fn send_rpc_blocking(
     write_result
 }
 
+fn validate_queue_lane(lane: &str) -> Result<(), String> {
+    if matches!(lane, "steering" | "followUp") {
+        Ok(())
+    } else {
+        Err("File Prime Agent inconnue.".to_string())
+    }
+}
+
+fn validate_queued_message_text(value: &str, label: &str, allow_empty: bool) -> Result<(), String> {
+    if !allow_empty && value.trim().is_empty() {
+        return Err(format!("{label} ne peut pas être vide."));
+    }
+    if value.len() > MAX_QUEUED_MESSAGE_TEXT {
+        return Err(format!("{label} dépasse la taille autorisée."));
+    }
+    Ok(())
+}
+
+fn validate_queue_mutation(mutation: &QueuedMessageMutation) -> Result<(), String> {
+    match mutation {
+        QueuedMessageMutation::Delete => Ok(()),
+        QueuedMessageMutation::Move { direction: -1 | 1 } => Ok(()),
+        QueuedMessageMutation::Move { .. } => {
+            Err("La direction de déplacement doit être -1 ou 1.".to_string())
+        }
+        QueuedMessageMutation::Replace { text, lane } => {
+            validate_queue_lane(lane)?;
+            validate_queued_message_text(text, "Le message modifié", false)
+        }
+    }
+}
+
+fn mutate_agent_queue_blocking(
+    agents: AgentsState,
+    owner: String,
+    conversation_id: String,
+    lane: String,
+    index: usize,
+    expected_text: String,
+    mutation: QueuedMessageMutation,
+) -> Result<QueueMutationResult, String> {
+    let conversation_id = validated_identifier(conversation_id)?;
+    validate_queue_lane(&lane)?;
+    validate_queued_message_text(&expected_text, "Le message attendu", true)?;
+    validate_queue_mutation(&mutation)?;
+
+    let (launch_spec, session_file) = {
+        let map = agents.0.lock();
+        let agent = map
+            .get(&conversation_id)
+            .ok_or_else(|| format!("Aucun Prime Agent actif pour {conversation_id}"))?;
+        if !agent.owners.contains(&owner) {
+            return Err(
+                "Cette fenêtre ne possède pas la conversation Prime Agent demandée.".to_string(),
+            );
+        }
+        let session_file = agent.info.session_path.clone().ok_or_else(|| {
+            "Prime Agent n’a pas encore publié le chemin de cette session.".to_string()
+        })?;
+        (agent.launch_spec.clone(), session_file)
+    };
+
+    let LaunchSpec::Source { node, cli, .. } = launch_spec else {
+        return Ok(QueueMutationResult {
+            status: "unsupported".to_string(),
+        });
+    };
+    let request = QueueBridgeRequest {
+        session_file,
+        lane,
+        index,
+        expected_text,
+        mutation,
+    };
+    let request = serde_json::to_string(&request)
+        .map_err(|error| format!("Impossible de préparer la mutation de file: {error}"))?;
+    let arguments = [OsString::from("-e"), OsString::from(QUEUE_BRIDGE_SCRIPT)];
+    let mut command = external_command(&node, &arguments);
+    command
+        .env("PRIME_ORBIT_CLI_PATH", cli)
+        .env("PRIME_ORBIT_QUEUE_REQUEST", request);
+    let output = capture_command_output(&mut command)?;
+    if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if details.is_empty() {
+            "Prime Agent n’a pas pu modifier cette instruction en attente.".to_string()
+        } else {
+            details
+        });
+    }
+    let result: QueueMutationResult = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Réponse de mutation de file invalide: {error}"))?;
+    if !matches!(
+        result.status.as_str(),
+        "applied" | "rejected" | "invalid" | "unsupported"
+    ) {
+        return Err("Statut de mutation de file inconnu.".to_string());
+    }
+    Ok(result)
+}
+
 fn stop_agent_blocking(
     app: AppHandle,
     agents: AgentsState,
@@ -950,6 +1077,32 @@ pub async fn send_rpc(
 }
 
 #[tauri::command(rename_all = "camelCase")]
+pub async fn mutate_agent_queue(
+    window: tauri::WebviewWindow,
+    agents: tauri::State<'_, AgentsState>,
+    conversation_id: String,
+    lane: String,
+    index: usize,
+    expected_text: String,
+    mutation: QueuedMessageMutation,
+) -> Result<QueueMutationResult, String> {
+    let agents = AgentsState(Arc::clone(&agents.0));
+    let owner = window.label().to_string();
+    crate::run_blocking(move || {
+        mutate_agent_queue_blocking(
+            agents,
+            owner,
+            conversation_id,
+            lane,
+            index,
+            expected_text,
+            mutation,
+        )
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
 pub async fn stop_agent(
     app: AppHandle,
     agents: tauri::State<'_, AgentsState>,
@@ -984,7 +1137,8 @@ mod tests {
     use super::{
         acquire_owner_lease, append_diagnostic_tail, conflicting_session_conversation,
         is_extension_ui_request, owner_may_send, release_owner_lease_state, runtime_busy_state,
-        runtime_session_path, RunningAgentInfo, MAX_EXIT_DIAGNOSTIC_BYTES,
+        runtime_session_path, validate_queue_lane, validate_queue_mutation, QueuedMessageMutation,
+        RunningAgentInfo, MAX_EXIT_DIAGNOSTIC_BYTES,
     };
     use parking_lot::Mutex;
     use std::{collections::HashSet, path::Path};
@@ -1195,5 +1349,25 @@ mod tests {
         assert!(diagnostic.ends_with("MARQUEUR"));
         assert!(!diagnostic.contains("ancienne erreur"));
         assert!(std::str::from_utf8(diagnostic.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn validates_queue_mutations_before_contacting_the_daemon() {
+        assert!(validate_queue_lane("steering").is_ok());
+        assert!(validate_queue_lane("followUp").is_ok());
+        assert!(validate_queue_lane("follow_up").is_err());
+        assert!(validate_queue_mutation(&QueuedMessageMutation::Delete).is_ok());
+        assert!(validate_queue_mutation(&QueuedMessageMutation::Move { direction: -1 }).is_ok());
+        assert!(validate_queue_mutation(&QueuedMessageMutation::Move { direction: 2 }).is_err());
+        assert!(validate_queue_mutation(&QueuedMessageMutation::Replace {
+            text: "Message corrigé".to_string(),
+            lane: "followUp".to_string(),
+        })
+        .is_ok());
+        assert!(validate_queue_mutation(&QueuedMessageMutation::Replace {
+            text: "   ".to_string(),
+            lane: "followUp".to_string(),
+        })
+        .is_err());
     }
 }

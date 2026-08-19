@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import type {
   AgentExitPayload,
   AttachmentReadResult,
+  PrimeAgentSessionSummary,
   GitChange,
   GitFileDiff,
   InstallProgressPayload,
@@ -219,6 +220,24 @@ export async function sendRpc(conversationId: string, payload: Record<string, un
   await invoke("send_rpc", { conversationId, payload });
 }
 
+export type QueueMutationStatus = "applied" | "rejected" | "invalid" | "unsupported";
+export type QueueMutation =
+  | { type: "delete" }
+  | { type: "move"; direction: -1 | 1 }
+  | { type: "replace"; text: string; lane: "steering" | "followUp" };
+
+export async function mutateAgentQueue(input: {
+  conversationId: string;
+  lane: "steering" | "followUp";
+  index: number;
+  expectedText: string;
+  mutation: QueueMutation;
+}): Promise<QueueMutationStatus> {
+  if (!isNative()) return "applied";
+  const result = await invoke<{ status: QueueMutationStatus }>("mutate_agent_queue", input);
+  return result.status;
+}
+
 export async function stopAgent(conversationId: string): Promise<void> {
   if (!isNative()) return;
   await invoke("stop_agent", { conversationId });
@@ -240,6 +259,11 @@ export async function loadSessionHistory(
     expectedSessionId: expectedSessionId ?? null,
     projectPath,
   });
+}
+
+export async function listPrimeAgentSessions(projectPaths: string[]): Promise<PrimeAgentSessionSummary[]> {
+  if (!isNative()) return [];
+  return invoke<PrimeAgentSessionSummary[]>("list_prime_agent_sessions", { projectPaths });
 }
 
 export async function quickInstallPrimeAgent(): Promise<void> {
@@ -327,6 +351,11 @@ export async function openPrimeAgentTerminal(cwd: string): Promise<void> {
 export async function openProjectFolder(path: string): Promise<void> {
   if (!isNative()) return;
   await invoke("open_project_folder", { path });
+}
+
+export async function openGitFileFolder(cwd: string, path: string): Promise<void> {
+  if (!isNative()) return;
+  await invoke("open_git_file_folder", { cwd, path });
 }
 
 export async function inspectPrimeAgentConnections(cwd?: string): Promise<PrimeAgentConnections> {

@@ -7,7 +7,7 @@ import {
   saveAppState,
   type AppStateSnapshot,
 } from "../lib/bridge";
-import type { AppView, Conversation, PersistedAppState, Project } from "../types";
+import type { AppView, Conversation, PersistedAppState, PrimeAgentSessionSummary, Project } from "../types";
 
 const PROJECT_COLORS = ["#7c6cff", "#45c6d8", "#2ecf8f", "#f3b65b", "#f56b79", "#b26cff"];
 const SAVE_DEBOUNCE_MS = 260;
@@ -20,6 +20,10 @@ const newId = (prefix: string) => `${prefix}-${crypto.randomUUID()}`;
 
 function pathName(path: string) {
   return path.split(/[\\/]/).filter(Boolean).at(-1) ?? "Nouveau projet";
+}
+
+function pathIdentity(path: string) {
+  return path.replace(/\\/g, "/").replace(/\/+$/, "").toLocaleLowerCase();
 }
 
 function saveRetryDelay(attempt: number) {
@@ -370,6 +374,86 @@ export function useWorkspace() {
     [state.selectedProjectId],
   );
 
+  const importPrimeAgentSessions = useCallback((sessions: PrimeAgentSessionSummary[]) => {
+    setState((current) => {
+      const knownPaths = new Set(current.conversations.flatMap((conversation) =>
+        conversation.sessionPath ? [pathIdentity(conversation.sessionPath)] : []));
+      const knownSessionIds = new Set(current.conversations.flatMap((conversation) =>
+        conversation.sessionId ? [conversation.sessionId] : []));
+      const projectsByPath = new Map(current.projects.map((project) => [pathIdentity(project.path), project]));
+      const additions: Conversation[] = [];
+      const nextOrderByProject = new Map<string, number>();
+      for (const session of sessions) {
+        // Child/RLM sessions belong in supervision, not as top-level chats.
+        if (session.rlmDepth > 0 || session.parentSessionPath) continue;
+        const project = projectsByPath.get(pathIdentity(session.cwd));
+        const sessionPath = pathIdentity(session.sessionPath);
+        if (!project || knownPaths.has(sessionPath) || knownSessionIds.has(session.sessionId)) continue;
+        const timestamp = session.updatedAtMs > 0
+          ? new Date(session.updatedAtMs).toISOString()
+          : session.createdAt && !Number.isNaN(Date.parse(session.createdAt))
+            ? new Date(session.createdAt).toISOString()
+            : new Date().toISOString();
+        const currentHead = nextOrderByProject.get(project.id)
+          ?? nextHeadOrder(current.conversations.filter((item) => item.projectId === project.id));
+        nextOrderByProject.set(project.id, currentHead - 1);
+        const title = session.sessionName?.trim()
+          || session.firstMessage?.trim()
+          || `Session Prime Agent ${session.sessionId.slice(-8)}`;
+        additions.push({
+          id: newId("conversation"),
+          projectId: project.id,
+          manualOrder: currentHead,
+          title: title.slice(0, 120),
+          createdAt: session.createdAt && !Number.isNaN(Date.parse(session.createdAt))
+            ? new Date(session.createdAt).toISOString()
+            : timestamp,
+          updatedAt: timestamp,
+          pinned: false,
+          archived: false,
+          status: "offline",
+          sessionPath: session.sessionPath,
+          sessionId: session.sessionId,
+          thinkingLevel: current.preferences.defaultThinking,
+          hasContent: session.messageCount > 0,
+          draft: "",
+          messages: [],
+          activities: [],
+        });
+        knownPaths.add(sessionPath);
+        knownSessionIds.add(session.sessionId);
+      }
+      return additions.length ? { ...current, conversations: [...additions, ...current.conversations] } : current;
+    });
+  }, []);
+
+  const preserveConversationReference = useCallback((conversationId: string, title: string) => {
+    const preservedId = newId("conversation");
+    let created = false;
+    setState((current) => {
+      const source = current.conversations.find((conversation) => conversation.id === conversationId);
+      if (!source?.sessionPath) return current;
+      const timestamp = new Date().toISOString();
+      const preserved = createPreservedConversationReference(
+        source,
+        preservedId,
+        title,
+        nextHeadOrder(current.conversations.filter((item) => item.projectId === source.projectId)),
+        timestamp,
+      );
+      created = true;
+      return { ...current, conversations: [preserved, ...current.conversations] };
+    });
+    return created ? preservedId : undefined;
+  }, [setState]);
+
+  const discardConversationReference = useCallback((conversationId: string) => {
+    setState((current) => ({
+      ...current,
+      conversations: current.conversations.filter((conversation) => conversation.id !== conversationId),
+    }));
+  }, [setState]);
+
   const selectConversation = useCallback((conversationId: string) => {
     setState((current) => {
       const conversation = current.conversations.find((item) => item.id === conversationId && !item.archived);
@@ -494,6 +578,9 @@ export function useWorkspace() {
     addProject,
     selectProject,
     createConversation,
+    importPrimeAgentSessions,
+    preserveConversationReference,
+    discardConversationReference,
     selectConversation,
     updateConversation,
     updateProject,
@@ -501,6 +588,31 @@ export function useWorkspace() {
     reorderConversation,
     deleteProject,
     archiveConversation,
+  };
+}
+
+export function createPreservedConversationReference(
+  source: Conversation,
+  id: string,
+  title: string,
+  manualOrder: number,
+  timestamp: string,
+): Conversation {
+  return {
+    ...source,
+    id,
+    manualOrder,
+    title,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    pinned: false,
+    archived: false,
+    status: "offline",
+    sessionNameSyncPending: true,
+    draft: "",
+    messages: [],
+    activities: [],
+    lastError: undefined,
   };
 }
 

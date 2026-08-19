@@ -4,9 +4,11 @@ import remarkGfm from "remark-gfm";
 import {
   Activity,
   ArchiveRestore,
+  CalendarClock,
   ArrowDown,
   ArrowUp,
   Box,
+  Bot,
   Brain,
   Check,
   ChevronDown,
@@ -18,8 +20,12 @@ import {
   Copy,
   File,
   FileCode2,
+  FolderOpen,
   GitBranch,
   GitCommitHorizontal,
+  HeartPulse,
+  Eye,
+  EyeOff,
   Image,
   Info,
   Layers3,
@@ -28,6 +34,8 @@ import {
   Maximize2,
   MoreHorizontal,
   Paperclip,
+  Pause,
+  Pencil,
   PanelRightClose,
   PanelRightOpen,
   Play,
@@ -39,23 +47,27 @@ import {
   ShieldCheck,
   Sparkles,
   Terminal,
+  Target,
+  Trash2,
   WandSparkles,
   X,
   Zap,
 } from "lucide-react";
-import { getGitFileDiff, pickAttachments, releaseAttachmentHandles } from "../lib/bridge";
+import { getGitFileDiff, openGitFileFolder, pickAttachments, releaseAttachmentHandles } from "../lib/bridge";
 import { useDismissableLayer } from "../hooks/useDismissableLayer";
 import { useI18n, type AppLanguage } from "../i18n";
 import type {
   ActivityItem,
   AgentSessionState,
+  AgentSchedule,
+  AgentHeartbeatSummary,
+  AgentRlmChild,
   Attachment,
   ChatMessage,
   Conversation,
   GitChange,
   GitFileDiff,
   ModelInfo,
-  PermissionPreset,
   Project,
   SessionStats,
   SlashCommand,
@@ -75,25 +87,33 @@ interface ConversationViewProps {
   commands: SlashCommand[];
   stats?: SessionStats;
   sessionState?: AgentSessionState;
+  schedules?: AgentSchedule[];
+  heartbeat?: AgentSchedule | null;
+  heartbeats?: AgentHeartbeatSummary[];
+  subagents?: AgentRlmChild[];
+  observedSubagent?: { activeSessionId: string; messages: ChatMessage[]; closed?: boolean; error?: string };
   inspectorOpen: boolean;
   changes: GitChange[];
   onToggleInspector: () => void;
   onDraftChange: (draft: string) => void;
-  onSend: (message: string, attachments: Attachment[]) => Promise<void>;
+  onSend: (message: string, attachments: Attachment[], delivery?: "steer" | "follow_up") => Promise<void>;
+  onMutateQueuedMessage: (input: { messageId: string; lane: "steering" | "followUp"; index: number; expectedText: string; mutation: { type: "delete" } | { type: "replace"; text: string; lane: "steering" | "followUp" } }) => Promise<void>;
   onRetryMessage: (assistantMessageId: string) => Promise<void>;
   onAbort: () => Promise<void>;
   onModel: (model: ModelInfo) => Promise<void>;
   onThinking: (level: ThinkingLevel) => Promise<void>;
-  onPermissionPreset: (preset: PermissionPreset) => Promise<void>;
   onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>;
+  onObserveSubagent: (activeSessionId?: string) => Promise<void>;
+  onForkMessage: (assistantMessageId: string) => Promise<void>;
+  onCloneSession: () => Promise<void>;
   onNewWindow: () => void;
   onOpenTerminal: () => void;
 }
 
 export function ConversationView(props: ConversationViewProps) {
-  const { project, conversation, models, commands, stats, sessionState, inspectorOpen, changes, onToggleInspector, onDraftChange, onSend, onRetryMessage, onAbort, onModel, onThinking, onPermissionPreset, onRunCommand, onNewWindow, onOpenTerminal } = props;
+  const { project, conversation, models, commands, stats, sessionState, schedules = [], heartbeat, heartbeats = [], subagents = [], observedSubagent, inspectorOpen, changes, onToggleInspector, onDraftChange, onSend, onMutateQueuedMessage, onRetryMessage, onAbort, onModel, onThinking, onRunCommand, onObserveSubagent, onForkMessage, onCloneSession, onNewWindow, onOpenTerminal } = props;
   const isRunning = ["starting", "streaming", "tool", "queued"].includes(conversation.status);
-  const [inspectorTab, setInspectorTab] = useState<"activity" | "context" | "changes" | "details">("changes");
+  const [inspectorTab, setInspectorTab] = useState<"activity" | "session" | "changes" | "details">("changes");
   const [openPopover, setOpenPopover] = useState<ConversationPopover>(null);
   const closePopover = useCallback(() => setOpenPopover(null), []);
   const togglePopover = useCallback((popover: Exclude<ConversationPopover, null>) => {
@@ -116,11 +136,12 @@ export function ConversationView(props: ConversationViewProps) {
           onNewWindow={onNewWindow}
           onOpenTerminal={onOpenTerminal}
           onRunCommand={onRunCommand}
+          onCloneSession={onCloneSession}
           openPopover={openPopover}
           onTogglePopover={togglePopover}
           onClosePopover={closePopover}
         />
-        <Transcript conversation={conversation} project={project} onSuggestion={(text) => onDraftChange(text)} onRunCommand={onRunCommand} onRetryMessage={onRetryMessage} />
+        <Transcript conversation={conversation} project={project} onSuggestion={(text) => onDraftChange(text)} onRunCommand={onRunCommand} onRetryMessage={onRetryMessage} onForkMessage={onForkMessage} />
         {isRunning ? <ActiveRunBar conversation={conversation} onAbort={onAbort} onActivity={() => { setInspectorTab("activity"); if (!inspectorOpen) onToggleInspector(); }} /> : null}
         <Composer
           key={conversation.id}
@@ -129,13 +150,14 @@ export function ConversationView(props: ConversationViewProps) {
           models={models}
           commands={commands}
           stats={stats}
+          sessionState={sessionState}
           isRunning={isRunning}
           onDraftChange={onDraftChange}
           onSend={onSend}
+          onMutateQueuedMessage={onMutateQueuedMessage}
           onAbort={onAbort}
           onModel={onModel}
           onThinking={onThinking}
-          onPermissionPreset={onPermissionPreset}
           onRunCommand={onRunCommand}
           openPopover={openPopover}
           onTogglePopover={togglePopover}
@@ -148,11 +170,18 @@ export function ConversationView(props: ConversationViewProps) {
           conversation={conversation}
           stats={stats}
           sessionState={sessionState}
+          schedules={schedules}
+          heartbeat={heartbeat}
+          heartbeats={heartbeats}
+          subagents={subagents}
+          observedSubagent={observedSubagent}
           changes={changes}
           tab={inspectorTab}
           onTab={setInspectorTab}
           onClose={onToggleInspector}
           onRunCommand={onRunCommand}
+          onObserveSubagent={onObserveSubagent}
+          onCloneSession={onCloneSession}
           onDraftChange={onDraftChange}
         />
       ) : null}
@@ -160,9 +189,9 @@ export function ConversationView(props: ConversationViewProps) {
   );
 }
 
-type ConversationPopover = "header-model" | "header-actions" | "composer-tools" | "composer-permission" | "composer-model" | "composer-thinking" | null;
+type ConversationPopover = "header-model" | "header-actions" | "composer-tools" | "composer-queue" | "composer-model" | "composer-thinking" | null;
 
-function ConversationHeader({ project, conversation, models, sessionState, inspectorOpen, onModel, onToggleInspector, onNewWindow, onOpenTerminal, onRunCommand, openPopover, onTogglePopover, onClosePopover }: {
+function ConversationHeader({ project, conversation, models, sessionState, inspectorOpen, onModel, onToggleInspector, onNewWindow, onOpenTerminal, onRunCommand, onCloneSession, openPopover, onTogglePopover, onClosePopover }: {
   project: Project;
   conversation: Conversation;
   models: ModelInfo[];
@@ -173,6 +202,7 @@ function ConversationHeader({ project, conversation, models, sessionState, inspe
   onNewWindow: () => void;
   onOpenTerminal: () => void;
   onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>;
+  onCloneSession: () => Promise<void>;
   openPopover: ConversationPopover;
   onTogglePopover: (popover: Exclude<ConversationPopover, null>) => void;
   onClosePopover: () => void;
@@ -201,41 +231,41 @@ function ConversationHeader({ project, conversation, models, sessionState, inspe
         </IconButton>
         <div className="header-model-wrap" data-dismissable-layer="header-actions">
           <IconButton label={bi(language, "Plus d’actions", "More actions")} className={openPopover === "header-actions" ? "is-active" : ""} onClick={() => onTogglePopover("header-actions")}><MoreHorizontal size={18} /></IconButton>
-          {openPopover === "header-actions" ? <SessionActionsPopover sessionState={sessionState} onChoose={(type, fields) => { void onRunCommand(type, fields); onClosePopover(); }} /> : null}
+          {openPopover === "header-actions" ? <SessionActionsPopover sessionState={sessionState} onClone={() => { void onCloneSession(); onClosePopover(); }} onChoose={(type, fields, keepOpen) => { void onRunCommand(type, fields); if (!keepOpen) onClosePopover(); }} /> : null}
         </div>
       </div>
     </header>
   );
 }
 
-function SessionActionsPopover({ sessionState, onChoose }: {
+function SessionActionsPopover({ sessionState, onChoose, onClone }: {
   sessionState?: AgentSessionState;
-  onChoose: (type: string, fields?: Record<string, unknown>) => void;
+  onChoose: (type: string, fields?: Record<string, unknown>, keepOpen?: boolean) => void;
+  onClone: () => void;
 }) {
   const { language } = useI18n();
-  const steeringMode = sessionState?.steeringMode ?? "all";
-  const followUpMode = sessionState?.followUpMode ?? "all";
+  const steeringMode = sessionState?.steeringMode ?? "one-at-a-time";
+  const followUpMode = sessionState?.followUpMode ?? "one-at-a-time";
   return (
     <div className="popover session-actions-popover">
       <div className="popover-label">{bi(language, "Session", "Session")}</div>
-      <button type="button" onClick={() => onChoose("new_session")}><Plus size={15} /><span><strong>{bi(language, "Nouvelle session", "New session")}</strong><small>{bi(language, "Repartir dans cette conversation", "Start fresh in this conversation")}</small></span></button>
-      <button type="button" onClick={() => onChoose("clone")}><GitBranch size={15} /><span><strong>{bi(language, "Cloner la session", "Clone session")}</strong><small>{bi(language, "Créer une branche indépendante", "Create an independent branch")}</small></span></button>
+      <button type="button" onClick={onClone}><Copy size={15} /><span><strong>{bi(language, "Dupliquer la session", "Duplicate session")}</strong><small>{bi(language, "Conserver l’origine et ouvrir une copie", "Keep the source and open a copy")}</small></span></button>
       <button type="button" onClick={() => onChoose("export_html")}><ArrowDown size={15} /><span><strong>{bi(language, "Exporter en HTML", "Export as HTML")}</strong><small>{bi(language, "Créer une copie lisible de la session", "Create a readable copy of the session")}</small></span></button>
       <div className="popover-separator" />
       <div className="popover-label">{bi(language, "Comportement", "Behavior")}</div>
       <button type="button" onClick={() => onChoose("set_auto_compaction", { enabled: !sessionState?.autoCompactionEnabled })}><ArchiveRestore size={15} /><span><strong>{bi(language, "Compactage automatique", "Automatic compaction")}</strong><small>{sessionState?.autoCompactionEnabled ? bi(language, "Activé · cliquer pour désactiver", "Enabled · click to disable") : bi(language, "Désactivé · cliquer pour activer", "Disabled · click to enable")}</small></span><Badge tone={sessionState?.autoCompactionEnabled ? "success" : "neutral"}>{sessionState?.autoCompactionEnabled ? "On" : "Off"}</Badge></button>
-      <button type="button" onClick={() => onChoose("set_steering_mode", { mode: steeringMode === "all" ? "one-at-a-time" : "all" })}><Layers3 size={15} /><span><strong>{bi(language, "Instructions immédiates", "Immediate instructions")}</strong><small>{steeringMode === "all" ? bi(language, "Toutes à chaque frontière de tour", "All at each turn boundary") : bi(language, "Une par tour", "One per turn")}</small></span></button>
-      <button type="button" onClick={() => onChoose("set_follow_up_mode", { mode: followUpMode === "all" ? "one-at-a-time" : "all" })}><Clock3 size={15} /><span><strong>{bi(language, "Messages en attente", "Pending messages")}</strong><small>{followUpMode === "all" ? bi(language, "Tous au prochain tour", "All on the next turn") : bi(language, "Un par tour", "One per turn")}</small></span></button>
+      <QueueModeRow icon={<Layers3 size={15} />} title={bi(language, "Orienter le travail en cours", "Steer current work")} detail={bi(language, "Livré après les outils du tour actuel, avant le prochain appel au modèle.", "Delivered after the current turn's tools, before the next model call.")} mode={steeringMode} language={language} onMode={(mode) => onChoose("set_steering_mode", { mode }, true)} />
+      <QueueModeRow icon={<Clock3 size={15} />} title={bi(language, "Démarrer un nouveau tour ensuite", "Start a follow-up turn")} detail={bi(language, "Attend la fin complète de l’exécution, puis démarre un nouveau tour utilisateur.", "Waits for the run to finish, then starts a new user turn.")} mode={followUpMode} language={language} onMode={(mode) => onChoose("set_follow_up_mode", { mode }, true)} />
       <button type="button" onClick={() => onChoose("get_state")}><RefreshCw size={15} /><span><strong>{bi(language, "Resynchroniser", "Resync")}</strong><small>{bi(language, "Recharger l’état de Prime Agent", "Reload Prime Agent state")}</small></span></button>
     </div>
   );
 }
 
-function Transcript({ conversation, project, onSuggestion, onRunCommand, onRetryMessage }: { conversation: Conversation; project: Project; onSuggestion: (text: string) => void; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onRetryMessage: (assistantMessageId: string) => Promise<void> }) {
+function Transcript({ conversation, project, onSuggestion, onRunCommand, onRetryMessage, onForkMessage }: { conversation: Conversation; project: Project; onSuggestion: (text: string) => void; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onRetryMessage: (assistantMessageId: string) => Promise<void>; onForkMessage: (assistantMessageId: string) => Promise<void> }) {
   const { language } = useI18n();
   const viewport = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
-  const messages = conversation.messages;
+  const messages = conversation.messages.filter((message) => !message.queueDelivery);
   const entries = buildTranscriptEntries(messages);
   const isHistoryLoading = messages.length === 0 && conversation.status === "starting";
 
@@ -261,8 +291,8 @@ function Transcript({ conversation, project, onSuggestion, onRunCommand, onRetry
         <div className="transcript-content">
           <div className="transcript-date"><span>{bi(language, "Aujourd’hui", "Today")}</span></div>
           {entries.map((entry) => entry.kind === "message"
-            ? <MessageItem key={entry.message.id} message={entry.message} onRunCommand={onRunCommand} onRetryMessage={onRetryMessage} />
-            : <PythonTranscriptRun key={entry.id} messages={entry.messages} tools={entry.tools} onRunCommand={onRunCommand} onRetryMessage={onRetryMessage} />)}
+            ? <MessageItem key={entry.message.id} message={entry.message} onRetryMessage={onRetryMessage} onForkMessage={onForkMessage} />
+            : <PythonTranscriptRun key={entry.id} messages={entry.messages} tools={entry.tools} onRetryMessage={onRetryMessage} onForkMessage={onForkMessage} />)}
           {conversation.lastError ? (
             <div className="inline-error"><Info size={17} /><div><strong>{bi(language, "Prime Agent a besoin d’attention", "Prime Agent needs attention")}</strong><p>{conversation.lastError}</p></div><Button variant="ghost" onClick={() => void onRunCommand("get_state")}>{bi(language, "Réessayer", "Retry")}</Button></div>
           ) : null}
@@ -359,7 +389,7 @@ function ConversationWelcome({ project, onSuggestion }: { project: Project; onSu
   );
 }
 
-function MessageItem({ message, onRunCommand, onRetryMessage, showTools = true }: { message: ChatMessage; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onRetryMessage: (assistantMessageId: string) => Promise<void>; showTools?: boolean }) {
+function MessageItem({ message, onRetryMessage, onForkMessage, showTools = true }: { message: ChatMessage; onRetryMessage: (assistantMessageId: string) => Promise<void>; onForkMessage: (assistantMessageId: string) => Promise<void>; showTools?: boolean }) {
   const { language, locale } = useI18n();
   const isUser = message.role === "user";
   return (
@@ -380,7 +410,7 @@ function MessageItem({ message, onRunCommand, onRetryMessage, showTools = true }
           <footer className="message-actions">
             <IconButton label={bi(language, "Copier la réponse", "Copy response")} onClick={() => void navigator.clipboard.writeText(message.content)}><Copy size={14} /></IconButton>
             <IconButton label={bi(language, "Réutiliser le texte dans le composeur", "Reuse text in the composer")} onClick={() => void onRetryMessage(message.id)}><RefreshCw size={14} /></IconButton>
-            <IconButton label={bi(language, "Créer une branche", "Create branch")} onClick={() => void onRunCommand("clone")}><GitBranch size={14} /></IconButton>
+            <IconButton label={bi(language, "Créer une branche depuis ce tour", "Branch from this turn")} onClick={() => void onForkMessage(message.id)}><GitBranch size={14} /></IconButton>
             <span />
             {message.durationMs ? <small><Clock3 size={12} /> {formatDuration(message.durationMs)}</small> : null}
             {message.usage?.total ? <small>{compactNumber(message.usage.total, locale)} tokens</small> : null}
@@ -435,13 +465,13 @@ function isPythonOnlyAssistantMessage(message: ChatMessage) {
   return message.role === "assistant" && Boolean(message.tools?.length) && message.tools!.every(isPythonTool);
 }
 
-function PythonTranscriptRun({ messages, tools, onRunCommand, onRetryMessage }: { messages: ChatMessage[]; tools: ToolActivity[]; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onRetryMessage: (assistantMessageId: string) => Promise<void> }) {
+function PythonTranscriptRun({ messages, tools, onRetryMessage, onForkMessage }: { messages: ChatMessage[]; tools: ToolActivity[]; onRetryMessage: (assistantMessageId: string) => Promise<void>; onForkMessage: (assistantMessageId: string) => Promise<void> }) {
   const { language, locale } = useI18n();
   const visibleMessages = messages.filter((message) => message.content.trim() || (message.attachments?.length ?? 0) > 0);
   const lastMessage = messages.at(-1)!;
   return (
     <>
-      {visibleMessages.map((message) => <MessageItem key={message.id} message={message} onRunCommand={onRunCommand} onRetryMessage={onRetryMessage} showTools={false} />)}
+      {visibleMessages.map((message) => <MessageItem key={message.id} message={message} onRetryMessage={onRetryMessage} onForkMessage={onForkMessage} showTools={false} />)}
       <article className="message message-assistant message-python-run">
         <div className="message-avatar"><span className="mini-orbit"><span /></span></div>
         <div className="message-column">
@@ -479,7 +509,9 @@ function AttachmentStrip({ attachments }: { attachments: Attachment[] }) {
   return (
     <div className="message-attachments">
       {attachments.map((attachment) => (
-        <div key={attachment.id} className="file-attachment">{attachment.isImage ? <Image size={17} /> : <File size={17} />}<span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size, language, locale)}</small></span></div>
+        attachment.isImage && attachment.previewDataUrl
+          ? <figure key={attachment.id}><img src={attachment.previewDataUrl} alt={attachment.name} /><figcaption>{attachment.name} · {formatBytes(attachment.size, language, locale)}</figcaption></figure>
+          : <div key={attachment.id} className="file-attachment">{attachment.isImage ? <Image size={17} /> : <File size={17} />}<span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size, language, locale)}</small></span></div>
       ))}
     </div>
   );
@@ -604,19 +636,20 @@ function ActiveRunBar({ conversation, onAbort, onActivity }: { conversation: Con
   );
 }
 
-function Composer({ project, conversation, models, commands, stats, isRunning, onDraftChange, onSend, onAbort, onModel, onThinking, onPermissionPreset, onRunCommand, openPopover, onTogglePopover, onClosePopover }: {
+function Composer({ project, conversation, models, commands, stats, sessionState, isRunning, onDraftChange, onSend, onMutateQueuedMessage, onAbort, onModel, onThinking, onRunCommand, openPopover, onTogglePopover, onClosePopover }: {
   project: Project;
   conversation: Conversation;
   models: ModelInfo[];
   commands: SlashCommand[];
   stats?: SessionStats;
+  sessionState?: AgentSessionState;
   isRunning: boolean;
   onDraftChange: (draft: string) => void;
-  onSend: (message: string, attachments: Attachment[]) => Promise<void>;
+  onSend: (message: string, attachments: Attachment[], delivery?: "steer" | "follow_up") => Promise<void>;
+  onMutateQueuedMessage: (input: { messageId: string; lane: "steering" | "followUp"; index: number; expectedText: string; mutation: { type: "delete" } | { type: "replace"; text: string; lane: "steering" | "followUp" } }) => Promise<void>;
   onAbort: () => Promise<void>;
   onModel: (model: ModelInfo) => Promise<void>;
   onThinking: (level: ThinkingLevel) => Promise<void>;
-  onPermissionPreset: (preset: PermissionPreset) => Promise<void>;
   onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>;
   openPopover: ConversationPopover;
   onTogglePopover: (popover: Exclude<ConversationPopover, null>) => void;
@@ -631,6 +664,9 @@ function Composer({ project, conversation, models, commands, stats, isRunning, o
   const [adding, setAdding] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [attachmentError, setAttachmentError] = useState<string>();
+  const [queueEditor, setQueueEditor] = useState<{ id: string; text: string }>();
+  const [queueBusyId, setQueueBusyId] = useState<string>();
+  const [queueError, setQueueError] = useState<string>();
   const textarea = useRef<HTMLTextAreaElement>(null);
   const activeModel = models.find((model) => `${model.provider}/${model.id}` === conversation.model);
 
@@ -643,6 +679,9 @@ function Composer({ project, conversation, models, commands, stats, isRunning, o
     attachmentsRef.current = [];
     setAttachments([]);
     setAttachmentError(undefined);
+    setQueueEditor(undefined);
+    setQueueBusyId(undefined);
+    setQueueError(undefined);
     void releaseAttachmentHandles(abandonedHandles).catch(() => undefined);
   }, [conversation.id]);
   useEffect(() => () => {
@@ -661,7 +700,7 @@ function Composer({ project, conversation, models, commands, stats, isRunning, o
     onDraftChange(value);
   };
 
-  const submit = async () => {
+  const submit = async (delivery?: "steer" | "follow_up") => {
     if ((!draft.trim() && attachments.length === 0) || adding || submittingRef.current) return;
     submittingRef.current = true;
     const sentDraft = draft;
@@ -673,7 +712,7 @@ function Composer({ project, conversation, models, commands, stats, isRunning, o
     setAttachmentError(undefined);
     onDraftChange("");
     try {
-      await onSend(sentDraft, sentAttachments);
+      await onSend(sentDraft, sentAttachments, delivery);
     } catch (error) {
       const currentDraft = draftRef.current;
       const restoredDraft = !currentDraft.trim() || currentDraft === sentDraft
@@ -701,7 +740,7 @@ function Composer({ project, conversation, models, commands, stats, isRunning, o
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault();
-      void submit();
+      void submit(isRunning ? "follow_up" : undefined);
     }
     if (event.key === "Escape" && isRunning) void onAbort();
   };
@@ -743,6 +782,7 @@ function Composer({ project, conversation, models, commands, stats, isRunning, o
         mimeType: result.mimeType,
         size: result.size,
         attachmentHandle: result.attachmentHandle,
+        previewDataUrl: result.previewDataUrl,
         isImage: result.isImage,
       })));
     } catch (error) {
@@ -768,10 +808,89 @@ function Composer({ project, conversation, models, commands, stats, isRunning, o
   };
 
   const contextPercent = stats?.contextUsage?.percent;
+  const queuedRows = buildQueuedRows(conversation, sessionState);
+  const applyQueuedMutation = async (
+    item: QueuedMessageRow,
+    mutation: { type: "delete" } | { type: "replace"; text: string; lane: "steering" | "followUp" },
+  ) => {
+    if (item.index === undefined || queueBusyId) return;
+    setQueueBusyId(item.id);
+    setQueueError(undefined);
+    try {
+      await onMutateQueuedMessage({
+        messageId: item.id,
+        lane: item.lane,
+        index: item.index,
+        expectedText: item.expectedText,
+        mutation,
+      });
+      setQueueEditor(undefined);
+    } catch (error) {
+      setQueueError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setQueueBusyId(undefined);
+    }
+  };
+  const saveQueuedEdit = (item: QueuedMessageRow) => {
+    const text = queueEditor?.text.trim() ?? "";
+    if (!text) {
+      setQueueError(bi(language, "Le message en attente ne peut pas être vide.", "The queued message cannot be empty."));
+      return;
+    }
+    if (text === item.expectedText) {
+      setQueueEditor(undefined);
+      return;
+    }
+    void applyQueuedMutation(item, { type: "replace", text, lane: item.lane });
+  };
   return (
     <div className={`composer-shell ${dragging ? "is-dragging" : ""}`} onDragEnter={(event) => { event.preventDefault(); setDragging(true); }} onDragOver={(event) => event.preventDefault()} onDragLeave={(event) => event.currentTarget === event.target && setDragging(false)} onDrop={handleDrop}>
       {dragging ? <div className="drop-overlay"><Paperclip size={24} /><strong>{bi(language, "Utilisez + pour autoriser ces fichiers", "Use + to authorize these files")}</strong></div> : null}
-      {attachments.length ? <div className="composer-attachments">{attachments.map((attachment) => <div key={attachment.id}>{attachment.isImage ? <Image size={18} /> : <FileCode2 size={18} />}<span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size, language, locale)}</small></span><IconButton label={`${bi(language, "Retirer", "Remove")} ${attachment.name}`} onClick={() => { const removed = attachmentsRef.current.find((item) => item.id === attachment.id); const next = attachmentsRef.current.filter((item) => item.id !== attachment.id); attachmentsRef.current = next; setAttachments(next); setAttachmentError(undefined); if (removed) void releaseAttachmentHandles(attachmentHandles([removed])).catch(() => undefined); }}><X size={14} /></IconButton></div>)}</div> : null}
+      {queuedRows.length ? (
+        <div className="queued-message-tray" aria-label={bi(language, "Instructions en attente", "Queued instructions")}>
+          {queuedRows.map((item) => {
+            const editing = queueEditor?.id === item.id;
+            const busy = queueBusyId === item.id;
+            const editBlocked = item.index === undefined || Boolean(item.attachments?.length);
+            return (
+              <div className={`queued-message-row ${editing ? "is-editing" : ""}`} key={item.id}>
+                <span className="queued-message-icon">{busy ? <LoaderCircle size={13} className="spin" /> : <Layers3 size={13} />}</span>
+                {editing ? (
+                  <input
+                    className="queued-message-input"
+                    value={queueEditor.text}
+                    autoFocus
+                    aria-label={bi(language, "Modifier le message en attente", "Edit queued message")}
+                    onChange={(event) => setQueueEditor({ id: item.id, text: event.target.value })}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); saveQueuedEdit(item); }
+                      if (event.key === "Escape") { event.preventDefault(); setQueueEditor(undefined); setQueueError(undefined); }
+                    }}
+                  />
+                ) : (
+                  <span className="queued-message-copy"><strong>{item.text}</strong>{item.attachments?.length ? <small>{item.attachments.length} {item.attachments.length === 1 ? bi(language, "pièce jointe", "attachment") : bi(language, "pièces jointes", "attachments")}</small> : item.index === undefined ? <small>{bi(language, "Synchronisation…", "Syncing…")}</small> : null}</span>
+                )}
+                <Badge tone={item.delivery === "steer" ? "accent" : "neutral"}>{item.delivery === "steer" ? bi(language, "Immédiat", "Steer") : bi(language, "Suivi", "Follow-up")}</Badge>
+                <span className="queued-message-actions">
+                  {editing ? (
+                    <>
+                      <IconButton label={bi(language, "Enregistrer la modification", "Save edit")} onClick={() => saveQueuedEdit(item)} disabled={busy}><Check size={13} /></IconButton>
+                      <IconButton label={bi(language, "Annuler la modification", "Cancel edit")} onClick={() => { setQueueEditor(undefined); setQueueError(undefined); }} disabled={busy}><X size={13} /></IconButton>
+                    </>
+                  ) : (
+                    <>
+                      <IconButton label={item.attachments?.length ? bi(language, "Les messages avec pièces jointes ne peuvent pas être modifiés après envoi", "Messages with attachments cannot be edited after sending") : bi(language, "Modifier le message en attente", "Edit queued message")} onClick={() => { setQueueEditor({ id: item.id, text: item.expectedText }); setQueueError(undefined); }} disabled={editBlocked || busy}><Pencil size={13} /></IconButton>
+                      <IconButton label={bi(language, "Supprimer le message en attente", "Delete queued message")} onClick={() => void applyQueuedMutation(item, { type: "delete" })} disabled={item.index === undefined || busy}><Trash2 size={13} /></IconButton>
+                    </>
+                  )}
+                </span>
+              </div>
+            );
+          })}
+          {queueError ? <p className="queued-message-error" role="alert"><CircleAlert size={13} />{queueError}</p> : null}
+        </div>
+      ) : null}
+      {attachments.length ? <div className="composer-attachments">{attachments.map((attachment) => <div key={attachment.id}>{attachment.isImage && attachment.previewDataUrl ? <img src={attachment.previewDataUrl} alt="" /> : attachment.isImage ? <Image size={18} /> : <FileCode2 size={18} />}<span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size, language, locale)}</small></span><IconButton label={`${bi(language, "Retirer", "Remove")} ${attachment.name}`} onClick={() => { const removed = attachmentsRef.current.find((item) => item.id === attachment.id); const next = attachmentsRef.current.filter((item) => item.id !== attachment.id); attachmentsRef.current = next; setAttachments(next); setAttachmentError(undefined); if (removed) void releaseAttachmentHandles(attachmentHandles([removed])).catch(() => undefined); }}><X size={14} /></IconButton></div>)}</div> : null}
       {attachmentError ? <p className="trust-note" role="alert"><Info size={14} />{attachmentError}</p> : null}
       <div className="composer-editor">
         <textarea ref={textarea} value={draft} onChange={(event) => updateDraft(event.target.value)} onKeyDown={handleKeyDown} onPaste={handlePaste} placeholder={isRunning ? bi(language, "Ajoutez une instruction à la suite…", "Add a follow-up instruction…") : `${bi(language, "Demandez quelque chose sur", "Ask something about")} ${project.name}…`} rows={1} aria-label={bi(language, "Message à Prime Agent", "Message Prime Agent")} />
@@ -783,9 +902,9 @@ function Composer({ project, conversation, models, commands, stats, isRunning, o
             <button type="button" className="composer-chip" aria-haspopup="menu" aria-expanded={openPopover === "composer-tools"} onClick={() => onTogglePopover("composer-tools")}><Box size={14} />{bi(language, "Outils", "Tools")}<ChevronDown size={13} /></button>
             {openPopover === "composer-tools" ? <ToolsPopover commands={commands} onChoose={(command) => { updateDraft(`/${command.name} `); onClosePopover(); textarea.current?.focus(); }} onCompact={() => { void onRunCommand("compact"); onClosePopover(); }} onRefine={() => { void onRunCommand("refine"); onClosePopover(); }} /> : null}
           </div>
-          <div className="composer-popover-wrap" data-dismissable-layer="composer-permission">
-            <button type="button" className="composer-chip permission-chip" aria-haspopup="menu" aria-expanded={openPopover === "composer-permission"} title={bi(language, "Profil d’interface uniquement : Prime Agent conserve vos droits utilisateur et n’est pas isolé par une sandbox.", "UI profile only: Prime Agent keeps your user permissions and is not isolated by a sandbox.")} onClick={() => onTogglePopover("composer-permission")}><ShieldCheck size={14} />{permissionLabel(project.permissionPreset, language)}<ChevronDown size={13} /></button>
-            {openPopover === "composer-permission" ? <PermissionPopover active={project.permissionPreset} onChoose={(preset) => { void onPermissionPreset(preset); onClosePopover(); }} /> : null}
+          <div className="composer-popover-wrap" data-dismissable-layer="composer-queue">
+            <button type="button" className="composer-chip permission-chip" aria-haspopup="menu" aria-expanded={openPopover === "composer-queue"} title={bi(language, "File d’instructions réellement gérée par Prime Agent", "Instruction queue managed by Prime Agent")} onClick={() => onTogglePopover("composer-queue")}><Layers3 size={14} />{queueLabel(sessionState, language)}<ChevronDown size={13} /></button>
+            {openPopover === "composer-queue" ? <QueuePopover sessionState={sessionState} onChoose={(type, fields) => { void onRunCommand(type, fields); }} /> : null}
           </div>
         </div>
         <div className="composer-tools-right">
@@ -799,30 +918,38 @@ function Composer({ project, conversation, models, commands, stats, isRunning, o
             {openPopover === "composer-thinking" ? <ThinkingPopover active={conversation.thinkingLevel} onChoose={(level) => { void onThinking(level); onClosePopover(); }} /> : null}
           </div>
           {isRunning ? <IconButton label={bi(language, "Arrêter l’exécution", "Stop run")} className="composer-stop" onClick={() => void onAbort()}><CircleStop size={18} /></IconButton> : null}
-          <button type="button" className={`send-button ${draft.trim() || attachments.length ? "is-ready" : ""}`} disabled={(!draft.trim() && !attachments.length) || adding} onClick={() => void submit()} aria-label={isRunning ? bi(language, "Ajouter à la file", "Add to queue") : bi(language, "Envoyer", "Send")} title={isRunning ? bi(language, "Ajouter à la file", "Add to queue") : bi(language, "Envoyer (Entrée)", "Send (Enter)")}>{isRunning ? <Layers3 size={18} /> : <Send size={18} />}</button>
+          {isRunning ? <button type="button" className="queued-force-send" disabled={(!draft.trim() && !attachments.length) || adding} onClick={() => void submit("steer")} title={bi(language, "Livrer après les outils en cours, avant le prochain appel au modèle", "Deliver after current tools, before the next model call")}><Zap size={15} />{bi(language, "Orienter", "Steer")}</button> : null}
+          <button type="button" className={`send-button ${draft.trim() || attachments.length ? "is-ready" : ""}`} disabled={(!draft.trim() && !attachments.length) || adding} onClick={() => void submit(isRunning ? "follow_up" : undefined)} aria-label={isRunning ? bi(language, "Ajouter à la file", "Add to queue") : bi(language, "Envoyer", "Send")} title={isRunning ? bi(language, "Attendre la fin puis démarrer un nouveau tour", "Wait for completion, then start a new turn") : bi(language, "Envoyer (Entrée)", "Send (Enter)")}>{isRunning ? <Layers3 size={18} /> : <Send size={18} />}</button>
         </div>
       </div>
     </div>
   );
 }
 
-function RunInspector({ project, conversation, stats, sessionState, changes, tab, onTab, onClose, onRunCommand, onDraftChange }: {
+function RunInspector({ project, conversation, stats, sessionState, schedules, heartbeat, heartbeats, subagents, observedSubagent, changes, tab, onTab, onClose, onRunCommand, onObserveSubagent, onCloneSession, onDraftChange }: {
   project: Project;
   conversation: Conversation;
   stats?: SessionStats;
   sessionState?: AgentSessionState;
+  schedules: AgentSchedule[];
+  heartbeat?: AgentSchedule | null;
+  heartbeats: AgentHeartbeatSummary[];
+  subagents: AgentRlmChild[];
+  observedSubagent?: { activeSessionId: string; messages: ChatMessage[]; closed?: boolean; error?: string };
   changes: GitChange[];
-  tab: "activity" | "context" | "changes" | "details";
-  onTab: (tab: "activity" | "context" | "changes" | "details") => void;
+  tab: "activity" | "session" | "changes" | "details";
+  onTab: (tab: "activity" | "session" | "changes" | "details") => void;
   onClose: () => void;
   onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>;
+  onObserveSubagent: (activeSessionId?: string) => Promise<void>;
+  onCloneSession: () => Promise<void>;
   onDraftChange: (draft: string) => void;
 }) {
   const { language } = useI18n();
   const tabs = [
     { id: "changes" as const, label: bi(language, "Modifs", "Changes"), icon: Code2, count: changes.length },
     { id: "activity" as const, label: bi(language, "Activité", "Activity"), icon: Activity },
-    { id: "context" as const, label: bi(language, "Contexte", "Context"), icon: Layers3 },
+    { id: "session" as const, label: "Session", icon: ListTree },
     { id: "details" as const, label: bi(language, "Détails", "Details"), icon: Info },
   ];
   return (
@@ -831,9 +958,9 @@ function RunInspector({ project, conversation, stats, sessionState, changes, tab
       <nav className="inspector-tabs" aria-label={bi(language, "Inspecteur de session", "Session inspector")}>{tabs.map((item) => { const TabIcon = item.icon; return <button key={item.id} type="button" className={tab === item.id ? "is-active" : ""} onClick={() => onTab(item.id)}><TabIcon size={14} />{item.label}{item.count ? <span>{item.count}</span> : null}</button>; })}</nav>
       <div className="inspector-content">
         {tab === "activity" ? <ActivityPanel activities={conversation.activities} conversation={conversation} /> : null}
-        {tab === "context" ? <ContextPanel project={project} conversation={conversation} sessionState={sessionState} onRunCommand={onRunCommand} /> : null}
+        {tab === "session" ? <SessionPanel project={project} conversation={conversation} sessionState={sessionState} schedules={schedules} heartbeat={heartbeat} heartbeats={heartbeats} subagents={subagents} observedSubagent={observedSubagent} onRunCommand={onRunCommand} onObserveSubagent={onObserveSubagent} /> : null}
         {tab === "changes" ? <ChangesPanel projectPath={project.path} changes={changes} draft={conversation.draft} onDraftChange={onDraftChange} /> : null}
-        {tab === "details" ? <DetailsPanel project={project} conversation={conversation} stats={stats} sessionState={sessionState} onRunCommand={onRunCommand} /> : null}
+        {tab === "details" ? <DetailsPanel project={project} conversation={conversation} stats={stats} sessionState={sessionState} onRunCommand={onRunCommand} onCloneSession={onCloneSession} /> : null}
       </div>
     </aside>
   );
@@ -865,18 +992,128 @@ function ActivityPanel({ activities, conversation }: { activities: ActivityItem[
   );
 }
 
-function ContextPanel({ project, conversation, sessionState, onRunCommand }: { project: Project; conversation: Conversation; sessionState?: AgentSessionState; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void> }) {
+function SessionPanel({ project, conversation, sessionState, schedules, heartbeat, heartbeats, subagents, observedSubagent, onRunCommand, onObserveSubagent }: { project: Project; conversation: Conversation; sessionState?: AgentSessionState; schedules: AgentSchedule[]; heartbeat?: AgentSchedule | null; heartbeats: AgentHeartbeatSummary[]; subagents: AgentRlmChild[]; observedSubagent?: { activeSessionId: string; messages: ChatMessage[]; closed?: boolean; error?: string }; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onObserveSubagent: (activeSessionId?: string) => Promise<void> }) {
   const { language, locale } = useI18n();
   const attachments = conversation.messages.flatMap((message) => message.attachments ?? []);
+  const sessionActions = sessionState?.sessionActions;
+  const queued = [
+    ...(sessionActions?.steering ?? []).map((text) => ({ lane: bi(language, "Immédiate", "Immediate"), text })),
+    ...(sessionActions?.followUps ?? []).map((text) => ({ lane: bi(language, "Suivi", "Follow-up"), text })),
+  ];
   return (
     <div className="inspector-section">
       <div className="section-title"><span>{bi(language, "Espace de travail", "Workspace")}</span></div>
       <div className="detail-card"><div><FolderIcon /><span><strong>{project.name}</strong><small>{project.path}</small></span></div><Badge tone="success">{bi(language, "Local", "Local")}</Badge></div>
-      <div className="section-title"><span>{bi(language, "Contexte chargé", "Loaded context")}</span><small>{attachments.length} {attachments.length === 1 ? bi(language, "fichier", "file") : bi(language, "fichiers", "files")}</small></div>
-      {attachments.length ? <div className="context-files">{attachments.map((attachment) => <div key={attachment.id}>{attachment.isImage ? <Image size={16} /> : <File size={16} />}<span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size, language, locale)}</small></span></div>)}</div> : <InspectorEmpty icon={<Layers3 size={22} />} text={bi(language, "Ajoutez des fichiers ou des images depuis le composer.", "Add files or images from the composer.")} />}
-      {sessionState?.goal?.objective ? <><div className="section-title"><span>{bi(language, "Objectif persistant", "Persistent goal")}</span><Badge tone={sessionState.goal.status === "active" ? "accent" : "neutral"}>{sessionState.goal.status}</Badge></div><div className="goal-card"><Sparkles size={17} /><div><strong>{sessionState.goal.objective}</strong><small>{sessionState.goal.tokensUsed ? `${compactNumber(sessionState.goal.tokensUsed, locale)} ${bi(language, "tokens utilisés", "tokens used")}` : bi(language, "Objectif actif", "Active goal")}</small></div></div></> : null}
-      <Button variant="ghost" className="full-button" onClick={() => void onRunCommand("get_state")}><RefreshCw size={14} />{bi(language, "Actualiser le contexte", "Refresh context")}</Button>
+      <div className="section-title"><span>{bi(language, "Pièces jointes explicites", "Explicit attachments")}</span><small>{attachments.length} {attachments.length === 1 ? bi(language, "fichier", "file") : bi(language, "fichiers", "files")}</small></div>
+      {attachments.length ? <div className="context-files">{attachments.map((attachment) => <div key={attachment.id}>{attachment.isImage && attachment.previewDataUrl ? <img className="context-file-preview" src={attachment.previewDataUrl} alt="" /> : attachment.isImage ? <Image size={16} /> : <File size={16} />}<span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size, language, locale)}</small></span></div>)}</div> : <InspectorEmpty icon={<Layers3 size={22} />} text={bi(language, "Ajoutez des fichiers ou des images depuis le composer.", "Add files or images from the composer.")} />}
+      <div className="section-title"><span>{bi(language, "File d’instructions Prime Agent", "Prime Agent instruction queue")}</span><Badge tone={queued.length ? "accent" : "neutral"}>{queued.length}</Badge></div>
+      {sessionActions?.active ? <div className="detail-card"><div><LoaderCircle size={16} className="spin" /><span><strong>{bi(language, "Action active", "Active action")}</strong><small>{sessionActions.active.label ?? (sessionActions.active.kind === "turn" ? bi(language, "Tour de l’agent", "Agent turn") : bi(language, "Commande de session", "Session command"))} · {sessionActions.active.phase}</small></span></div><Badge tone="accent">Live</Badge></div> : null}
+      {queued.length ? <div className="context-files queue-items">{queued.map((item, index) => <div key={`${item.lane}:${index}:${item.text.slice(0, 32)}`}><Layers3 size={16} /><span><strong>{item.lane}</strong><small>{item.text}</small></span></div>)}</div> : <InspectorEmpty icon={<Layers3 size={22} />} text={bi(language, "Aucune instruction en attente dans Prime Agent.", "No instruction is queued in Prime Agent.")} />}
+      <GoalPanel conversation={conversation} goal={sessionState?.goal} onRunCommand={onRunCommand} />
+      <SubagentsPanel subagents={subagents} observed={observedSubagent} onObserve={onObserveSubagent} />
+      <SupervisionPanel schedules={schedules} heartbeat={heartbeat} heartbeats={heartbeats} onRunCommand={onRunCommand} />
+      <Button variant="ghost" className="full-button" onClick={() => void onRunCommand("get_state")}><RefreshCw size={14} />{bi(language, "Actualiser la session", "Refresh session")}</Button>
     </div>
+  );
+}
+
+function GoalPanel({ conversation, goal, onRunCommand }: { conversation: Conversation; goal?: AgentSessionState["goal"]; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void> }) {
+  const { language, locale } = useI18n();
+  const [editing, setEditing] = useState(false);
+  const [objective, setObjective] = useState("");
+  const [budget, setBudget] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const runGoal = async (command: string) => {
+    setBusy(true);
+    setError(undefined);
+    try {
+      await onRunCommand("prompt", {
+        message: command,
+        ...(["starting", "streaming", "tool", "queued"].includes(conversation.status) ? { streamingBehavior: "steer" } : {}),
+      });
+      setEditing(false);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const submit = () => {
+    const trimmed = objective.trim();
+    if (!trimmed) return;
+    const parsedBudget = Number.parseInt(budget, 10);
+    void runGoal(`/goal${Number.isFinite(parsedBudget) && parsedBudget > 0 ? ` --budget ${parsedBudget}` : ""} ${trimmed}`);
+  };
+  const tokens = goal?.tokensUsed ? compactNumber(goal.tokensUsed, locale) : "0";
+  return <section className="goal-panel"><div className="section-title"><span>{bi(language, "Objectif persistant", "Persistent goal")}</span><Badge tone={goal?.status === "active" ? "accent" : goal?.status === "error" ? "danger" : "neutral"}>{goal?.status ?? bi(language, "inactif", "inactive")}</Badge></div><p className="supervision-explainer">{bi(language, "Le mode Goal poursuit un objectif entre plusieurs tours et peut continuer jusqu’à son achèvement ou sa limite de tokens.", "Goal mode pursues an objective across turns and can continue until completion or its token limit.")}</p>{goal?.objective ? <div className="goal-card"><Target size={17} /><div><strong>{goal.objective}</strong><small>{tokens} {bi(language, "tokens utilisés", "tokens used")}{goal.tokenBudget ? ` / ${compactNumber(goal.tokenBudget, locale)}` : ""}{goal.lastReason ? ` · ${goal.lastReason}` : ""}</small></div></div> : <InspectorEmpty icon={<Target size={21} />} text={bi(language, "Aucun objectif persistant pour cette session.", "No persistent goal for this session.")} />}{goal?.objective ? <div className="goal-actions">{goal.status === "paused" ? <Button variant="ghost" disabled={busy} onClick={() => void runGoal("/goal resume")}><Play size={14} />{bi(language, "Reprendre", "Resume")}</Button> : <Button variant="ghost" disabled={busy || goal.status !== "active"} onClick={() => void runGoal("/goal pause")}><Pause size={14} />{bi(language, "Pause", "Pause")}</Button>}<Button variant="ghost" disabled={busy} onClick={() => void runGoal("/goal clear")}><X size={14} />{bi(language, "Effacer", "Clear")}</Button></div> : <Button variant="ghost" onClick={() => setEditing((current) => !current)}><Plus size={14} />{bi(language, "Nouvel objectif", "New goal")}</Button>}{editing ? <div className="supervision-editor"><label><span>{bi(language, "Objectif", "Objective")}</span><textarea rows={3} value={objective} onChange={(event) => setObjective(event.target.value)} autoFocus /></label><label><span>{bi(language, "Budget de tokens (optionnel)", "Token budget (optional)")}</span><input inputMode="numeric" value={budget} onChange={(event) => setBudget(event.target.value.replace(/[^0-9]/g, ""))} placeholder="50000" /></label><Button disabled={!objective.trim() || busy} onClick={submit}>{busy ? <LoaderCircle size={14} className="spin" /> : <Target size={14} />}{bi(language, "Démarrer", "Start")}</Button></div> : null}{error ? <p className="trust-note" role="alert"><CircleAlert size={14} />{error}</p> : null}</section>;
+}
+
+function SubagentsPanel({ subagents, observed, onObserve }: { subagents: AgentRlmChild[]; observed?: { activeSessionId: string; messages: ChatMessage[]; closed?: boolean; error?: string }; onObserve: (activeSessionId?: string) => Promise<void> }) {
+  const { language, locale } = useI18n();
+  const [error, setError] = useState<string>();
+  const ordered = [...subagents].sort((a, b) => Number(["done", "error", "cancelled"].includes(a.status)) - Number(["done", "error", "cancelled"].includes(b.status)));
+  const toggle = async (child: AgentRlmChild) => {
+    if (!child.activeSessionId) return;
+    setError(undefined);
+    try {
+      await onObserve(observed?.activeSessionId === child.activeSessionId ? undefined : child.activeSessionId);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+  return <section className="subagents-panel"><div className="section-title"><span>{bi(language, "Sous-agents", "Subagents")}</span><Badge tone={ordered.some((child) => child.status === "running") ? "accent" : "neutral"}>{ordered.length}</Badge></div><p className="supervision-explainer">{bi(language, "Consultez les sous-sessions RLM réellement créées par Prime Agent. Le modèle affiché est celui choisi lors de leur création.", "Inspect the RLM child sessions actually created by Prime Agent. The displayed model is the one chosen when they were spawned.")}</p>{ordered.length ? <div className="subagent-list">{ordered.map((child) => { const observing = Boolean(child.activeSessionId && observed?.activeSessionId === child.activeSessionId); return <div className={`subagent-row is-${child.status}`} key={child.id}><Bot size={16} /><span><strong>{child.label || child.sessionName || child.id}</strong><small>{child.model ?? bi(language, "Modèle hérité", "Inherited model")}{child.toolUseCount ? ` · ${child.toolUseCount} ${bi(language, "outils", "tools")}` : ""}{child.durationMs ? ` · ${new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }).format(child.durationMs / 1000)} s` : ""}</small></span><Badge tone={child.status === "running" ? "accent" : child.status === "error" ? "danger" : "neutral"}>{child.status}</Badge>{child.activeSessionId ? <IconButton label={observing ? bi(language, "Fermer la sous-session", "Close child session") : bi(language, "Consulter la sous-session", "Inspect child session")} onClick={() => void toggle(child)}>{observing ? <EyeOff size={14} /> : <Eye size={14} />}</IconButton> : null}</div>; })}</div> : <InspectorEmpty icon={<Bot size={21} />} text={bi(language, "Aucun sous-agent signalé dans cette session.", "No subagent has been reported in this session.")} />}{observed ? <div className="observed-subagent"><header><strong>{bi(language, "Sous-session observée", "Observed child session")}</strong><Badge tone={observed.closed ? "neutral" : "accent"}>{observed.closed ? bi(language, "fermée", "closed") : "Live"}</Badge></header>{observed.messages.length ? <div>{observed.messages.slice(-12).map((message) => <article key={message.id} className={`observed-message is-${message.role}`}><strong>{message.role === "assistant" ? "Agent" : bi(language, "Tâche", "Task")}</strong><p>{message.content.slice(0, 900)}</p></article>)}</div> : <p>{bi(language, "En attente d’un message de la sous-session…", "Waiting for a child-session message…")}</p>}{observed.error ? <p className="trust-note" role="alert"><CircleAlert size={14} />{observed.error}</p> : null}</div> : null}<p className="trust-note"><Info size={14} />{bi(language, "Prime Agent ne permet pas de changer le modèle d’un sous-agent déjà lancé via son RPC classique. Les préférences de futurs sous-agents nécessitent le catalogue de modèles scoped du daemon.", "Prime Agent's classic RPC cannot change the model of an already running child. Future-subagent preferences require the daemon's scoped-model catalog.")}</p>{error ? <p className="trust-note" role="alert"><CircleAlert size={14} />{error}</p> : null}</section>;
+}
+
+function SupervisionPanel({ schedules, heartbeat, heartbeats, onRunCommand }: { schedules: AgentSchedule[]; heartbeat?: AgentSchedule | null; heartbeats: AgentHeartbeatSummary[]; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void> }) {
+  const { language, locale } = useI18n();
+  const [editor, setEditor] = useState<"schedule" | "heartbeat">();
+  const [schedule, setSchedule] = useState("every 30m");
+  const [prompt, setPrompt] = useState("");
+  const [deliveryMode, setDeliveryMode] = useState<"steer" | "follow_up">("steer");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string>();
+  const runAction = async (type: string, fields: Record<string, unknown>) => {
+    setError(undefined);
+    try {
+      await onRunCommand(type, fields);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+  const submit = async () => {
+    if (!prompt.trim() || !schedule.trim() || submitting) return;
+    setSubmitting(true);
+    setError(undefined);
+    try {
+      await onRunCommand(editor === "heartbeat" ? "set_heartbeat" : "add_schedule", {
+        schedule: schedule.trim(),
+        prompt: prompt.trim(),
+        ...(editor === "heartbeat" ? { deliveryMode } : {}),
+      });
+      setPrompt("");
+      setEditor(undefined);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+  const activeSchedules = schedules.filter((job) => job.source !== "heartbeat" && job.source !== "rlm_heartbeat" && job.status === "active");
+  const remoteHeartbeats = heartbeats.filter((item) => item.job.id !== heartbeat?.id);
+  const supervisionCount = (heartbeat ? 1 : 0) + activeSchedules.length + remoteHeartbeats.length;
+  return (
+    <section className="supervision-panel">
+      <div className="section-title"><span>{bi(language, "Supervision Prime Agent", "Prime Agent supervision")}</span><Badge tone={supervisionCount ? "accent" : "neutral"}>{supervisionCount}</Badge></div>
+      <p className="supervision-explainer">{bi(language, "Surveille et relance le travail en arrière-plan avec les heartbeats et les tâches planifiées réelles de Prime Agent.", "Monitor and resume background work with Prime Agent's real heartbeats and scheduled jobs.")}</p>
+      {heartbeat ? <div className="supervision-job"><HeartPulse size={16} /><span><strong>{bi(language, "Heartbeat de cette session", "This session heartbeat")}</strong><small>{heartbeat.schedule.expression} · {heartbeat.deliveryMode === "follow_up" ? bi(language, "nouveau tour", "new turn") : bi(language, "oriente le tour", "steers turn")}{heartbeat.nextRunAt ? ` · ${new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit" }).format(new Date(heartbeat.nextRunAt))}` : ""}</small></span><IconButton label={heartbeat.status === "paused" ? bi(language, "Reprendre", "Resume") : bi(language, "Mettre en pause", "Pause")} onClick={() => void runAction("update_heartbeat", { action: heartbeat.status === "paused" ? "resume" : "pause" })}>{heartbeat.status === "paused" ? <Play size={14} /> : <Pause size={14} />}</IconButton><IconButton label={bi(language, "Supprimer le heartbeat", "Clear heartbeat")} onClick={() => void runAction("update_heartbeat", { action: "clear" })}><X size={14} /></IconButton></div> : null}
+      {activeSchedules.map((job) => <div className="supervision-job" key={job.id}><CalendarClock size={16} /><span><strong>{job.label || job.prompt}</strong><small>{job.schedule.expression}{job.nextRunAt ? ` · ${new Intl.DateTimeFormat(locale, { dateStyle: "short", timeStyle: "short" }).format(new Date(job.nextRunAt))}` : ""}</small></span><IconButton label={bi(language, "Annuler la tâche", "Cancel job")} onClick={() => void runAction("cancel_schedule", { jobId: job.id })}><X size={14} /></IconButton></div>)}
+      {remoteHeartbeats.slice(0, 8).map((item) => <div className="supervision-job is-remote" key={item.job.id}><HeartPulse size={16} /><span><strong>{item.sessionName || item.firstMessage || item.job.label || item.job.sessionId}</strong><small>{item.job.schedule.expression} · {item.job.status}</small></span><IconButton label={item.job.status === "paused" ? bi(language, "Reprendre", "Resume") : bi(language, "Mettre en pause", "Pause")} onClick={() => void runAction("manage_heartbeat", { activeSessionId: item.job.activeSessionId, jobId: item.job.id, action: item.job.status === "paused" ? "resume" : "pause" })}>{item.job.status === "paused" ? <Play size={14} /> : <Pause size={14} />}</IconButton><IconButton label={bi(language, "Arrêter", "Stop")} onClick={() => void runAction("manage_heartbeat", { activeSessionId: item.job.activeSessionId, jobId: item.job.id, action: "stop" })}><X size={14} /></IconButton></div>)}
+      {!heartbeat && activeSchedules.length === 0 ? <InspectorEmpty icon={<HeartPulse size={21} />} text={bi(language, "Aucune supervision planifiée pour cette session.", "No scheduled supervision for this session.")} /> : null}
+      <div className="supervision-actions"><Button variant="ghost" onClick={() => setEditor((current) => current === "heartbeat" ? undefined : "heartbeat")}><HeartPulse size={14} />{bi(language, "Heartbeat", "Heartbeat")}</Button><Button variant="ghost" onClick={() => setEditor((current) => current === "schedule" ? undefined : "schedule")}><CalendarClock size={14} />{bi(language, "Planifier", "Schedule")}</Button></div>
+      {error && !editor ? <p className="trust-note" role="alert"><CircleAlert size={14} />{error}</p> : null}
+      {editor ? <div className="supervision-editor"><label><span>{bi(language, "Fréquence ou date", "Frequency or date")}</span><input value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="every 30m" /></label><label><span>{bi(language, "Instruction à exécuter", "Instruction to run")}</span><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={3} /></label>{editor === "heartbeat" ? <label><span>{bi(language, "Si l’agent travaille déjà", "If the agent is already working")}</span><select value={deliveryMode} onChange={(event) => setDeliveryMode(event.target.value as "steer" | "follow_up")}><option value="steer">{bi(language, "Orienter le travail en cours", "Steer current work")}</option><option value="follow_up">{bi(language, "Attendre puis ouvrir un nouveau tour", "Wait, then start a new turn")}</option></select></label> : null}{error ? <p className="trust-note" role="alert"><CircleAlert size={14} />{error}</p> : null}<Button disabled={!prompt.trim() || !schedule.trim() || submitting} onClick={() => void submit()}>{submitting ? <LoaderCircle size={14} className="spin" /> : <Check size={14} />}{bi(language, "Activer", "Enable")}</Button></div> : null}
+    </section>
   );
 }
 
@@ -889,6 +1126,8 @@ function ChangesPanel({ projectPath, changes, draft, onDraftChange }: { projectP
   const [loadingPath, setLoadingPath] = useState<string>();
   const [diffError, setDiffError] = useState<string>();
   const [pendingPrompt, setPendingPrompt] = useState<GitPromptAction>();
+  const [fileMenu, setFileMenu] = useState<{ change: GitChange; x: number; y: number }>();
+  const [fileActionError, setFileActionError] = useState<string>();
   const diffRequest = useRef(0);
   const totals = changes.reduce((sum, change) => ({ additions: sum.additions + change.additions, deletions: sum.deletions + change.deletions }), { additions: 0, deletions: 0 });
   const binaryCount = changes.filter((change) => change.binary).length;
@@ -918,6 +1157,36 @@ function ChangesPanel({ projectPath, changes, draft, onDraftChange }: { projectP
     setLoadingPath(undefined);
     setDiffError(undefined);
   }, [projectPath]);
+
+  useEffect(() => {
+    if (!fileMenu) return;
+    const close = () => setFileMenu(undefined);
+    const keydown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("keydown", keydown);
+    window.addEventListener("blur", close);
+    window.addEventListener("resize", close);
+    window.addEventListener("scroll", close, true);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("keydown", keydown);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("scroll", close, true);
+    };
+  }, [fileMenu]);
+
+  const openContainingFolder = async (change: GitChange) => {
+    setFileMenu(undefined);
+    setFileActionError(undefined);
+    try {
+      await openGitFileFolder(projectPath, change.path);
+    } catch (error) {
+      setFileActionError(error instanceof Error ? error.message : String(error));
+    }
+  };
 
   useEffect(() => {
     if (expandedPath && !changes.some((change) => change.path === expandedPath)) {
@@ -961,14 +1230,16 @@ function ChangesPanel({ projectPath, changes, draft, onDraftChange }: { projectP
       {changes.length ? <><div className="changes-summary"><div><strong>{changes.length}</strong><span>{changes.length === 1 ? bi(language, "fichier modifié", "modified file") : bi(language, "fichiers modifiés", "modified files")}{binaryCount ? ` · ${binaryCount} ${bi(language, "binaire", "binary")}` : ""}</span></div><div className="diff-count"><b>+{totals.additions}</b><em>-{totals.deletions}</em></div></div><div className="change-list">{changes.map((change) => {
         const expanded = expandedPath === change.path;
         const loading = loadingPath === change.path;
-        return <div className={`change-item ${expanded ? "is-expanded" : ""}`} key={`${change.originalPath ?? ""}:${change.path}`}><button type="button" aria-expanded={expanded} onClick={() => void toggleDiff(change)} title={bi(language, "Afficher le diff", "Show diff")}><span className={`change-status ${changeStatusClass(change.status)}`} title={changeStatusTitle(change.status, language)}>{changeStatusLabel(change.status)}</span><FileCode2 size={15} /><span><strong>{fileName(change.path)}</strong><small>{change.originalPath ? `${change.originalPath} → ${parentPath(change.path) || "."}` : parentPath(change.path)}</small></span>{change.binary ? <span className="change-binary">{bi(language, "Binaire", "Binary")}</span> : change.additions || change.deletions ? <span className="change-stats"><b>+{change.additions}</b><em>-{change.deletions}</em></span> : <span className="change-metadata">{bi(language, "Métadonnées", "Metadata")}</span>}{loading ? <LoaderCircle size={14} className="spin" /> : expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</button>{expanded ? <div className="change-preview" aria-live="polite">{loading ? <div className="diff-loading"><LoaderCircle size={15} className="spin" />{bi(language, "Chargement du diff…", "Loading diff…")}</div> : diffError ? <div className="diff-error"><CircleAlert size={15} />{diffError}</div> : diff?.binary ? <div className="diff-empty"><FileCode2 size={18} />{bi(language, "Fichier binaire : aucun aperçu textuel disponible.", "Binary file: no text preview available.")}</div> : diff?.patch ? <><pre className="git-diff" aria-label={bi(language, `Diff de ${change.path}`, `Diff for ${change.path}`)}>{diff.patch.split("\n").map((line, index) => <span className={`diff-line ${diffLineClass(line)}`} key={`${index}:${line.slice(0, 24)}`}>{line || " "}</span>)}</pre>{diff.truncated ? <p className="diff-truncated"><Info size={13} />{bi(language, "Aperçu tronqué pour préserver les performances.", "Preview truncated to preserve performance.")}</p> : null}</> : <div className="diff-empty"><Check size={18} />{bi(language, "Aucune différence textuelle à afficher.", "No textual difference to display.")}</div>}</div> : null}</div>;
+        return <div className={`change-item ${expanded ? "is-expanded" : ""}`} key={`${change.originalPath ?? ""}:${change.path}`}><button type="button" aria-expanded={expanded} onClick={() => void toggleDiff(change)} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setFileActionError(undefined); setFileMenu({ change, x: Math.min(event.clientX, window.innerWidth - 230), y: Math.min(event.clientY, window.innerHeight - 90) }); }} title={bi(language, "Afficher le diff", "Show diff")}><span className={`change-status ${changeStatusClass(change.status)}`} title={changeStatusTitle(change.status, language)}>{changeStatusLabel(change.status)}</span><FileCode2 size={15} /><span><strong>{fileName(change.path)}</strong><small>{change.originalPath ? `${change.originalPath} → ${parentPath(change.path) || "."}` : parentPath(change.path)}</small></span>{change.binary ? <span className="change-binary">{bi(language, "Binaire", "Binary")}</span> : change.additions || change.deletions ? <span className="change-stats"><b>+{change.additions}</b><em>-{change.deletions}</em></span> : <span className="change-metadata">{bi(language, "Métadonnées", "Metadata")}</span>}{loading ? <LoaderCircle size={14} className="spin" /> : expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</button>{expanded ? <div className="change-preview" aria-live="polite">{loading ? <div className="diff-loading"><LoaderCircle size={15} className="spin" />{bi(language, "Chargement du diff…", "Loading diff…")}</div> : diffError ? <div className="diff-error"><CircleAlert size={15} />{diffError}</div> : diff?.binary ? <div className="diff-empty"><FileCode2 size={18} />{bi(language, "Fichier binaire : aucun aperçu textuel disponible.", "Binary file: no text preview available.")}</div> : diff?.patch ? <><pre className="git-diff" aria-label={bi(language, `Diff de ${change.path}`, `Diff for ${change.path}`)}>{diff.patch.split("\n").map((line, index) => <span className={`diff-line ${diffLineClass(line)}`} key={`${index}:${line.slice(0, 24)}`}>{line || " "}</span>)}</pre>{diff.truncated ? <p className="diff-truncated"><Info size={13} />{bi(language, "Aperçu tronqué pour préserver les performances.", "Preview truncated to preserve performance.")}</p> : null}</> : <div className="diff-empty"><Check size={18} />{bi(language, "Aucune différence textuelle à afficher.", "No textual difference to display.")}</div>}</div> : null}</div>;
       })}</div><p className="trust-note"><Info size={14} />{bi(language, "Cliquez sur un fichier pour afficher son diff Git. Les aperçus volumineux sont tronqués automatiquement.", "Click a file to view its Git diff. Large previews are truncated automatically.")}</p></> : <InspectorEmpty icon={<Code2 size={22} />} text={bi(language, "Aucun changement Git détecté dans ce projet.", "No Git changes detected in this project.")} />}
+      {fileActionError ? <p className="trust-note" role="alert"><CircleAlert size={14} />{fileActionError}</p> : null}
+      {fileMenu ? <div className="git-file-context-menu" role="menu" style={{ left: fileMenu.x, top: fileMenu.y }} onPointerDown={(event) => event.stopPropagation()}><button type="button" role="menuitem" autoFocus onClick={() => void openContainingFolder(fileMenu.change)}><FolderOpen size={15} /><span><strong>{bi(language, "Ouvrir le dossier contenant", "Open containing folder")}</strong><small>{parentPath(fileMenu.change.path) || "."}</small></span></button></div> : null}
       {pendingPrompt ? <Modal title={bi(language, "Remplacer le message en cours ?", "Replace the current message?")} description={bi(language, "Le texte déjà saisi sera effacé et remplacé par l’instruction préparée.", "The text already entered will be erased and replaced by the prepared instruction.")} width="470px" onClose={() => setPendingPrompt(undefined)} footer={<><Button variant="secondary" onClick={() => setPendingPrompt(undefined)}>{bi(language, "Conserver mon texte", "Keep my text")}</Button><Button variant="danger" onClick={() => applyPrompt(pendingPrompt)}>{bi(language, "Effacer et remplacer", "Erase and replace")}</Button></>}><div className="draft-replace-warning"><CircleAlert size={20} /><div><strong>{bi(language, "Cette action ne peut pas être annulée.", "This action cannot be undone.")}</strong><p>{bi(language, "L’instruction sera seulement préparée dans le champ de saisie : elle ne sera pas envoyée automatiquement.", "The instruction will only be prepared in the composer; it will not be sent automatically.")}</p></div></div></Modal> : null}
     </div>
   );
 }
 
-function DetailsPanel({ project, conversation, stats, sessionState, onRunCommand }: { project: Project; conversation: Conversation; stats?: SessionStats; sessionState?: AgentSessionState; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void> }) {
+function DetailsPanel({ project, conversation, stats, sessionState, onRunCommand, onCloneSession }: { project: Project; conversation: Conversation; stats?: SessionStats; sessionState?: AgentSessionState; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onCloneSession: () => Promise<void> }) {
   const { language, locale } = useI18n();
   return (
     <div className="inspector-section">
@@ -981,7 +1252,7 @@ function DetailsPanel({ project, conversation, stats, sessionState, onRunCommand
       <div className="section-title"><span>{bi(language, "Configuration", "Configuration")}</span></div>
       <dl className="details-list"><div><dt>{bi(language, "Modèle", "Model")}</dt><dd>{sessionState?.model?.name ?? shortModel(conversation.model) ?? bi(language, "Par défaut", "Default")}</dd></div><div><dt>{bi(language, "Raisonnement", "Reasoning")}</dt><dd>{thinkingLabel(conversation.thinkingLevel, language)}</dd></div><div><dt>{bi(language, "Projet", "Project")}</dt><dd>{project.name}</dd></div><div><dt>Session</dt><dd className="mono">{sessionState?.sessionId?.slice(0, 12) ?? conversation.sessionId?.slice(0, 12) ?? bi(language, "En attente", "Pending")}</dd></div><div><dt>{bi(language, "Persistance", "Persistence")}</dt><dd>{conversation.sessionPath ? bi(language, "Activée", "Enabled") : bi(language, "Nouvelle session", "New session")}</dd></div></dl>
       <div className="section-title"><span>{bi(language, "Maintenance", "Maintenance")}</span></div>
-      <div className="maintenance-actions"><Button variant="secondary" onClick={() => void onRunCommand("compact")}><ArchiveRestore size={15} />{bi(language, "Compacter", "Compact")}</Button><Button variant="secondary" onClick={() => void onRunCommand("refine")}><WandSparkles size={15} />{bi(language, "Raffiner", "Refine")}</Button><Button variant="secondary" onClick={() => void onRunCommand("clone")}><GitBranch size={15} />{bi(language, "Cloner", "Clone")}</Button><Button variant="secondary" onClick={() => void onRunCommand("export_html")}><ArrowDown size={15} />{bi(language, "Exporter", "Export")}</Button></div>
+      <div className="maintenance-actions"><Button variant="secondary" onClick={() => void onRunCommand("compact")}><ArchiveRestore size={15} />{bi(language, "Compacter", "Compact")}</Button><Button variant="secondary" onClick={() => void onRunCommand("refine")}><WandSparkles size={15} />{bi(language, "Raffiner", "Refine")}</Button><Button variant="secondary" onClick={() => void onCloneSession()}><Copy size={15} />{bi(language, "Dupliquer", "Duplicate")}</Button><Button variant="secondary" onClick={() => void onRunCommand("export_html")}><ArrowDown size={15} />{bi(language, "Exporter", "Export")}</Button></div>
     </div>
   );
 }
@@ -1028,24 +1299,87 @@ function ThinkingPopover({ active, onChoose }: { active: ThinkingLevel; onChoose
   return <div className="popover thinking-popover"><div className="popover-label">{bi(language, "Niveau de raisonnement", "Reasoning level")}</div>{levels.map((level) => <button key={level.value} type="button" className={active === level.value ? "is-selected" : ""} onClick={() => onChoose(level.value)}><span><strong>{level.label}</strong><small>{level.detail}</small></span>{active === level.value ? <Check size={15} /> : null}</button>)}</div>;
 }
 
-function PermissionPopover({ active, onChoose }: { active: PermissionPreset; onChoose: (preset: PermissionPreset) => void }) {
+function QueuePopover({ sessionState, onChoose }: { sessionState?: AgentSessionState; onChoose: (type: string, fields?: Record<string, unknown>) => void }) {
   const { language } = useI18n();
-  const presets: Array<{ value: PermissionPreset; label: string; detail: string }> = [
-    { value: "guarded", label: bi(language, "Supervision stricte", "Strict supervision"), detail: bi(language, "L’interface demande davantage de validations", "The interface asks for more confirmations") },
-    { value: "standard", label: bi(language, "Supervision standard", "Standard supervision"), detail: bi(language, "Équilibre entre fluidité et confirmations", "A balance of flow and confirmations") },
-    { value: "autonomous", label: bi(language, "Autonomie", "Autonomy"), detail: bi(language, "Moins d’interruptions et de confirmations UI", "Fewer interruptions and UI confirmations") },
-  ];
+  const steeringMode = sessionState?.steeringMode ?? "one-at-a-time";
+  const followUpMode = sessionState?.followUpMode ?? "one-at-a-time";
+  const actions = sessionState?.sessionActions;
   return (
     <div className="popover thinking-popover permission-popover">
-      <div className="popover-label">{bi(language, "Profil de supervision", "Supervision profile")}</div>
-      {presets.map((preset) => (
-        <button key={preset.value} type="button" className={active === preset.value ? "is-selected" : ""} onClick={() => onChoose(preset.value)}>
-          <span><strong>{preset.label}</strong><small>{preset.detail}</small></span>
-          {active === preset.value ? <Check size={15} /> : null}
-        </button>
-      ))}
+      <div className="popover-label">{bi(language, "File Prime Agent", "Prime Agent queue")}</div>
+      <QueueModeRow icon={<Zap size={15} />} title={bi(language, "Orienter le travail en cours", "Steer current work")} detail={bi(language, "Après les outils du tour actuel, avant le prochain appel au modèle.", "After the current turn's tools, before the next model call.")} mode={steeringMode} language={language} onMode={(mode) => onChoose("set_steering_mode", { mode })} />
+      <QueueModeRow icon={<Clock3 size={15} />} title={bi(language, "Nouveau tour après l’exécution", "New turn after the run")} detail={bi(language, "Attend que l’agent soit libre, puis démarre un nouveau tour.", "Waits until the agent is idle, then starts a new turn.")} mode={followUpMode} language={language} onMode={(mode) => onChoose("set_follow_up_mode", { mode })} />
       <div className="popover-separator" />
-      <p className="trust-note"><Info size={14} />{bi(language, "Profil d’interface uniquement : ce réglage ne crée pas de sandbox. Prime Agent conserve vos droits utilisateur.", "UI profile only: this setting does not create a sandbox. Prime Agent keeps your user permissions.")}</p>
+      <div className="popover-label">{bi(language, "État réel", "Live state")}</div>
+      <p className="trust-note"><Layers3 size={14} />{actions?.queuedCount
+        ? bi(language, `${actions.queuedCount} instruction(s) en attente dans Prime Agent.`, `${actions.queuedCount} instruction(s) queued in Prime Agent.`)
+        : bi(language, "Aucune instruction en attente.", "No queued instructions.")}</p>
+    </div>
+  );
+}
+
+interface QueuedMessageRow {
+  id: string;
+  text: string;
+  delivery: "steer" | "follow_up";
+  lane: "steering" | "followUp";
+  index?: number;
+  expectedText: string;
+  attachments?: Attachment[];
+}
+
+export function buildQueuedRows(conversation: Conversation, sessionState?: AgentSessionState): QueuedMessageRow[] {
+  const actions = sessionState?.sessionActions;
+  const local = conversation.messages.flatMap((message) => message.queueDelivery ? [{
+    message,
+    delivery: message.queueDelivery,
+    payload: message.queueText ?? message.content,
+    used: false,
+  }] : []);
+  const authoritative = (["steer", "follow_up"] as const).flatMap((delivery) => {
+    const lane = delivery === "steer" ? "steering" as const : "followUp" as const;
+    const previews = delivery === "steer" ? actions?.steering ?? [] : actions?.followUps ?? [];
+    return previews.map((text, index): QueuedMessageRow => {
+      const match = local.find((item) => !item.used && item.delivery === delivery && item.payload === text);
+      if (match) match.used = true;
+      return {
+        id: match?.message.id ?? `remote-queue:${delivery}:${index}:${text.slice(0, 32)}`,
+        text: match?.message.content ?? text,
+        delivery,
+        lane,
+        index,
+        expectedText: text,
+        attachments: match?.message.attachments,
+      };
+    });
+  });
+  const syncing = local.filter((item) => !item.used).map(({ message, delivery, payload }): QueuedMessageRow => ({
+    id: message.id,
+    text: message.content,
+    delivery,
+    lane: delivery === "steer" ? "steering" : "followUp",
+    expectedText: payload,
+    attachments: message.attachments,
+  }));
+  return [...authoritative, ...syncing];
+}
+
+function QueueModeRow({ icon, title, detail, mode, language, onMode }: {
+  icon: React.ReactNode;
+  title: string;
+  detail: string;
+  mode: "all" | "one-at-a-time";
+  language: "fr" | "en";
+  onMode: (mode: "all" | "one-at-a-time") => void;
+}) {
+  return (
+    <div className="queue-mode-row">
+      <span className="queue-mode-icon">{icon}</span>
+      <span className="queue-mode-copy"><strong>{title}</strong><small>{detail}</small></span>
+      <span className="queue-mode-toggle" role="group" aria-label={`${title} · ${bi(language, "mode de distribution", "delivery mode")}`}>
+        <button type="button" title={bi(language, "Livrer ensemble toutes les instructions en attente", "Deliver every queued instruction together")} className={mode === "all" ? "is-selected" : ""} aria-pressed={mode === "all"} onClick={() => onMode("all")}>{bi(language, "Tout", "All")}</button>
+        <button type="button" title={bi(language, "Livrer une instruction, attendre la réponse, puis livrer la suivante", "Deliver one instruction, wait for its response, then deliver the next")} className={mode === "one-at-a-time" ? "is-selected" : ""} aria-pressed={mode === "one-at-a-time"} onClick={() => onMode("one-at-a-time")}>{bi(language, "Un à la fois", "One at a time")}</button>
+      </span>
     </div>
   );
 }
@@ -1145,10 +1479,10 @@ function thinkingLabel(level: ThinkingLevel, language: AppLanguage) {
     ? { off: "Off", minimal: "Minimal", low: "Light", medium: "Balanced", high: "Deep", xhigh: "Very deep", max: "Maximum" }
     : { off: "Off", minimal: "Minimal", low: "Léger", medium: "Équilibré", high: "Approfondi", xhigh: "Très approfondi", max: "Maximum" })[level];
 }
-function permissionLabel(preset: PermissionPreset, language: AppLanguage) {
-  if (preset === "guarded") return bi(language, "Supervision stricte", "Strict supervision");
-  if (preset === "autonomous") return bi(language, "Autonomie", "Autonomy");
-  return bi(language, "Supervision standard", "Standard supervision");
+function queueLabel(sessionState: AgentSessionState | undefined, language: AppLanguage) {
+  const queued = sessionState?.sessionActions?.queuedCount ?? 0;
+  if (queued > 0) return bi(language, `File · ${queued}`, `Queue · ${queued}`);
+  return bi(language, "File", "Queue");
 }
 function shortModel(model?: string) { return model?.includes("/") ? model.slice(model.indexOf("/") + 1) : model; }
 function shortPath(path: string) { const pieces = path.split(/[\\/]/).filter(Boolean); return pieces.length > 3 ? `…/${pieces.slice(-2).join("/")}` : pieces.join("/"); }

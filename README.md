@@ -28,10 +28,12 @@ Prime Orbit turns [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent
 
 - **Project-first workspace** — keep projects and their conversations visible together, reorder them manually with drag and drop, search globally, archive old work, and see which agents are running or finished.
 - **Full Prime Agent conversations** — stream answers, attach images and local files, choose models and reasoning levels, run tools, inspect context, and review Git changes.
+- **Prime Agent supervision** — configure real heartbeats and scheduled jobs, inspect their next run, and pause, resume, cancel, or stop supervised work across sessions.
 - **Useful activity instead of protocol noise** — tool calls and sub-agent activity are consolidated, repeated events are deduplicated, and large Python execution sequences can be grouped.
 - **Fast, lazy startup** — Prime Orbit loads only the conversation you open. Other histories and agent processes are not eagerly restored.
 - **Resilient history** — if the Prime Agent runtime is temporarily unavailable, the selected session can be reconstructed locally in read-only mode without duplicating the source transcript.
 - **Long-running work** — agents can continue in the background, multiple windows share the same native runtime, and active sessions are released safely when no longer needed.
+- **One session catalog** — top-level sessions created from the classic Prime Agent terminal appear lazily beside Orbit conversations when their project is linked.
 - **Providers and MCP** — inspect configured providers, manage HTTP MCP servers globally or per project, and use OAuth or bearer-token environment variables without exposing secret values to the renderer.
 - **Desktop polish** — native file dialogs, custom context menus, keyboard navigation, light/dark/system themes, and complete English/French interface support.
 
@@ -61,10 +63,10 @@ Prime Agent's interactive `/login`, `/logout`, and OAuth MCP flows still run in 
 4. Let the onboarding flow detect Prime Agent, or use **Quick install** to install it from the official repository.
 5. Configure a provider, create a conversation, and start working.
 
-The 0.1.11 desktop build is validated on Windows 10/11 x64. Microsoft Edge WebView2 is normally already present on supported Windows installations.
+The 0.1.12 desktop build is validated on Windows 10/11 x64. Microsoft Edge WebView2 is normally already present on supported Windows installations.
 
 > [!IMPORTANT]
-> The 0.1.11 installers are not code-signed yet. Windows SmartScreen may display an unknown-publisher warning. Verify the SHA-256 values in the release notes before running a downloaded installer.
+> The 0.1.12 installers are not code-signed yet. Windows SmartScreen may display an unknown-publisher warning. Verify the SHA-256 values in the release notes before running a downloaded installer.
 
 ### Prime Agent requirements
 
@@ -84,11 +86,12 @@ Prime Orbit's development and Vite 8 build toolchain has a separate Node.js 22.1
 | Area | Included |
 | --- | --- |
 | Projects | Multiple local workspaces, stable manual order, typed deletion confirmation, archive/pin/search, direct Explorer access |
-| Conversations | Persistent Prime Agent sessions, lazy loading, streaming, follow-ups, models, reasoning, supervision profiles |
-| Attachments | Images and validated local file references, native drag and drop, bounded file handling |
+| Conversations | Persistent Prime Agent sessions, lazy loading, streaming, real steering/follow-up queues, models, reasoning, session naming and branches |
+| Attachments | Native image thumbnails, validated local file references, native drag and drop, bounded file handling |
 | Tools | Tool cards, Python grouping, sub-agent activity, command palette, execution inspector |
 | Git | Real per-file statistics, bounded diff previews, and protected Prime Agent prompts for commit/push and release workflows |
-| Runtime | One native RPC process per conversation, multi-window leases, background work, graceful stop and recovery |
+| Runtime | One native RPC process per conversation, terminal-session discovery, multi-window leases, background work, graceful stop and recovery |
+| Supervision | Real heartbeats, schedules, queue steering/follow-up modes, and cross-session heartbeat management |
 | Models | Provider catalogs, scoped model selection, validated `models.json`, atomic save and backup |
 | MCP | Built-in and custom HTTP servers, global/project scope, OAuth or bearer environment variable configuration |
 | Reliability | Revisioned state, three-way multi-window merge, atomic persistence, runtime health checks, session fallback |
@@ -103,7 +106,7 @@ Prime Orbit's development and Vite 8 build toolchain has a separate Node.js 22.1
 - On Windows, Prime Orbit can recover an exact stale Prime Agent session lease only after proving that its recorded process is no longer alive. Live or unverifiable locks are preserved.
 
 > [!WARNING]
-> Prime Agent is not a sandbox. Its tools run with the permissions of your user account. Prime Orbit's supervision profiles change the UI experience; they do not provide operating-system isolation.
+> Prime Agent is not a sandbox. Its tools run with the permissions of your user account. Prime Orbit shows that permission boundary explicitly and does not present a UI profile as operating-system isolation.
 
 ## Troubleshooting
 
@@ -177,7 +180,7 @@ Tauri writes platform bundles under `src-tauri/target/release/bundle/`.
 
 ## Release status
 
-Prime Orbit is an early desktop release. Version 0.1.11 ships Windows x64 NSIS and MSI installers. macOS and Linux code paths exist, but official binaries have not yet been validated or published.
+Prime Orbit is an early desktop release. Version 0.1.12 ships Windows x64 NSIS and MSI installers. macOS and Linux code paths exist, but official binaries have not yet been validated or published.
 
 See [CHANGELOG.md](CHANGELOG.md) for release details.
 

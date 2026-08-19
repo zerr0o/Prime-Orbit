@@ -3,6 +3,7 @@ use crate::{
     runtime::{capture_command_output, external_command, find_program},
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use image::ImageFormat;
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::Value;
@@ -10,7 +11,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
     fs::{self, File},
-    io::Read,
+    io::{Cursor, Read},
     path::{Component, Path, PathBuf},
     process::{ExitStatus, Output, Stdio},
     sync::Arc,
@@ -48,6 +49,8 @@ pub struct AttachmentData {
     pub mime_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment_handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_data_url: Option<String>,
     pub size: u64,
     pub is_image: bool,
 }
@@ -79,6 +82,7 @@ struct PreparedImage {
     name: String,
     mime_type: String,
     bytes: Vec<u8>,
+    preview_data_url: String,
 }
 
 enum PreparedAttachment {
@@ -196,6 +200,27 @@ fn image_signature_matches(mime_type: &str, bytes: &[u8]) -> bool {
     }
 }
 
+pub(crate) fn image_preview_data_url(mime_type: &str, bytes: &[u8]) -> Result<String, String> {
+    let format = match mime_type {
+        "image/png" => ImageFormat::Png,
+        "image/jpeg" => ImageFormat::Jpeg,
+        "image/gif" => ImageFormat::Gif,
+        "image/webp" => ImageFormat::WebP,
+        _ => return Err("Format d’image non pris en charge".to_string()),
+    };
+    let source = image::load_from_memory_with_format(bytes, format)
+        .map_err(|error| format!("Impossible de décoder l’image: {error}"))?;
+    let thumbnail = source.thumbnail(320, 220);
+    let mut encoded = Cursor::new(Vec::new());
+    thumbnail
+        .write_to(&mut encoded, ImageFormat::Png)
+        .map_err(|error| format!("Impossible de créer l’aperçu de l’image: {error}"))?;
+    Ok(format!(
+        "data:image/png;base64,{}",
+        STANDARD.encode(encoded.into_inner())
+    ))
+}
+
 fn read_selected_attachment(
     path: PathBuf,
     remaining_image_bytes: u64,
@@ -223,6 +248,7 @@ fn read_selected_attachment(
             name,
             mime_type,
             attachment_handle: None,
+            preview_data_url: None,
             size,
             is_image: false,
         }));
@@ -259,10 +285,12 @@ fn read_selected_attachment(
             mime_type
         ));
     }
+    let preview_data_url = image_preview_data_url(&mime_type, &bytes)?;
     Ok(PreparedAttachment::Image(PreparedImage {
         name,
         mime_type,
         bytes,
+        preview_data_url,
     }))
 }
 
@@ -322,6 +350,7 @@ impl AttachmentCache {
                         name: image.name,
                         mime_type: image.mime_type.clone(),
                         attachment_handle: Some(handle.clone()),
+                        preview_data_url: Some(image.preview_data_url),
                         size,
                         is_image: true,
                     });
@@ -599,10 +628,48 @@ fn validated_project_folder(path: String) -> Result<PathBuf, String> {
         .map_err(|error| format!("Impossible de résoudre {}: {error}", path.display()))
 }
 
+fn containing_git_folder(cwd: String, relative_path: String) -> Result<PathBuf, String> {
+    let root = validated_git_cwd(cwd)?;
+    let relative = PathBuf::from(relative_path);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err("Le chemin du fichier Git est invalide".to_string());
+    }
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let folder = canonicalize(root.join(parent)).map_err(|error| {
+        format!(
+            "Impossible de résoudre le dossier contenant {}: {error}",
+            relative.display()
+        )
+    })?;
+    if !folder.starts_with(&root) || !folder.is_dir() {
+        return Err("Le dossier demandé sort du projet Git".to_string());
+    }
+    Ok(folder)
+}
+
 #[tauri::command]
 pub async fn open_project_folder(app: AppHandle, path: String) -> Result<(), String> {
     crate::run_blocking(move || {
         let folder = validated_project_folder(path)?;
+        app.opener()
+            .open_path(folder.to_string_lossy().into_owned(), None::<&str>)
+            .map_err(|error| format!("Impossible d’ouvrir {}: {error}", folder.display()))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn open_git_file_folder(app: AppHandle, cwd: String, path: String) -> Result<(), String> {
+    crate::run_blocking(move || {
+        let folder = containing_git_folder(cwd, path)?;
         app.opener()
             .open_path(folder.to_string_lossy().into_owned(), None::<&str>)
             .map_err(|error| format!("Impossible d’ouvrir {}: {error}", folder.display()))
@@ -631,6 +698,7 @@ mod attachment_tests {
             name: name.to_string(),
             mime_type: "image/png".to_string(),
             bytes: bytes.to_vec(),
+            preview_data_url: "data:image/png;base64,cHJldmlldw==".to_string(),
         })
     }
 
@@ -702,6 +770,10 @@ mod attachment_tests {
             .is_some());
         assert_eq!(value.get("dataBase64"), None);
         assert_eq!(value.get("previewUrl"), None);
+        assert!(value
+            .get("previewDataUrl")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.starts_with("data:image/png;base64,")));
     }
 
     #[test]
@@ -1333,10 +1405,14 @@ pub async fn get_git_file_diff(
 #[cfg(test)]
 mod tests {
     use super::{
-        get_git_file_diff_blocking, list_git_changes_blocking, parse_numstat_z, parse_porcelain_z,
-        safe_git_relative_path, validated_project_folder,
+        containing_git_folder, get_git_file_diff_blocking, list_git_changes_blocking,
+        parse_numstat_z, parse_porcelain_z, safe_git_relative_path, validated_project_folder,
     };
-    use std::{fs, path::Path, process::Command};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::Command,
+    };
 
     fn run_git(cwd: &Path, arguments: &[&str]) {
         let output = Command::new("git")
@@ -1378,6 +1454,30 @@ mod tests {
         assert!(safe_git_relative_path("src/lib.rs").is_ok());
         assert!(safe_git_relative_path("../outside.txt").is_err());
         assert!(safe_git_relative_path("C:\\outside.txt").is_err());
+    }
+
+    #[test]
+    fn containing_folder_opens_the_exact_git_parent_without_allowing_traversal() {
+        let directory = tempfile::tempdir().expect("temporary repository");
+        let nested = directory.path().join("src").join("feature");
+        fs::create_dir_all(&nested).expect("create nested folder");
+        let resolved = containing_git_folder(
+            directory.path().to_string_lossy().into_owned(),
+            "src/feature/view.tsx".to_string(),
+        )
+        .expect("resolve containing folder");
+        let expected = nested
+            .canonicalize()
+            .expect("canonical nested folder")
+            .to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .to_string();
+        assert_eq!(resolved, PathBuf::from(expected));
+        assert!(containing_git_folder(
+            directory.path().to_string_lossy().into_owned(),
+            "../outside.txt".to_string(),
+        )
+        .is_err());
     }
 
     #[test]

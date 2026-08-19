@@ -1,4 +1,5 @@
 use crate::paths::canonicalize;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::{
@@ -9,6 +10,8 @@ use std::{
     time::SystemTime,
 };
 use tauri::{AppHandle, Manager};
+
+use crate::session_lease::resolve_agent_dir;
 
 const CURRENT_SESSION_VERSION: u64 = 3;
 const MAX_SESSION_BYTES: u64 = 64 * 1024 * 1024;
@@ -27,6 +30,208 @@ pub struct SessionHistoryResult {
     pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCatalogEntry {
+    pub session_path: String,
+    pub session_id: String,
+    pub cwd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_message: Option<String>,
+    pub message_count: usize,
+    pub rlm_depth: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    pub updated_at_ms: u64,
+}
+
+fn catalog_text(value: &Value, limit: usize) -> Option<String> {
+    let text = match value {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| {
+                let block = block.as_object()?;
+                matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("text" | "output_text")
+                )
+                .then(|| {
+                    block
+                        .get("text")
+                        .or_else(|| block.get("content"))
+                        .and_then(Value::as_str)
+                })
+                .flatten()
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.is_empty() {
+        None
+    } else {
+        Some(single_line.chars().take(limit).collect())
+    }
+}
+
+fn scan_catalog_entry(path: &Path) -> Option<SessionCatalogEntry> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_SESSION_BYTES
+    {
+        return None;
+    }
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut header: Option<Value> = None;
+    let mut session_name = None;
+    let mut first_message = None;
+    let mut message_count = 0_usize;
+    let mut entries = 0_usize;
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line).ok()?;
+        if read == 0 {
+            break;
+        }
+        entries = entries.saturating_add(1);
+        if entries > MAX_ENTRIES {
+            return None;
+        }
+        if line.len() > MAX_LINE_BYTES {
+            // Oversized tool results contain no catalog metadata. Count only
+            // ordinary message envelopes without retaining the payload.
+            const MESSAGE_MARKER: &[u8] = b"\"type\":\"message\"";
+            if line
+                .windows(MESSAGE_MARKER.len())
+                .any(|window| window == MESSAGE_MARKER)
+            {
+                message_count = message_count.saturating_add(1);
+            }
+            continue;
+        }
+        let value = match serde_json::from_slice::<Value>(&line) {
+            Ok(value) => value,
+            Err(_) if !line.ends_with(b"\n") => break,
+            Err(_) => continue,
+        };
+        let kind = string_field(&value, "type");
+        if header.is_none() {
+            if kind != Some("session") {
+                return None;
+            }
+            header = Some(value.clone());
+        }
+        if kind == Some("session_info") {
+            session_name = value
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(|name| name.chars().take(160).collect());
+        }
+        if kind == Some("message") {
+            message_count = message_count.saturating_add(1);
+            if first_message.is_none()
+                && value
+                    .get("message")
+                    .and_then(|message| string_field(message, "role"))
+                    == Some("user")
+            {
+                first_message = value
+                    .get("message")
+                    .and_then(|message| message.get("content"))
+                    .and_then(|content| catalog_text(content, 180));
+            }
+        }
+    }
+    let header = header?;
+    let session_id = string_field(&header, "id")?.to_string();
+    let cwd = string_field(&header, "cwd")?.to_string();
+    let rlm_depth = header.get("rlmDepth").and_then(Value::as_u64).unwrap_or(0);
+    let updated_at_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    Some(SessionCatalogEntry {
+        session_path: canonicalize(path).ok()?.to_string_lossy().into_owned(),
+        session_id,
+        cwd,
+        session_name,
+        first_message,
+        message_count,
+        rlm_depth,
+        parent_session_path: string_field(&header, "parentSession").map(str::to_string),
+        created_at: string_field(&header, "timestamp").map(str::to_string),
+        updated_at_ms,
+    })
+}
+
+fn list_session_catalog(
+    app: &AppHandle,
+    project_paths: Vec<String>,
+) -> Result<Vec<SessionCatalogEntry>, String> {
+    let home = app
+        .path()
+        .home_dir()
+        .map_err(|error| format!("Impossible de localiser les sessions Prime Agent: {error}"))?;
+    let configured = std::env::var_os("PRIME_AGENT_CODING_AGENT_DIR")
+        .or_else(|| std::env::var_os("PI_CODING_AGENT_DIR"));
+    let mut roots = project_paths
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .map(|cwd| resolve_agent_dir(&home, &cwd, configured.as_deref()).join("sessions"))
+        .collect::<HashSet<_>>();
+    if roots.is_empty() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
+        roots.insert(resolve_agent_dir(&home, &cwd, configured.as_deref()).join("sessions"));
+    }
+    let mut sessions = Vec::new();
+    let mut known_paths = HashSet::new();
+    for root in roots {
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("Impossible de lire {}: {error}", root.display())),
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("jsonl"))
+            {
+                if let Some(session) = scan_catalog_entry(&path) {
+                    if known_paths.insert(session.session_path.clone()) {
+                        sessions.push(session);
+                    }
+                }
+            }
+        }
+    }
+    sessions.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+    Ok(sessions)
+}
+
+#[tauri::command]
+pub async fn list_prime_agent_sessions(
+    app: AppHandle,
+    project_paths: Vec<String>,
+) -> Result<Vec<SessionCatalogEntry>, String> {
+    crate::run_blocking(move || list_session_catalog(&app, project_paths)).await
 }
 
 #[derive(Debug, Clone)]
@@ -526,12 +731,32 @@ fn sanitized_content(value: &Value, truncated: &mut bool) -> Value {
                             "name": object.get("name").and_then(Value::as_str).unwrap_or("tool"),
                             "arguments": sanitize_payload(object.get("arguments").unwrap_or(&Value::Null), truncated),
                         })),
-                        // Never move image bytes or URLs over IPC. The UI only
-                        // needs the marker to render its existing placeholder.
-                        "image" | "image_url" => Some(json!({
-                            "type": "image",
-                            "mimeType": object.get("mimeType").and_then(Value::as_str),
-                        })),
+                        // Never move original image bytes or URLs over IPC.
+                        // A small native-generated thumbnail is sufficient for
+                        // the transcript/session preview and remains bounded.
+                        "image" | "image_url" => {
+                            let mime_type = object.get("mimeType").and_then(Value::as_str);
+                            let image_bytes = object
+                                .get("data")
+                                .and_then(Value::as_str)
+                                .filter(|data| data.len() <= 12 * 1024 * 1024)
+                                .and_then(|data| STANDARD.decode(data).ok())
+                                .filter(|bytes| bytes.len() <= 8 * 1024 * 1024);
+                            let size = image_bytes.as_ref().map(Vec::len);
+                            let preview_data_url = image_bytes.as_deref().and_then(|bytes| {
+                                crate::files::image_preview_data_url(
+                                    mime_type.unwrap_or("image/png"),
+                                    bytes,
+                                )
+                                .ok()
+                            });
+                            Some(json!({
+                                "type": "image",
+                                "mimeType": mime_type,
+                                "size": size,
+                                "previewDataUrl": preview_data_url,
+                            }))
+                        },
                         _ => None,
                     }
                 })
@@ -909,6 +1134,25 @@ mod tests {
         assert!(!serialized.contains("branche abandonnée"));
         assert!(!serialized.contains("secret interne"));
         assert!(history.read_only);
+    }
+
+    #[test]
+    fn catalogs_terminal_sessions_without_loading_their_transcript() {
+        let fixture = Fixture::new(&[
+            json!({"type":"session_info","id":"name","parentId":null,"name":"Audit terminal"}),
+            json!({"type":"message","id":"one","parentId":"name","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"Inspecte le dépôt depuis le terminal"}}),
+            json!({"type":"message","id":"two","parentId":"one","message":{"role":"assistant","content":"Détails confidentiels non nécessaires au catalogue"}}),
+        ]);
+        let entry = scan_catalog_entry(&fixture.session).expect("catalog entry");
+        assert_eq!(entry.session_id, fixture.session_id);
+        assert_eq!(entry.session_name.as_deref(), Some("Audit terminal"));
+        assert_eq!(
+            entry.first_message.as_deref(),
+            Some("Inspecte le dépôt depuis le terminal")
+        );
+        assert_eq!(entry.message_count, 2);
+        assert_eq!(entry.rlm_depth, 0);
+        assert_eq!(Path::new(&entry.cwd), fixture.project);
     }
 
     #[test]

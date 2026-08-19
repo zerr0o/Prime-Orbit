@@ -20,6 +20,7 @@ new Function("module", "exports", "require", buildResult.outputFiles[0].text)(
 );
 const {
   applyConversationPatch,
+  createPreservedConversationReference,
   jsonValuesEqual,
   rebaseWorkspaceState,
   workspaceStatesEqual,
@@ -139,4 +140,35 @@ test("runtime-only conversation patches do not advance the durable timestamp", (
     title: "Renamed",
   }, "2026-08-19T10:05:00.000Z");
   assert.equal(durableUpdate.updatedAt, "2026-08-19T10:05:00.000Z");
+});
+
+test("preserving a session for fork or clone keeps its durable source reference without copying runtime payloads", () => {
+  const source = conversation({
+    title: "Audit",
+    sessionPath: "C:\\Sessions\\audit.jsonl",
+    sessionId: "session-a",
+    pinned: true,
+    status: "tool",
+    draft: "new draft",
+    messages: [{ id: "message-a", role: "assistant", content: "Large history", createdAt: "2026-08-19T10:00:00.000Z" }],
+    activities: [{ id: "activity-a", type: "tool", title: "Running", status: "running", createdAt: "2026-08-19T10:00:00.000Z" }],
+  });
+
+  const preserved = createPreservedConversationReference(
+    source,
+    "conversation-source",
+    "Audit · origine",
+    -1,
+    "2026-08-19T10:10:00.000Z",
+  );
+
+  assert.equal(preserved.sessionPath, source.sessionPath);
+  assert.equal(preserved.sessionId, source.sessionId);
+  assert.equal(preserved.title, "Audit · origine");
+  assert.equal(preserved.status, "offline");
+  assert.equal(preserved.sessionNameSyncPending, true);
+  assert.equal(preserved.pinned, false);
+  assert.deepEqual(preserved.messages, []);
+  assert.deepEqual(preserved.activities, []);
+  assert.equal(preserved.draft, "");
 });

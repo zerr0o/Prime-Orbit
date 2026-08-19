@@ -1,6 +1,6 @@
 [package]
 name = "prime-orbit"
-version = "0.1.11"
+version = "0.1.12"
 description = "Prime Orbit desktop client for Prime Agent"
 authors = ["Prime Orbit contributors"]
 edition = "2021"
@@ -17,6 +17,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 base64 = "0.22"
 dunce = "1"
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 mime_guess = "2"
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
