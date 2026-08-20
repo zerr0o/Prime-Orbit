@@ -43,6 +43,7 @@ import type {
 } from "../types";
 
 interface ConversationRuntime {
+  isCompacting?: boolean;
   state?: AgentSessionState;
   models: ModelInfo[];
   commands: SlashCommand[];
@@ -74,6 +75,8 @@ interface PendingSelectionRequest {
   generation: number;
   timeout: number;
   transcriptEpoch?: number;
+  statsEpoch?: number;
+  stateEpoch?: number;
   resolve?: (message: RpcEnvelope) => void;
   reject?: (error: Error) => void;
 }
@@ -82,6 +85,32 @@ interface PendingConversationRequest {
   conversationId: string;
   timeout: number;
   resolve: (message: RpcEnvelope) => void;
+  reject: (error: Error) => void;
+}
+
+export function applyRuntimeCompactingState(
+  runtime: ConversationRuntime | undefined,
+  isCompacting: boolean,
+  clearContextUsage = false,
+): ConversationRuntime {
+  const current = runtime ?? { models: [], commands: [], logs: [] };
+  const state = current.state && current.state.isCompacting !== isCompacting
+    ? { ...current.state, isCompacting }
+    : current.state;
+  const stats = clearContextUsage && current.stats?.contextUsage
+    ? { ...current.stats, contextUsage: undefined }
+    : current.stats;
+  if (current.isCompacting === isCompacting && state === current.state && stats === current.stats) return current;
+  return { ...current, isCompacting, state, stats };
+}
+
+interface PendingCompaction {
+  conversationId: string;
+  previousStatus: Conversation["status"];
+  started: boolean;
+  timeout: number;
+  promise: Promise<void>;
+  resolve: () => void;
   reject: (error: Error) => void;
 }
 
@@ -96,6 +125,11 @@ const HISTORY_RESPONSE_TIMEOUT_MS = 30_000;
 const HISTORY_REQUEST_ATTEMPTS = 1;
 const PASSIVE_RESPONSE_TIMEOUT_MS = 30_000;
 const HTML_EXPORT_RESPONSE_TIMEOUT_MS = 20 * 60_000;
+// Compaction can legitimately take far longer than the daemon's legacy 30 s
+// acknowledgement window. The lifecycle events remain authoritative and the
+// emergency restart is the explicit escape hatch for a truly stuck operation.
+const COMPACTION_LIFECYCLE_TIMEOUT_MS = 24 * 60 * 60_000;
+const RECENT_COMPACTION_END_MS = 10_000;
 const SELECTION_SCOPED_COMMANDS = new Set([
   "get_state",
   "get_messages",
@@ -120,6 +154,70 @@ const localHistoryIdentity = (conversation: Pick<Conversation, "id" | "sessionPa
   `${conversation.id}\0${conversation.sessionPath ?? ""}\0${conversation.sessionId ?? ""}`
 );
 const localHistoryConversationPrefix = (conversationId: string) => `${conversationId}\0`;
+
+export function isCompactDaemonAcknowledgementTimeout(message: Pick<RpcEnvelope, "command" | "success" | "error">): boolean {
+  if (message.command !== "compact" || message.success !== false || typeof message.error !== "string") return false;
+  return /^Timed out after 30000ms waiting for the Prime Agent daemon response to "compact"\.(?:\s|$)/.test(
+    message.error.trim(),
+  );
+}
+
+export type CompactResponseDisposition = "not_compact" | "success" | "pending" | "lifecycle_handled" | "failure";
+
+/** Classifies the compact acknowledgement separately from the operation. A
+ * daemon acknowledgement timeout never proves that compaction failed: Prime
+ * Agent keeps running it and reports completion with compaction_end. */
+export function compactResponseDisposition(
+  message: Pick<RpcEnvelope, "command" | "success" | "error">,
+  hasRecentLifecycleEnd: boolean,
+): CompactResponseDisposition {
+  if (message.command !== "compact") return "not_compact";
+  if (message.success !== false) return "success";
+  if (hasRecentLifecycleEnd) return "lifecycle_handled";
+  return isCompactDaemonAcknowledgementTimeout(message) ? "pending" : "failure";
+}
+
+export interface CompactionEndPresentation {
+  title: string;
+  detail?: string;
+  status: ActivityItem["status"];
+  failed: boolean;
+}
+
+interface CompactionEndEventLike {
+  type?: string;
+  aborted?: unknown;
+  willRetry?: unknown;
+  errorMessage?: unknown;
+  errorSeverity?: unknown;
+}
+
+export function compactionEndPresentation(
+  event: CompactionEndEventLike,
+): CompactionEndPresentation {
+  const detail = typeof event.errorMessage === "string" && event.errorMessage.trim()
+    ? event.errorMessage.trim()
+    : undefined;
+  if (event.errorSeverity === "error") {
+    return { title: "Échec du compactage", detail, status: "error", failed: true };
+  }
+  if (event.aborted === true) {
+    return { title: "Compactage annulé", detail, status: "warning", failed: false };
+  }
+  if (event.errorSeverity === "warning") {
+    return { title: "Compactage non nécessaire", detail, status: "warning", failed: false };
+  }
+  // Older and automatic Prime Agent compaction paths can report a real
+  // failure through errorMessage without adding errorSeverity. A terminal
+  // diagnostic must never be presented as a successful compaction.
+  if (detail) {
+    return { title: "Échec du compactage", detail, status: "error", failed: true };
+  }
+  if (event.willRetry === true) {
+    return { title: "Contexte compacté, reprise en cours", detail, status: "running", failed: false };
+  }
+  return { title: "Contexte compacté", detail, status: "success", failed: false };
+}
 
 const cleanDiagnostic = (value: unknown) => (
   typeof value === "string" && value.trim() ? redactText(value.trim()) : undefined
@@ -272,8 +370,9 @@ export function reconcileQueuedMessages(
 export function shouldReloadQueuedTranscript(
   conversation: Conversation | undefined,
   actions: AgentSessionState["sessionActions"] | undefined,
+  isCompacting = false,
 ): boolean {
-  if (!conversation || !actions || actions.active) return false;
+  if (!conversation || !actions || actions.active || isCompacting) return false;
   if (
     (actions.queuedCount ?? 0) > 0
     || (actions.steering?.length ?? 0) > 0
@@ -467,6 +566,24 @@ export function applyQueueMutationSnapshot(
   };
 }
 
+/** A deleted queue row may have been the only reason activePromptRuns was set
+ * while Compact owned the session. Clear that optimistic run marker only when
+ * both the local transcript and Prime Agent's authoritative lanes are empty,
+ * and never while an actual agent_start/agent_end lifecycle is active. */
+export function shouldClearPromptRunAfterQueueDeletion(
+  mutation: QueueMutation,
+  messages: ChatMessage[],
+  actions: SessionActionSnapshot | undefined,
+  hasActiveAgentLifecycle: boolean,
+): boolean {
+  if (mutation.type !== "delete" || hasActiveAgentLifecycle) return false;
+  if (messages.some((message) => Boolean(message.queueDelivery))) return false;
+  if (!actions) return true;
+  return (actions.steering?.length ?? 0) === 0
+    && (actions.followUps?.length ?? 0) === 0
+    && (actions.queuedCount ?? 0) === 0;
+}
+
 export function rollbackPromptTransaction(conversation: Conversation, transaction: PromptTransaction): Conversation {
   if (conversation.id !== transaction.conversationId) return conversation;
   const messages = conversation.messages.filter((message) => message.id !== transaction.messageId);
@@ -573,6 +690,8 @@ export function useAgentRuntime(options: {
   const historyInFlight = useRef(new Map<string, HistoryLoad>());
   const historyLoaded = useRef(new Set<string>());
   const transcriptEpoch = useRef(new Map<string, number>());
+  const statsEpoch = useRef(new Map<string, number>());
+  const stateEpoch = useRef(new Map<string, number>());
   const localHistoryInFlight = useRef(new Map<string, Promise<void>>());
   const localHistoryLoaded = useRef(new Set<string>());
   const localHistoryApplied = useRef(new Map<string, string>());
@@ -580,6 +699,16 @@ export function useAgentRuntime(options: {
   const bootstrapGeneration = useRef(new Map<string, number>());
   const pendingSelectionRequests = useRef(new Map<string, PendingSelectionRequest>());
   const pendingConversationRequests = useRef(new Map<string, PendingConversationRequest>());
+  // Unlike selection-scoped bootstrap requests, compaction belongs to the
+  // conversation process and must survive navigation. Every window receives
+  // the same native lifecycle events; only the initiating window owns a
+  // waiter/promise for its button.
+  const pendingCompactions = useRef(new Map<string, PendingCompaction>());
+  const compactingConversations = useRef(new Set<string>());
+  const compactionLifecycleStarted = useRef(new Set<string>());
+  const activeCompactionActivities = useRef(new Map<string, string>());
+  const recentCompactionEnds = useRef(new Map<string, { endedAt: number; activityId: string }>());
+  const compactionRefreshPending = useRef(new Set<string>());
   const activeSelection = useRef<SelectionToken>({ generation: 0 });
   const selectedConversationId = useRef(active ? selectedConversation?.id : undefined);
   const intentionallyStopped = useRef(new Set<string>());
@@ -590,6 +719,10 @@ export function useAgentRuntime(options: {
   // process-local marker closes that gap so the second prompt is represented
   // as queued even when both handlers crossed ensureStarted concurrently.
   const activePromptRuns = useRef(new Set<string>());
+  // Keep the real agent lifecycle separate from optimistic/queued prompts.
+  // Otherwise deleting the last follow-up during Compact can leave a phantom
+  // run, while clearing it blindly could hide a genuinely running agent.
+  const activeAgentLifecycles = useRef(new Set<string>());
   const extensionResponsesInFlight = useRef(new Set<string>());
   const maintenanceEventVersions = useRef(new Map<string, number>());
   const maintenanceRefreshes = useRef(new Map<string, Promise<void>>());
@@ -708,6 +841,8 @@ export function useAgentRuntime(options: {
       generation,
       timeout,
       transcriptEpoch: requestMetadata.transcriptEpoch,
+      statsEpoch: type === "get_session_stats" ? (statsEpoch.current.get(conversationId) ?? 0) : undefined,
+      stateEpoch: type === "get_state" ? (stateEpoch.current.get(conversationId) ?? 0) : undefined,
       resolve: resolveResponse,
       reject: rejectResponse,
     });
@@ -871,6 +1006,59 @@ export function useAgentRuntime(options: {
     });
   }, []);
 
+  const setRuntimeCompacting = useCallback((conversationId: string, isCompacting: boolean, clearContextUsage = false) => {
+    setRuntimes((current) => {
+      const runtime = current[conversationId];
+      const next = applyRuntimeCompactingState(runtime, isCompacting, clearContextUsage);
+      if (next === runtime) return current;
+      return { ...current, [conversationId]: next };
+    });
+  }, []);
+
+  const settleCompactionWaiter = useCallback((conversationId: string, error?: Error) => {
+    const pending = pendingCompactions.current.get(conversationId);
+    if (!pending) return;
+    pendingCompactions.current.delete(conversationId);
+    window.clearTimeout(pending.timeout);
+    if (error) pending.reject(error);
+    else pending.resolve();
+  }, []);
+
+  const recentCompactionEnd = useCallback((conversationId: string) => {
+    const recent = recentCompactionEnds.current.get(conversationId);
+    if (!recent) return undefined;
+    if (Date.now() - recent.endedAt <= RECENT_COMPACTION_END_MS) return recent;
+    recentCompactionEnds.current.delete(conversationId);
+    return undefined;
+  }, []);
+
+  const invalidateCompactionHistory = useCallback((conversationId: string) => {
+    transcriptEpoch.current.set(conversationId, (transcriptEpoch.current.get(conversationId) ?? 0) + 1);
+    historyLoaded.current.delete(conversationId);
+    historyInFlight.current.delete(conversationId);
+    localHistoryApplied.current.delete(conversationId);
+    const localPrefix = localHistoryConversationPrefix(conversationId);
+    for (const identity of localHistoryLoaded.current) {
+      if (identity.startsWith(localPrefix)) localHistoryLoaded.current.delete(identity);
+    }
+  }, []);
+
+  const refreshAfterCompaction = useCallback((conversationId: string) => {
+    compactionRefreshPending.current.add(conversationId);
+    historyLoaded.current.delete(conversationId);
+    const token = activeSelection.current;
+    if (
+      token.conversationId !== conversationId
+      || !isCurrentSelection(conversationId, token.generation)
+      || activePromptRuns.current.has(conversationId)
+    ) return;
+    compactionRefreshPending.current.delete(conversationId);
+    const epoch = transcriptEpoch.current.get(conversationId) ?? 0;
+    void sendSelectionRequest(conversationId, token.generation, "get_state").catch(() => undefined);
+    void sendSelectionRequest(conversationId, token.generation, "get_session_stats").catch(() => undefined);
+    void loadConversationHistory(conversationId, token.generation, epoch).catch(() => undefined);
+  }, [isCurrentSelection, loadConversationHistory, sendSelectionRequest]);
+
   const reloadDeliveredQueueTranscript = useCallback((
     conversationId: string,
     actions: AgentSessionState["sessionActions"] | undefined,
@@ -880,7 +1068,11 @@ export function useAgentRuntime(options: {
       token.conversationId !== conversationId
       || !isCurrentSelection(conversationId, token.generation)
       || activePromptRuns.current.has(conversationId)
-      || !shouldReloadQueuedTranscript(getConversationRef.current(conversationId), actions)
+      || !shouldReloadQueuedTranscript(
+        getConversationRef.current(conversationId),
+        actions,
+        compactingConversations.current.has(conversationId),
+      )
     ) return;
     const epoch = transcriptEpoch.current.get(conversationId) ?? 0;
     historyLoaded.current.delete(conversationId);
@@ -923,6 +1115,32 @@ export function useAgentRuntime(options: {
         return;
       }
 
+      const compactDisposition = compactResponseDisposition(
+        message,
+        Boolean(recentCompactionEnd(conversationId)),
+      );
+      if (compactDisposition === "pending") {
+        compactingConversations.current.add(conversationId);
+        setRuntimeCompacting(conversationId, true);
+        const activityId = activeCompactionActivities.current.get(conversationId) ?? uid("compaction");
+        activeCompactionActivities.current.set(conversationId, activityId);
+        updateConversation(conversationId, (conversation) => ({
+          ...conversation,
+          status: "tool",
+          lastError: undefined,
+        }));
+        addActivity(conversationId, {
+          id: activityId,
+          type: "compaction_start",
+          title: "Compactage du contexte en cours",
+          detail: "Le délai d’accusé de réception du daemon est dépassé, mais Prime Agent poursuit le compactage en arrière-plan.",
+          status: "running",
+          raw: message,
+        });
+        return;
+      }
+      if (compactDisposition === "success" || compactDisposition === "lifecycle_handled") return;
+
       if (message.success === false) {
         const error = cleanDiagnostic(message.error) ?? `La commande ${message.command ?? "RPC"} a échoué.`;
         updateConversation(conversationId, { status: "error", lastError: error });
@@ -932,15 +1150,22 @@ export function useAgentRuntime(options: {
 
       const data = message.data as Record<string, unknown> | undefined;
       if (message.command === "get_state" && data) {
+        if (pending?.stateEpoch !== (stateEpoch.current.get(conversationId) ?? 0)) return;
         const rawSessionState = data as unknown as AgentSessionState;
         const sessionState = {
           ...rawSessionState,
           sessionActions: normalizePrimeOrbitSessionActions(rawSessionState.sessionActions),
         };
+        if (sessionState.isCompacting) compactingConversations.current.add(conversationId);
+        else compactingConversations.current.delete(conversationId);
         sessionActionsByConversation.current.set(conversationId, sessionState.sessionActions);
         setRuntimes((current) => ({
           ...current,
-          [conversationId]: { ...(current[conversationId] ?? { models: [], commands: [], logs: [] }), state: sessionState },
+          [conversationId]: {
+            ...(current[conversationId] ?? { models: [], commands: [], logs: [] }),
+            isCompacting: sessionState.isCompacting,
+            state: sessionState,
+          },
         }));
         updateConversation(conversationId, (conversation) => reconcileQueuedMessages({
           ...conversation,
@@ -953,7 +1178,17 @@ export function useAgentRuntime(options: {
           thinkingLevel: sessionState.thinkingLevel ?? conversation.thinkingLevel,
           // Keep the central loading state visible until get_messages has
           // actually populated the transcript.
-          status: sessionState.isStreaming ? "streaming" : conversation.status === "starting" ? "starting" : "idle",
+          status: sessionState.isCompacting
+            ? "tool"
+            : sessionState.isStreaming
+              ? "streaming"
+              : sessionState.sessionActions.queuedCount > 0
+                || sessionState.sessionActions.steering.length > 0
+                || sessionState.sessionActions.followUps.length > 0
+                ? "queued"
+              : conversation.status === "starting"
+                ? "starting"
+                : "idle",
           lastError: undefined,
         }, sessionState.sessionActions));
         if (!sessionState.isStreaming) {
@@ -973,6 +1208,7 @@ export function useAgentRuntime(options: {
           return;
         }
         historyLoaded.current.add(conversationId);
+        compactionRefreshPending.current.delete(conversationId);
         localHistoryApplied.current.delete(conversationId);
         const mapped = mapAgentMessages(data.messages);
         const sourceMessageCount = data.messages.length;
@@ -1011,6 +1247,7 @@ export function useAgentRuntime(options: {
       }
 
       if (message.command === "get_session_stats" && data) {
+        if (pending?.statsEpoch !== (statsEpoch.current.get(conversationId) ?? 0)) return;
         setRuntimes((current) => ({
           ...current,
           [conversationId]: {
@@ -1129,7 +1366,7 @@ export function useAgentRuntime(options: {
         updateConversation(conversationId, { model: `${model.provider}/${model.id}` });
       }
     },
-    [addActivity, isCurrentSelection, loadConversationHistory, reloadDeliveredQueueTranscript, sendSelectionRequest, updateConversation],
+    [addActivity, isCurrentSelection, loadConversationHistory, recentCompactionEnd, reloadDeliveredQueueTranscript, sendSelectionRequest, setRuntimeCompacting, updateConversation],
   );
 
   const handleAgentEvent = useCallback(
@@ -1161,19 +1398,99 @@ export function useAgentRuntime(options: {
       }
       if (eventType === "agent_start") {
         transcriptEpoch.current.set(conversationId, (transcriptEpoch.current.get(conversationId) ?? 0) + 1);
+        activeAgentLifecycles.current.add(conversationId);
         activePromptRuns.current.add(conversationId);
         updateConversation(conversationId, { status: "streaming", lastError: undefined });
         addActivity(conversationId, { type: eventType, title: "Prime Agent réfléchit", status: "running", raw: event });
         return;
       }
+      if (eventType === "compaction_start") {
+        const lifecycleWasStarted = compactionLifecycleStarted.current.has(conversationId);
+        compactionLifecycleStarted.current.add(conversationId);
+        compactingConversations.current.add(conversationId);
+        recentCompactionEnds.current.delete(conversationId);
+        const pending = pendingCompactions.current.get(conversationId);
+        if (pending && event.reason === "manual") pending.started = true;
+        const activityId = activeCompactionActivities.current.get(conversationId) ?? uid("compaction");
+        activeCompactionActivities.current.set(conversationId, activityId);
+        if (!lifecycleWasStarted) {
+          stateEpoch.current.set(conversationId, (stateEpoch.current.get(conversationId) ?? 0) + 1);
+          invalidateCompactionHistory(conversationId);
+        }
+        setRuntimeCompacting(conversationId, true);
+        updateConversation(conversationId, { status: "tool", lastError: undefined });
+        addActivity(conversationId, {
+          id: activityId,
+          type: eventType,
+          title: "Compactage du contexte en cours",
+          detail: event.reason === "manual" ? "Compactage demandé manuellement." : `Compactage automatique · ${String(event.reason ?? "contexte")}`,
+          status: "running",
+          raw: event,
+        });
+        return;
+      }
+      if (eventType === "compaction_end") {
+        const recent = recentCompactionEnd(conversationId);
+        const lifecycleWasStarted = compactionLifecycleStarted.current.delete(conversationId);
+        const activityId = activeCompactionActivities.current.get(conversationId)
+          ?? recent?.activityId
+          ?? uid("compaction");
+        // A repeated terminal event must not launch a second refresh or create
+        // another timeline row. This also makes a response arriving immediately
+        // before/after compaction_end harmless.
+        if (!lifecycleWasStarted && recent) {
+          compactingConversations.current.delete(conversationId);
+          setRuntimeCompacting(conversationId, false);
+          return;
+        }
+        if (!lifecycleWasStarted) invalidateCompactionHistory(conversationId);
+        activeCompactionActivities.current.delete(conversationId);
+        compactingConversations.current.delete(conversationId);
+        recentCompactionEnds.current.set(conversationId, { endedAt: Date.now(), activityId });
+        statsEpoch.current.set(conversationId, (statsEpoch.current.get(conversationId) ?? 0) + 1);
+        stateEpoch.current.set(conversationId, (stateEpoch.current.get(conversationId) ?? 0) + 1);
+        setRuntimeCompacting(conversationId, false, true);
+        const presentation = compactionEndPresentation(event);
+        const diagnostic = cleanDiagnostic(event.errorMessage);
+        updateConversation(conversationId, (conversation) => ({
+          ...conversation,
+          status: presentation.failed
+            ? "error"
+            : event.willRetry === true
+              ? "streaming"
+              : conversation.messages.some((message) => Boolean(message.queueDelivery))
+                ? "queued"
+                : activePromptRuns.current.has(conversationId)
+                  ? "streaming"
+                  : "idle",
+          lastError: presentation.failed ? diagnostic ?? "Le compactage du contexte a échoué." : undefined,
+        }));
+        addActivity(conversationId, {
+          id: activityId,
+          type: eventType,
+          title: presentation.title,
+          detail: presentation.detail,
+          status: presentation.status,
+          raw: event,
+        });
+        if (event.reason === "manual") {
+          settleCompactionWaiter(
+            conversationId,
+            presentation.failed ? new Error(diagnostic ?? "Le compactage du contexte a échoué.") : undefined,
+          );
+        }
+        refreshAfterCompaction(conversationId);
+        return;
+      }
       if (eventType === "agent_end") {
+        activeAgentLifecycles.current.delete(conversationId);
         activePromptRuns.current.delete(conversationId);
         const boundaryTime = now();
         updateConversation(conversationId, (conversation) => {
           const finalized = finalizeConversationTools(conversation, "completed", boundaryTime);
           return {
           ...finalized,
-          status: "idle",
+          status: compactingConversations.current.has(conversationId) ? "tool" : "idle",
           messages: finalized.messages
             .filter((item) => item.role !== "assistant" || item.content.trim() || (item.tools?.length ?? 0) > 0)
             .map((item) => (item.status === "streaming" ? { ...item, status: "complete" } : item)),
@@ -1192,6 +1509,9 @@ export function useAgentRuntime(options: {
           if (token.conversationId !== conversationId) return;
           void sendSelectionRequest(conversationId, token.generation, "get_session_stats").catch(() => undefined);
         }, 150);
+        if (compactionRefreshPending.current.has(conversationId)) {
+          refreshAfterCompaction(conversationId);
+        }
         return;
       }
       if (eventType === "turn_end") {
@@ -1429,7 +1749,7 @@ export function useAgentRuntime(options: {
         addActivity(conversationId, { type: eventType, title: humanizeEvent(eventType), status: "info", raw: event });
       }
     },
-    [addActivity, handleResponse, reloadDeliveredQueueTranscript, sendSelectionRequest, updateConversation],
+    [addActivity, handleResponse, invalidateCompactionHistory, recentCompactionEnd, refreshAfterCompaction, reloadDeliveredQueueTranscript, sendSelectionRequest, setRuntimeCompacting, settleCompactionWaiter, updateConversation],
   );
 
   useEffect(() => {
@@ -1455,7 +1775,14 @@ export function useAgentRuntime(options: {
         addLog(conversationId, "stderr", truncateRuntimeLog(line));
       },
       onExit: ({ conversationId, code, success, error }) => {
+        activeAgentLifecycles.current.delete(conversationId);
         activePromptRuns.current.delete(conversationId);
+        compactingConversations.current.delete(conversationId);
+        compactionLifecycleStarted.current.delete(conversationId);
+        activeCompactionActivities.current.delete(conversationId);
+        recentCompactionEnds.current.delete(conversationId);
+        compactionRefreshPending.current.delete(conversationId);
+        setRuntimeCompacting(conversationId, false, true);
         setExtensionRequests((current) => current.filter((request) => request.conversationId !== conversationId));
         started.current.delete(conversationId);
         startInFlight.current.delete(conversationId);
@@ -1468,6 +1795,10 @@ export function useAgentRuntime(options: {
           : agentExitErrorMessage({ code, success, error, stderr });
         if (exitDiagnostic) processExitErrors.current.set(conversationId, exitDiagnostic);
         else processExitErrors.current.delete(conversationId);
+        settleCompactionWaiter(
+          conversationId,
+          new Error(exitDiagnostic ?? "Prime Agent s’est arrêté pendant le compactage."),
+        );
         cancelConversationRequests(
           conversationId,
           exitDiagnostic ?? "Prime Agent s’est arrêté pendant le chargement.",
@@ -1498,7 +1829,7 @@ export function useAgentRuntime(options: {
       if (isNative()) setEventsReady(false);
       unlisten?.();
     };
-  }, [addActivity, addLog, cancelConversationRequests, cancelPersistentConversationRequests, handleAgentEvent, onInstallComplete, onInstallProgress, updateConversation]);
+  }, [addActivity, addLog, cancelConversationRequests, cancelPersistentConversationRequests, handleAgentEvent, onInstallComplete, onInstallProgress, setRuntimeCompacting, settleCompactionWaiter, updateConversation]);
 
   const ensureProcessStarted = useCallback(
     async (conversation: Conversation, project: Project) => {
@@ -1632,6 +1963,7 @@ export function useAgentRuntime(options: {
     sessionActionsByConversation.current.delete(conversationId);
     if (kind === "restart") {
       historyLoaded.current.delete(conversationId);
+      activeAgentLifecycles.current.delete(conversationId);
       activePromptRuns.current.delete(conversationId);
       processExitErrors.current.delete(conversationId);
       lastStderr.current.delete(conversationId);
@@ -1823,7 +2155,10 @@ export function useAgentRuntime(options: {
     for (const requestId of pendingConversationRequests.current.keys()) {
       clearPendingConversationRequest(requestId, new Error("La fenêtre se ferme."));
     }
-  }, [cancelConversationRequests, clearPendingConversationRequest]);
+    for (const conversationId of pendingCompactions.current.keys()) {
+      settleCompactionWaiter(conversationId, new Error("La fenêtre se ferme pendant le compactage."));
+    }
+  }, [cancelConversationRequests, clearPendingConversationRequest, settleCompactionWaiter]);
 
   const sendPrompt = useCallback(
     async (message: string, attachments: Attachment[], requestedDelivery?: "steer" | "follow_up") => {
@@ -1837,6 +2172,8 @@ export function useAgentRuntime(options: {
       const beforeStart = getConversationRef.current(conversationId) ?? selectedConversation;
       const forceQueued = requestedDelivery !== undefined
         || activePromptRuns.current.has(conversationId)
+        || pendingCompactions.current.has(conversationId)
+        || compactingConversations.current.has(conversationId)
         || beforeStart.status === "streaming"
         || beforeStart.status === "tool"
         || beforeStart.status === "queued";
@@ -1976,6 +2313,7 @@ export function useAgentRuntime(options: {
         },
       };
     });
+    let conversationAfterMutation: Conversation | undefined;
     updateConversation(conversationId, (conversation) => {
       let messages = conversation.messages;
       if (input.mutation.type === "delete") {
@@ -1992,8 +2330,18 @@ export function useAgentRuntime(options: {
         } : message);
       }
       const updated = messages === conversation.messages ? conversation : { ...conversation, messages };
-      return nextActions ? reconcileQueuedMessages(updated, nextActions) : updated;
+      const reconciled = nextActions ? reconcileQueuedMessages(updated, nextActions) : updated;
+      conversationAfterMutation = reconciled;
+      return reconciled;
     });
+    if (conversationAfterMutation && shouldClearPromptRunAfterQueueDeletion(
+      input.mutation,
+      conversationAfterMutation.messages,
+      nextActions,
+      activeAgentLifecycles.current.has(conversationId),
+    )) {
+      activePromptRuns.current.delete(conversationId);
+    }
     window.setTimeout(refresh, 50);
   }, [ensureStarted, isCurrentSelection, runtimes, selectedConversation, selectedProject, sendSelectionRequest, updateConversation]);
 
@@ -2019,6 +2367,7 @@ export function useAgentRuntime(options: {
     try {
       await sendRpc(selectedConversation.id, { id: uid("abort"), type: "abort" });
     } finally {
+      activeAgentLifecycles.current.delete(selectedConversation.id);
       activePromptRuns.current.delete(selectedConversation.id);
       updateConversation(selectedConversation.id, (conversation) => ({
         ...finalizeConversationTools(conversation, "cancelled", now()),
@@ -2033,6 +2382,7 @@ export function useAgentRuntime(options: {
     try {
       await stopAgent(selectedConversation.id);
     } finally {
+      activeAgentLifecycles.current.delete(selectedConversation.id);
       activePromptRuns.current.delete(selectedConversation.id);
       updateConversation(selectedConversation.id, (conversation) => ({
         ...finalizeConversationTools(conversation, "cancelled", now()),
@@ -2071,10 +2421,18 @@ export function useAgentRuntime(options: {
         const previousEventVersion = maintenanceEventVersions.current.get(maintenanceKey) ?? 0;
         cancelConversationRequests(conversationId, "La connexion Prime Agent redémarre.");
         cancelPersistentConversationRequests(conversationId, "Le redémarrage d’urgence a interrompu l’opération en arrière-plan.");
+        settleCompactionWaiter(conversationId, new Error("Le redémarrage d’urgence a interrompu le compactage."));
+        compactingConversations.current.delete(conversationId);
+        compactionLifecycleStarted.current.delete(conversationId);
+        activeCompactionActivities.current.delete(conversationId);
+        recentCompactionEnds.current.delete(conversationId);
+        compactionRefreshPending.current.delete(conversationId);
+        setRuntimeCompacting(conversationId, false, true);
         processExitErrors.current.delete(conversationId);
         lastStderr.current.delete(conversationId);
         historyLoaded.current.delete(conversationId);
         bootstrapGeneration.current.delete(conversationId);
+        activeAgentLifecycles.current.delete(conversationId);
         activePromptRuns.current.delete(conversationId);
         updateConversation(conversationId, (conversation) => ({
           ...finalizeConversationTools(conversation, "cancelled", now()),
@@ -2155,6 +2513,106 @@ export function useAgentRuntime(options: {
       }
       await ensureStarted(selectedConversation, selectedProject);
       const token = activeSelection.current;
+      if (type === "compact") {
+        const conversationId = selectedConversation.id;
+        if (
+          pendingCompactions.current.has(conversationId)
+          || compactingConversations.current.has(conversationId)
+        ) {
+          throw new Error("Un compactage du contexte est déjà en cours pour cette conversation.");
+        }
+        const currentConversation = getConversationRef.current(conversationId) ?? selectedConversation;
+        let resolveCompaction!: () => void;
+        let rejectCompaction!: (error: Error) => void;
+        const promise = new Promise<void>((resolve, reject) => {
+          resolveCompaction = resolve;
+          rejectCompaction = reject;
+        });
+        // A compaction_end error can arrive immediately before the compact RPC
+        // response. Attach a handler now so that ordering cannot create an
+        // unhandled rejection before runCommand awaits the lifecycle promise.
+        void promise.catch(() => undefined);
+        const activityId = uid("compaction");
+        const pending = {} as PendingCompaction;
+        const timeout = window.setTimeout(() => {
+          if (pendingCompactions.current.get(conversationId) !== pending) return;
+          pendingCompactions.current.delete(conversationId);
+          addActivity(conversationId, {
+            id: activityId,
+            type: "compaction_start",
+            title: "Compactage toujours en cours",
+            detail: "Prime Orbit n’a reçu aucun événement terminal. L’état reste conservé ; utilisez le redémarrage d’urgence uniquement si la session est réellement bloquée.",
+            status: "warning",
+          });
+          rejectCompaction(new Error("Prime Agent n’a pas confirmé la fin du compactage dans le délai de sécurité."));
+        }, COMPACTION_LIFECYCLE_TIMEOUT_MS);
+        Object.assign(pending, {
+          conversationId,
+          previousStatus: currentConversation.status,
+          started: false,
+          timeout,
+          promise,
+          resolve: resolveCompaction,
+          reject: rejectCompaction,
+        } satisfies PendingCompaction);
+        pendingCompactions.current.set(conversationId, pending);
+        compactingConversations.current.add(conversationId);
+        activeCompactionActivities.current.set(conversationId, activityId);
+        stateEpoch.current.set(conversationId, (stateEpoch.current.get(conversationId) ?? 0) + 1);
+        setRuntimeCompacting(conversationId, true);
+        updateConversation(conversationId, { status: "tool", lastError: undefined });
+        addActivity(conversationId, {
+          id: activityId,
+          type: "compaction_start",
+          title: "Compactage du contexte en cours",
+          detail: "Demande envoyée à Prime Agent.",
+          status: "running",
+        });
+        try {
+          const responsePromise = sendConversationRequest(
+            conversationId,
+            type,
+            fields,
+            COMPACTION_LIFECYCLE_TIMEOUT_MS,
+          );
+          const first = await Promise.race([
+            responsePromise.then((response) => ({ kind: "response" as const, response })),
+            promise.then(() => ({ kind: "lifecycle" as const })),
+          ]);
+          if (first.kind === "lifecycle") return;
+          const disposition = compactResponseDisposition(
+            first.response,
+            Boolean(recentCompactionEnd(conversationId)),
+          );
+          if (disposition === "failure") {
+            throw new Error(first.response.error ?? "Prime Agent n’a pas pu démarrer le compactage du contexte.");
+          }
+          await promise;
+        } catch (error) {
+          if (pendingCompactions.current.get(conversationId) === pending) {
+            pendingCompactions.current.delete(conversationId);
+            window.clearTimeout(timeout);
+            if (!compactionLifecycleStarted.current.has(conversationId)) {
+              compactingConversations.current.delete(conversationId);
+              activeCompactionActivities.current.delete(conversationId);
+              setRuntimeCompacting(conversationId, false);
+              updateConversation(conversationId, (conversation) => conversation.status === "tool"
+                ? { ...conversation, status: pending.previousStatus }
+                : conversation);
+              addActivity(conversationId, {
+                id: activityId,
+                type: "compaction_end",
+                title: "Compactage non démarré",
+                detail: error instanceof Error ? error.message : String(error),
+                status: "error",
+              });
+            }
+            rejectCompaction(error instanceof Error ? error : new Error(String(error)));
+          }
+          throw error;
+        }
+        return;
+      }
       if (type === "export_html") {
         const exportConversationId = selectedConversation.id;
         const exportConversationTitle = selectedConversation.title;
@@ -2225,7 +2683,7 @@ export function useAgentRuntime(options: {
       }
       await sendRpc(selectedConversation.id, { id: uid(type), type, ...fields });
     },
-    [addActivity, awaitMaintenanceRefresh, cancelConversationRequests, cancelPersistentConversationRequests, detection?.mode, ensureProcessStarted, ensureStarted, loadConversationHistory, onNotice, selectedConversation, selectedProject, sendConversationRequest, sendSelectionRequest, updateConversation],
+    [addActivity, awaitMaintenanceRefresh, cancelConversationRequests, cancelPersistentConversationRequests, detection?.mode, ensureProcessStarted, ensureStarted, loadConversationHistory, onNotice, recentCompactionEnd, selectedConversation, selectedProject, sendConversationRequest, sendSelectionRequest, setRuntimeCompacting, settleCompactionWaiter, updateConversation],
   );
 
   const observeSubagent = useCallback(async (activeSessionId?: string) => {
@@ -2395,6 +2853,7 @@ export function useAgentRuntime(options: {
     commands: runtime?.commands ?? [],
     stats: runtime?.stats,
     sessionState: runtime?.state,
+    isCompacting: runtime?.isCompacting ?? runtime?.state?.isCompacting ?? false,
     schedules: runtime?.schedules ?? [],
     heartbeat: runtime?.heartbeat,
     heartbeats: runtime?.heartbeats ?? [],

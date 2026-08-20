@@ -490,6 +490,7 @@ function App() {
             commands={agent.commands}
             stats={agent.stats}
             sessionState={agent.sessionState}
+            isCompacting={agent.isCompacting}
             schedules={agent.schedules}
             heartbeat={agent.heartbeat}
             heartbeats={agent.heartbeats}

@@ -89,6 +89,7 @@ interface ConversationViewProps {
   commands: SlashCommand[];
   stats?: SessionStats;
   sessionState?: AgentSessionState;
+  isCompacting?: boolean;
   schedules?: AgentSchedule[];
   heartbeat?: AgentSchedule | null;
   heartbeats?: AgentHeartbeatSummary[];
@@ -254,9 +255,10 @@ export function resolveComposerDraftAfterSelection(
 }
 
 export function ConversationView(props: ConversationViewProps) {
-  const { project, conversation, models, commands, stats, sessionState, schedules = [], heartbeat, heartbeats = [], subagents = [], observedSubagent, inspectorOpen, changes, resourceReloadSupported, onToggleInspector, onDraftChange, onSend, onMutateQueuedMessage, onRetryMessage, onAbort, onModel, onThinking, onRunCommand, onObserveSubagent, onForkMessage, onCloneSession, onNewWindow, onOpenTerminal } = props;
+  const { project, conversation, models, commands, stats, sessionState, isCompacting: runtimeCompacting = false, schedules = [], heartbeat, heartbeats = [], subagents = [], observedSubagent, inspectorOpen, changes, resourceReloadSupported, onToggleInspector, onDraftChange, onSend, onMutateQueuedMessage, onRetryMessage, onAbort, onModel, onThinking, onRunCommand, onObserveSubagent, onForkMessage, onCloneSession, onNewWindow, onOpenTerminal } = props;
   const { language } = useI18n();
-  const isRunning = ["starting", "streaming", "tool", "queued"].includes(conversation.status);
+  const isCompacting = runtimeCompacting || Boolean(sessionState?.isCompacting);
+  const isRunning = !isCompacting && ["starting", "streaming", "tool", "queued"].includes(conversation.status);
   const [inspectorTab, setInspectorTab] = useState<"activity" | "session" | "changes" | "details">("changes");
   const [openPopover, setOpenPopover] = useState<ConversationPopover>(null);
   const [restartDialogOpen, setRestartDialogOpen] = useState(false);
@@ -315,6 +317,7 @@ export function ConversationView(props: ConversationViewProps) {
         />
         <Transcript conversation={conversation} project={project} onSuggestion={(text) => onDraftChange(text)} onRunCommand={onRunCommand} onRetryMessage={onRetryMessage} onForkMessage={onForkMessage} />
         {isRunning ? <ActiveRunBar conversation={conversation} onAbort={onAbort} onActivity={() => { setInspectorTab("activity"); if (!inspectorOpen) onToggleInspector(); }} /> : null}
+        {isCompacting ? <CompactionStatusBar /> : null}
         <Composer
           key={conversation.id}
           project={project}
@@ -325,6 +328,7 @@ export function ConversationView(props: ConversationViewProps) {
           sessionState={sessionState}
           resourceReloadSupported={resourceReloadSupported}
           isRunning={isRunning}
+          isCompacting={isCompacting}
           onDraftChange={onDraftChange}
           onSend={onSend}
           onMutateQueuedMessage={onMutateQueuedMessage}
@@ -343,6 +347,7 @@ export function ConversationView(props: ConversationViewProps) {
           conversation={conversation}
           stats={stats}
           sessionState={sessionState}
+          isCompacting={isCompacting}
           schedules={schedules}
           heartbeat={heartbeat}
           heartbeats={heartbeats}
@@ -500,7 +505,7 @@ function Transcript({ conversation, project, onSuggestion, onRunCommand, onRetry
           <div className="transcript-date"><span>{bi(language, "Aujourd’hui", "Today")}</span></div>
           {entries.map((entry) => entry.kind === "message"
             ? <MessageItem key={entry.message.id} message={entry.message} onRetryMessage={onRetryMessage} onForkMessage={onForkMessage} />
-            : <PythonTranscriptRun key={entry.id} messages={entry.messages} tools={entry.tools} onRetryMessage={onRetryMessage} onForkMessage={onForkMessage} />)}
+            : <AssistantTurn key={entry.id} messages={entry.messages} onRetryMessage={onRetryMessage} onForkMessage={onForkMessage} />)}
           {conversation.lastError ? (
             <div className="inline-error"><Info size={17} /><div><strong>{bi(language, "Prime Agent a besoin d’attention", "Prime Agent needs attention")}</strong><p>{conversation.lastError}</p></div><Button variant="ghost" onClick={() => void onRunCommand("get_state")}>{bi(language, "Réessayer", "Retry")}</Button></div>
           ) : null}
@@ -600,21 +605,22 @@ function ConversationWelcome({ project, onSuggestion }: { project: Project; onSu
 function MessageItem({ message, onRetryMessage, onForkMessage, showTools = true }: { message: ChatMessage; onRetryMessage: (assistantMessageId: string) => Promise<void>; onForkMessage: (assistantMessageId: string) => Promise<void>; showTools?: boolean }) {
   const { language, locale } = useI18n();
   const isUser = message.role === "user";
+  const isSystem = message.role === "system";
   return (
     <article className={`message message-${message.role}`}>
-      <div className="message-avatar">{isUser ? "ZE" : <span className="mini-orbit"><span /></span>}</div>
+      <div className="message-avatar" aria-hidden="true">{isUser ? "ZE" : isSystem ? <Info size={14} /> : <span className="mini-orbit"><span /></span>}</div>
       <div className="message-column">
-        <header className="message-header"><strong>{isUser ? bi(language, "Vous", "You") : "Prime Agent"}</strong><time>{formatTime(message.createdAt, locale)}</time>{message.model ? <Badge>{shortModel(message.model)}</Badge> : null}</header>
+        <header className="message-header"><strong>{isUser ? bi(language, "Vous", "You") : isSystem ? bi(language, "Système", "System") : "Prime Agent"}</strong><time dateTime={message.createdAt}>{formatTime(message.createdAt, locale)}</time>{message.model ? <Badge>{shortModel(message.model)}</Badge> : null}</header>
         <div className={isUser ? "user-message-card" : "assistant-message-body"}>
           {message.attachments?.length ? <AttachmentStrip attachments={message.attachments} /> : null}
           <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
             a: ({ children, ...props }) => <a {...props} target="_blank" rel="noreferrer">{children}</a>,
             code: ({ children, className, ...props }) => <code {...props} className={className}>{children}</code>,
           }}>{message.content || (message.status === "streaming" ? " " : "")}</ReactMarkdown>
-          {message.status === "streaming" ? <span className="streaming-cursor" /> : null}
+          {message.status === "streaming" ? <span className="streaming-cursor" aria-hidden="true" /> : null}
         </div>
         {showTools && message.tools?.length ? <MessageToolSequence tools={message.tools} /> : null}
-        {!isUser && message.status === "complete" && message.content.trim() ? (
+        {message.role === "assistant" && message.status === "complete" && message.content.trim() ? (
           <footer className="message-actions">
             <IconButton label={bi(language, "Copier la réponse", "Copy response")} onClick={() => void navigator.clipboard.writeText(message.content)}><Copy size={14} /></IconButton>
             <IconButton label={bi(language, "Réutiliser le texte dans le composeur", "Reuse text in the composer")} onClick={() => void onRetryMessage(message.id)}><RefreshCw size={14} /></IconButton>
@@ -629,66 +635,108 @@ function MessageItem({ message, onRetryMessage, onForkMessage, showTools = true 
   );
 }
 
-type TranscriptEntry =
+function AssistantTurn({ messages, onRetryMessage, onForkMessage }: { messages: ChatMessage[]; onRetryMessage: (assistantMessageId: string) => Promise<void>; onForkMessage: (assistantMessageId: string) => Promise<void> }) {
+  const { language, locale } = useI18n();
+  const firstMessage = messages[0]!;
+  const model = [...messages].reverse().find((message) => message.model)?.model;
+  const segments = buildAssistantTurnSegments(messages);
+  const actionMessage = [...messages].reverse().find((message) => message.status === "complete" && message.content.trim());
+  const isActive = messages.some((message) => message.status === "pending"
+    || message.status === "streaming"
+    || message.tools?.some((tool) => tool.status === "queued" || tool.status === "running"));
+  const copyText = messages.map((message) => message.content.trim()).filter(Boolean).join("\n\n");
+  const durationMs = messages.reduce((total, message) => total + (message.durationMs ?? 0), 0);
+  const totalTokens = messages.reduce((total, message) => total + (message.usage?.total ?? 0), 0);
+
+  return (
+    <article className="message message-assistant message-agent-turn" aria-busy={isActive || undefined}>
+      <div className="message-avatar" aria-hidden="true"><span className="mini-orbit"><span /></span></div>
+      <div className="message-column">
+        <header className="message-header"><strong>Prime Agent</strong><time dateTime={firstMessage.createdAt}>{formatTime(firstMessage.createdAt, locale)}</time>{model ? <Badge>{shortModel(model)}</Badge> : null}</header>
+        {isActive ? <span className="visually-hidden" role="status">{bi(language, "Prime Agent poursuit ce tour.", "Prime Agent is continuing this turn.")}</span> : null}
+        <div className="assistant-turn-sequence">
+          {segments.map((segment) => segment.kind === "content" ? (
+            <div className={`assistant-turn-content ${segment.message.status === "error" ? "is-error" : ""}`} key={segment.id}>
+              {segment.message.attachments?.length ? <AttachmentStrip attachments={segment.message.attachments} /> : null}
+              <div className="assistant-message-body">
+                <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
+                  a: ({ children, ...props }) => <a {...props} target="_blank" rel="noreferrer">{children}</a>,
+                  code: ({ children, className, ...props }) => <code {...props} className={className}>{children}</code>,
+                }}>{segment.message.content || (segment.message.status === "streaming" ? " " : "")}</ReactMarkdown>
+                {segment.message.status === "streaming" ? <span className="streaming-cursor" aria-hidden="true" /> : null}
+              </div>
+              {segment.message.status === "error" ? <p className="assistant-turn-error" role="alert"><CircleAlert size={14} />{bi(language, "Cette partie de la réponse a été interrompue.", "This part of the response was interrupted.")}</p> : null}
+            </div>
+          ) : <MessageToolSequence key={segment.id} tools={segment.tools} />)}
+        </div>
+        {!isActive && actionMessage ? (
+          <footer className="message-actions">
+            <IconButton label={bi(language, "Copier la réponse", "Copy response")} onClick={() => void navigator.clipboard.writeText(copyText)}><Copy size={14} /></IconButton>
+            <IconButton label={bi(language, "Réutiliser le texte dans le composeur", "Reuse text in the composer")} onClick={() => void onRetryMessage(actionMessage.id)}><RefreshCw size={14} /></IconButton>
+            <IconButton label={bi(language, "Créer une branche depuis ce tour", "Branch from this turn")} onClick={() => void onForkMessage(actionMessage.id)}><GitBranch size={14} /></IconButton>
+            <span />
+            {durationMs > 0 ? <small><Clock3 size={12} /> {formatDuration(durationMs)}</small> : null}
+            {totalTokens > 0 ? <small>{compactNumber(totalTokens, locale)} tokens</small> : null}
+          </footer>
+        ) : null}
+      </div>
+    </article>
+  );
+}
+
+export type TranscriptEntry =
   | { kind: "message"; message: ChatMessage }
-  | { kind: "python-run"; id: string; messages: ChatMessage[]; tools: ToolActivity[] };
+  | { kind: "assistant-turn"; id: string; messages: ChatMessage[] };
 
 /**
- * A user message, visible non-Python tool, or mixed tool set always starts a new
- * block. Only uninterrupted assistant messages containing Python tools alone are
- * folded together; their visible text is still rendered in its original order.
+ * Prime Agent may emit several assistant messages while completing one user
+ * turn. Preserve their source order but expose them as one visual transcript
+ * entry until a user or system message creates an explicit boundary.
  */
-function buildTranscriptEntries(messages: ChatMessage[]): TranscriptEntry[] {
+export function buildTranscriptEntries(messages: ChatMessage[]): TranscriptEntry[] {
   const entries: TranscriptEntry[] = [];
   for (let index = 0; index < messages.length;) {
     const message = messages[index]!;
-    if (!isPythonOnlyAssistantMessage(message)) {
+    if (message.role !== "assistant") {
       entries.push({ kind: "message", message });
       index += 1;
       continue;
     }
 
-    const runMessages: ChatMessage[] = [];
-    const tools: ToolActivity[] = [];
+    const turnMessages: ChatMessage[] = [];
     let cursor = index;
-    while (cursor < messages.length && isPythonOnlyAssistantMessage(messages[cursor]!)) {
-      const candidate = messages[cursor]!;
-      runMessages.push(candidate);
-      tools.push(...(candidate.tools ?? []));
+    while (cursor < messages.length && messages[cursor]!.role === "assistant") {
+      turnMessages.push(messages[cursor]!);
       cursor += 1;
     }
 
-    const uniqueTools = mergeToolCalls(tools);
-    if (uniqueTools.length < 2) {
-      runMessages.forEach((candidate) => entries.push({ kind: "message", message: candidate }));
-    } else {
-      entries.push({ kind: "python-run", id: `python-run:${runMessages[0]!.id}`, messages: runMessages, tools: uniqueTools });
-    }
+    entries.push({ kind: "assistant-turn", id: `assistant-turn:${turnMessages[0]!.id}`, messages: turnMessages });
     index = cursor;
   }
   return entries;
 }
 
-function isPythonOnlyAssistantMessage(message: ChatMessage) {
-  return message.role === "assistant" && Boolean(message.tools?.length) && message.tools!.every(isPythonTool);
-}
+type AssistantTurnSegment =
+  | { kind: "content"; id: string; message: ChatMessage }
+  | { kind: "tools"; id: string; tools: ToolActivity[] };
 
-function PythonTranscriptRun({ messages, tools, onRetryMessage, onForkMessage }: { messages: ChatMessage[]; tools: ToolActivity[]; onRetryMessage: (assistantMessageId: string) => Promise<void>; onForkMessage: (assistantMessageId: string) => Promise<void> }) {
-  const { language, locale } = useI18n();
-  const visibleMessages = messages.filter((message) => message.content.trim() || (message.attachments?.length ?? 0) > 0);
-  const lastMessage = messages.at(-1)!;
-  return (
-    <>
-      {visibleMessages.map((message) => <MessageItem key={message.id} message={message} onRetryMessage={onRetryMessage} onForkMessage={onForkMessage} showTools={false} />)}
-      <article className="message message-assistant message-python-run">
-        <div className="message-avatar"><span className="mini-orbit"><span /></span></div>
-        <div className="message-column">
-          <header className="message-header"><strong>Prime Agent</strong><time>{formatTime(lastMessage.createdAt, locale)}</time><Badge>{bi(language, "Séquence technique", "Technical sequence")}</Badge></header>
-          <div className="message-tools"><PythonExecutionGroup tools={tools} /></div>
-        </div>
-      </article>
-    </>
-  );
+export function buildAssistantTurnSegments(messages: ChatMessage[]): AssistantTurnSegment[] {
+  const segments: AssistantTurnSegment[] = [];
+  for (const message of messages) {
+    if (message.content.trim() || (message.attachments?.length ?? 0) > 0 || message.status === "streaming") {
+      segments.push({ kind: "content", id: `content:${message.id}`, message });
+    }
+    if (!message.tools?.length) continue;
+
+    const tools = mergeToolCalls(message.tools);
+    const previous = segments.at(-1);
+    if (tools.every(isPythonTool) && previous?.kind === "tools" && previous.tools.every(isPythonTool)) {
+      previous.tools = mergeToolCalls([...previous.tools, ...tools]);
+      continue;
+    }
+    segments.push({ kind: "tools", id: `tools:${message.id}`, tools });
+  }
+  return segments;
 }
 
 function MessageToolSequence({ tools }: { tools: ToolActivity[] }) {
@@ -876,6 +924,19 @@ function ActiveRunBar({ conversation, onAbort, onActivity }: { conversation: Con
   );
 }
 
+function CompactionStatusBar() {
+  const { language } = useI18n();
+  return (
+    <div className="compaction-status-bar" role="status" aria-live="polite">
+      <span className="compaction-status-icon" aria-hidden="true"><LoaderCircle size={16} className="spin" /></span>
+      <div>
+        <strong>{bi(language, "Compactage du contexte en cours…", "Compacting context…")}</strong>
+        <small>{bi(language, "La session reste active. Les nouveaux messages seront ajoutés à la file.", "The session stays active. New messages will be added to the queue.")}</small>
+      </div>
+    </div>
+  );
+}
+
 /** Attachment handles are ephemeral native capabilities, so they are kept in
  * this renderer window only. This preserves an unsent composer when navigating
  * between conversations without ever serializing the handles to app state. */
@@ -918,7 +979,7 @@ export async function releaseAllConversationAttachmentDrafts() {
   await releaseConversationAttachmentDrafts([...conversationAttachmentDrafts.keys()]);
 }
 
-function Composer({ project, conversation, models, commands, stats, sessionState, resourceReloadSupported, isRunning, onDraftChange, onSend, onMutateQueuedMessage, onAbort, onModel, onThinking, onRunCommand, openPopover, onTogglePopover, onClosePopover }: {
+function Composer({ project, conversation, models, commands, stats, sessionState, resourceReloadSupported, isRunning, isCompacting, onDraftChange, onSend, onMutateQueuedMessage, onAbort, onModel, onThinking, onRunCommand, openPopover, onTogglePopover, onClosePopover }: {
   project: Project;
   conversation: Conversation;
   models: ModelInfo[];
@@ -927,6 +988,7 @@ function Composer({ project, conversation, models, commands, stats, sessionState
   sessionState?: AgentSessionState;
   resourceReloadSupported: boolean;
   isRunning: boolean;
+  isCompacting: boolean;
   onDraftChange: (draft: string) => void;
   onSend: (message: string, attachments: Attachment[], delivery?: "steer" | "follow_up") => Promise<void>;
   onMutateQueuedMessage: (input: { messageId: string; lane: "steering" | "followUp"; index: number; expectedText: string; mutation: { type: "delete" } | { type: "replace"; text: string; lane: "steering" | "followUp" } }) => Promise<void>;
@@ -963,13 +1025,23 @@ function Composer({ project, conversation, models, commands, stats, sessionState
   const [slashDismissed, setSlashDismissed] = useState(false);
   const [composerFocused, setComposerFocused] = useState(false);
   const [commandError, setCommandError] = useState<string>();
+  const [toolActionBusy, setToolActionBusy] = useState<"compact" | "refine">();
   const textarea = useRef<HTMLTextAreaElement>(null);
   const slashList = useRef<HTMLDivElement>(null);
   const activeModel = models.find((model) => `${model.provider}/${model.id}` === conversation.model);
-  const slashCommands = useMemo(
-    () => buildComposerSlashCommands(commands, language, resourceReloadSupported),
-    [commands, language, resourceReloadSupported],
-  );
+  const isBusy = isRunning || isCompacting;
+  const compactDisabledReason = isCompacting
+    ? bi(language, "Un compactage du contexte est déjà en cours.", "Context compaction is already in progress.")
+    : isRunning
+      ? bi(language, "Attendez la fin du tour actif avant de compacter le contexte.", "Wait for the active run to finish before compacting context.")
+      : undefined;
+  const slashCommands = useMemo(() => (
+    buildComposerSlashCommands(commands, language, resourceReloadSupported).map((command) => (
+      command.name === "compact" && compactDisabledReason
+        ? { ...command, disabledReason: compactDisabledReason }
+        : command
+    ))
+  ), [commands, compactDisabledReason, language, resourceReloadSupported]);
   const activeSlashCommand = parseActiveComposerSlashCommand(draft, slashCommands);
   const editorValue = activeSlashCommand?.argument ?? draft;
   const slashQuery = !activeSlashCommand && editorValue.startsWith("/") && !/\s/.test(editorValue)
@@ -1103,6 +1175,20 @@ function Composer({ project, conversation, models, commands, stats, sessionState
     requestAnimationFrame(() => textarea.current?.focus());
   };
 
+  const runToolAction = async (action: "compact" | "refine") => {
+    if (toolActionBusy) return;
+    setToolActionBusy(action);
+    setCommandError(undefined);
+    onClosePopover();
+    try {
+      await onRunCommand(action);
+    } catch (error) {
+      setCommandError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setToolActionBusy(undefined);
+    }
+  };
+
   const chooseSlashCommand = async (command: ComposerSlashCommand) => {
     setSlashDismissed(true);
     setCommandError(undefined);
@@ -1125,6 +1211,10 @@ function Composer({ project, conversation, models, commands, stats, sessionState
   };
 
   const submit = async (delivery?: "steer" | "follow_up") => {
+    if (activeSlashCommand?.command.disabledReason) {
+      setCommandError(activeSlashCommand.command.disabledReason);
+      return;
+    }
     const actionSubmission = resolveComposerActionSubmission(draft, slashCommands);
     if (actionSubmission) {
       if (submittingRef.current) return;
@@ -1225,7 +1315,7 @@ function Composer({ project, conversation, models, commands, stats, sessionState
     }
     if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault();
-      void submit(isRunning ? "follow_up" : undefined);
+      void submit(isBusy ? "follow_up" : undefined);
     }
     if (event.key === "Escape" && isRunning) void onAbort();
   };
@@ -1511,7 +1601,7 @@ function Composer({ project, conversation, models, commands, stats, sessionState
       {attachmentError ? <p className="trust-note" role="alert"><Info size={14} />{attachmentError}</p> : null}
       {commandError ? <p className="trust-note composer-command-error" role="alert"><CircleAlert size={14} />{commandError}</p> : null}
       <div className="composer-editor">
-        <textarea ref={textarea} value={editorValue} onChange={(event) => updateEditorValue(event.target.value)} onKeyDown={handleKeyDown} onPaste={handlePaste} onFocus={() => setComposerFocused(true)} onBlur={() => { setComposerFocused(false); if (draftRef.current !== reportedDraftRef.current) reportDraftNow(draftRef.current); }} placeholder={activeSlashCommand ? activeSlashCommand.command.description : isRunning ? bi(language, "Ajoutez une instruction à la suite…", "Add a follow-up instruction…") : `${bi(language, "Demandez quelque chose sur", "Ask something about")} ${project.name}…`} rows={1} aria-label={bi(language, "Message à Prime Agent", "Message Prime Agent")} aria-autocomplete="list" aria-expanded={slashPaletteOpen} aria-controls={slashPaletteOpen ? "composer-slash-command-list" : undefined} aria-activedescendant={slashPaletteOpen ? `composer-slash-command-${Math.min(slashSelection, filteredSlashCommands.length - 1)}` : undefined} />
+        <textarea ref={textarea} value={editorValue} onChange={(event) => updateEditorValue(event.target.value)} onKeyDown={handleKeyDown} onPaste={handlePaste} onFocus={() => setComposerFocused(true)} onBlur={() => { setComposerFocused(false); if (draftRef.current !== reportedDraftRef.current) reportDraftNow(draftRef.current); }} placeholder={activeSlashCommand ? activeSlashCommand.command.description : isCompacting ? bi(language, "Ajoutez un message après le compactage…", "Add a message after compaction…") : isRunning ? bi(language, "Ajoutez une instruction à la suite…", "Add a follow-up instruction…") : `${bi(language, "Demandez quelque chose sur", "Ask something about")} ${project.name}…`} rows={1} aria-label={bi(language, "Message à Prime Agent", "Message Prime Agent")} aria-autocomplete="list" aria-expanded={slashPaletteOpen} aria-controls={slashPaletteOpen ? "composer-slash-command-list" : undefined} aria-activedescendant={slashPaletteOpen ? `composer-slash-command-${Math.min(slashSelection, filteredSlashCommands.length - 1)}` : undefined} />
       </div>
       <div className="composer-toolbar">
         <div className="composer-tools-left">
@@ -1519,7 +1609,7 @@ function Composer({ project, conversation, models, commands, stats, sessionState
           {activeSlashCommand ? <button type="button" className="active-slash-command" onClick={clearActiveSlashCommand} title={bi(language, `Retirer la commande /${activeSlashCommand.command.name}`, `Remove /${activeSlashCommand.command.name} command`)}>{slashCommandIcon(activeSlashCommand.command)}<span>{activeSlashCommand.command.label}</span><X size={12} /></button> : null}
           <div className="composer-popover-wrap" data-dismissable-layer="composer-tools">
             <button type="button" className="composer-chip" aria-haspopup="menu" aria-expanded={openPopover === "composer-tools"} onClick={() => onTogglePopover("composer-tools")}><Box size={14} />{bi(language, "Outils", "Tools")}<ChevronDown size={13} /></button>
-            {openPopover === "composer-tools" ? <ToolsPopover commands={commands} onChoose={(command) => { updateDraft(`/${command.name} `); onClosePopover(); textarea.current?.focus(); }} onCompact={() => { void onRunCommand("compact"); onClosePopover(); }} onRefine={() => { void onRunCommand("refine"); onClosePopover(); }} /> : null}
+            {openPopover === "composer-tools" ? <ToolsPopover commands={commands} busyAction={toolActionBusy} compactDisabledReason={compactDisabledReason} onChoose={(command) => { updateDraft(`/${command.name} `); onClosePopover(); textarea.current?.focus(); }} onCompact={() => void runToolAction("compact")} onRefine={() => void runToolAction("refine")} /> : null}
           </div>
           <div className="composer-popover-wrap" data-dismissable-layer="composer-queue">
             <button type="button" className="composer-chip permission-chip" aria-haspopup="menu" aria-expanded={openPopover === "composer-queue"} title={bi(language, "File d’instructions réellement gérée par Prime Agent", "Instruction queue managed by Prime Agent")} onClick={() => onTogglePopover("composer-queue")}><Layers3 size={14} />{queueLabel(sessionState, language)}<ChevronDown size={13} /></button>
@@ -1537,19 +1627,20 @@ function Composer({ project, conversation, models, commands, stats, sessionState
             {openPopover === "composer-thinking" ? <ThinkingPopover active={conversation.thinkingLevel} onChoose={(level) => { void onThinking(level); onClosePopover(); }} /> : null}
           </div>
           {isRunning ? <IconButton label={bi(language, "Arrêter l’exécution", "Stop run")} className="composer-stop" onClick={() => void onAbort()}><CircleStop size={18} /></IconButton> : null}
-          {isRunning ? <button type="button" className="queued-force-send" disabled={!hasComposerContent || adding} onClick={() => void submit("steer")} title={bi(language, "Livrer après les outils en cours, avant le prochain appel au modèle", "Deliver after current tools, before the next model call")}><Zap size={15} />{bi(language, "Orienter", "Steer")}</button> : null}
-          <button type="button" className={`send-button ${hasComposerContent ? "is-ready" : ""}`} disabled={!hasComposerContent || adding} onClick={() => void submit(isRunning ? "follow_up" : undefined)} aria-label={isRunning ? bi(language, "Ajouter à la file", "Add to queue") : bi(language, "Envoyer", "Send")} title={isRunning ? bi(language, "Attendre la fin puis démarrer un nouveau tour", "Wait for completion, then start a new turn") : bi(language, "Envoyer (Entrée)", "Send (Enter)")}>{isRunning ? <Layers3 size={18} /> : <Send size={18} />}</button>
+          {isRunning && !isCompacting ? <button type="button" className="queued-force-send" disabled={!hasComposerContent || adding} onClick={() => void submit("steer")} title={bi(language, "Livrer après les outils en cours, avant le prochain appel au modèle", "Deliver after current tools, before the next model call")}><Zap size={15} />{bi(language, "Orienter", "Steer")}</button> : null}
+          <button type="button" className={`send-button ${hasComposerContent ? "is-ready" : ""}`} disabled={!hasComposerContent || adding} onClick={() => void submit(isBusy ? "follow_up" : undefined)} aria-label={isBusy ? bi(language, "Ajouter à la file", "Add to queue") : bi(language, "Envoyer", "Send")} title={isBusy ? bi(language, "Attendre la fin puis démarrer un nouveau tour", "Wait for completion, then start a new turn") : bi(language, "Envoyer (Entrée)", "Send (Enter)")}>{isBusy ? <Layers3 size={18} /> : <Send size={18} />}</button>
         </div>
       </div>
     </div>
   );
 }
 
-function RunInspector({ project, conversation, stats, sessionState, schedules, heartbeat, heartbeats, subagents, observedSubagent, changes, tab, onTab, onClose, onRunCommand, onObserveSubagent, onCloneSession, onDraftChange }: {
+function RunInspector({ project, conversation, stats, sessionState, isCompacting, schedules, heartbeat, heartbeats, subagents, observedSubagent, changes, tab, onTab, onClose, onRunCommand, onObserveSubagent, onCloneSession, onDraftChange }: {
   project: Project;
   conversation: Conversation;
   stats?: SessionStats;
   sessionState?: AgentSessionState;
+  isCompacting: boolean;
   schedules: AgentSchedule[];
   heartbeat?: AgentSchedule | null;
   heartbeats: AgentHeartbeatSummary[];
@@ -1579,7 +1670,7 @@ function RunInspector({ project, conversation, stats, sessionState, schedules, h
         {tab === "activity" ? <ActivityPanel activities={conversation.activities} conversation={conversation} /> : null}
         {tab === "session" ? <SessionPanel project={project} conversation={conversation} sessionState={sessionState} schedules={schedules} heartbeat={heartbeat} heartbeats={heartbeats} subagents={subagents} observedSubagent={observedSubagent} onRunCommand={onRunCommand} onObserveSubagent={onObserveSubagent} /> : null}
         {tab === "changes" ? <ChangesPanel projectPath={project.path} changes={changes} draft={conversation.draft} onDraftChange={onDraftChange} /> : null}
-        {tab === "details" ? <DetailsPanel project={project} conversation={conversation} stats={stats} sessionState={sessionState} onRunCommand={onRunCommand} onCloneSession={onCloneSession} /> : null}
+        {tab === "details" ? <DetailsPanel project={project} conversation={conversation} stats={stats} sessionState={sessionState} isCompacting={isCompacting} onRunCommand={onRunCommand} onCloneSession={onCloneSession} /> : null}
       </div>
     </aside>
   );
@@ -1858,10 +1949,11 @@ function ChangesPanel({ projectPath, changes, draft, onDraftChange }: { projectP
   );
 }
 
-function DetailsPanel({ project, conversation, stats, sessionState, onRunCommand, onCloneSession }: { project: Project; conversation: Conversation; stats?: SessionStats; sessionState?: AgentSessionState; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onCloneSession: () => Promise<void> }) {
+function DetailsPanel({ project, conversation, stats, sessionState, isCompacting, onRunCommand, onCloneSession }: { project: Project; conversation: Conversation; stats?: SessionStats; sessionState?: AgentSessionState; isCompacting: boolean; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onCloneSession: () => Promise<void> }) {
   const { language, locale } = useI18n();
   const [busyAction, setBusyAction] = useState<string>();
   const [actionError, setActionError] = useState<string>();
+  const conversationBusy = ["starting", "streaming", "tool", "queued"].includes(conversation.status);
   const runAction = async (key: string, action: () => Promise<void>) => {
     if (busyAction) return;
     setBusyAction(key);
@@ -1885,19 +1977,20 @@ function DetailsPanel({ project, conversation, stats, sessionState, onRunCommand
       <div className="section-title"><span>{bi(language, "Configuration", "Configuration")}</span></div>
       <dl className="details-list"><div><dt>{bi(language, "Modèle", "Model")}</dt><dd>{sessionState?.model?.name ?? shortModel(conversation.model) ?? bi(language, "Par défaut", "Default")}</dd></div><div><dt>{bi(language, "Raisonnement", "Reasoning")}</dt><dd>{thinkingLabel(conversation.thinkingLevel, language)}</dd></div><div><dt>{bi(language, "Projet", "Project")}</dt><dd>{project.name}</dd></div><div><dt>Session</dt><dd className="mono">{sessionState?.sessionId?.slice(0, 12) ?? conversation.sessionId?.slice(0, 12) ?? bi(language, "En attente", "Pending")}</dd></div><div><dt>{bi(language, "Persistance", "Persistence")}</dt><dd>{conversation.sessionPath ? bi(language, "Activée", "Enabled") : bi(language, "Nouvelle session", "New session")}</dd></div></dl>
       <div className="section-title"><span>{bi(language, "Maintenance", "Maintenance")}</span></div>
-      <div className="maintenance-actions"><Button variant="secondary" loading={busyAction === "compact"} disabled={Boolean(busyAction)} onClick={() => void runAction("compact", () => onRunCommand("compact"))}><ArchiveRestore size={15} />{bi(language, "Compacter", "Compact")}</Button><Button variant="secondary" loading={busyAction === "refine"} disabled={Boolean(busyAction)} onClick={() => void runAction("refine", () => onRunCommand("refine"))}><WandSparkles size={15} />{bi(language, "Raffiner", "Refine")}</Button><Button variant="secondary" loading={busyAction === "clone"} disabled={Boolean(busyAction)} onClick={() => void runAction("clone", onCloneSession)}><Copy size={15} />{bi(language, "Dupliquer", "Duplicate")}</Button><Button variant="secondary" loading={busyAction === "export_html"} disabled={Boolean(busyAction)} onClick={() => void runAction("export_html", () => onRunCommand("export_html"))}><ArrowDown size={15} />{bi(language, "Exporter", "Export")}</Button></div>
+      {isCompacting ? <p className="maintenance-status" role="status"><LoaderCircle size={14} className="spin" />{bi(language, "Compactage en cours. Les statistiques seront actualisées à la fin.", "Compaction in progress. Statistics will refresh when it finishes.")}</p> : null}
+      <div className="maintenance-actions"><Button variant="secondary" loading={isCompacting || busyAction === "compact"} disabled={Boolean(busyAction) || conversationBusy || isCompacting} onClick={() => void runAction("compact", () => onRunCommand("compact"))}><ArchiveRestore size={15} />{bi(language, "Compacter", "Compact")}</Button><Button variant="secondary" loading={busyAction === "refine"} disabled={Boolean(busyAction) || isCompacting} onClick={() => void runAction("refine", () => onRunCommand("refine"))}><WandSparkles size={15} />{bi(language, "Raffiner", "Refine")}</Button><Button variant="secondary" loading={busyAction === "clone"} disabled={Boolean(busyAction)} onClick={() => void runAction("clone", onCloneSession)}><Copy size={15} />{bi(language, "Dupliquer", "Duplicate")}</Button><Button variant="secondary" loading={busyAction === "export_html"} disabled={Boolean(busyAction)} onClick={() => void runAction("export_html", () => onRunCommand("export_html"))}><ArrowDown size={15} />{bi(language, "Exporter", "Export")}</Button></div>
       {actionError ? <p className="popover-inline-error" role="alert"><CircleAlert size={14} />{actionError}</p> : null}
     </div>
   );
 }
 
-function ToolsPopover({ commands, onChoose, onCompact, onRefine }: { commands: SlashCommand[]; onChoose: (command: SlashCommand) => void; onCompact: () => void; onRefine: () => void }) {
+function ToolsPopover({ commands, busyAction, compactDisabledReason, onChoose, onCompact, onRefine }: { commands: SlashCommand[]; busyAction?: "compact" | "refine"; compactDisabledReason?: string; onChoose: (command: SlashCommand) => void; onCompact: () => void; onRefine: () => void }) {
   const { language } = useI18n();
   return (
     <div className="popover tools-popover">
       <div className="popover-label">{bi(language, "Actions rapides", "Quick actions")}</div>
-      <button type="button" onClick={onCompact}><ArchiveRestore size={15} /><span><strong>{bi(language, "Compacter le contexte", "Compact context")}</strong><small>{bi(language, "Résumer la session pour libérer de la place", "Summarize the session to free up context")}</small></span></button>
-      <button type="button" onClick={onRefine}><WandSparkles size={15} /><span><strong>{bi(language, "Raffiner le harness", "Refine the harness")}</strong><small>{bi(language, "Capitaliser les apprentissages de la session", "Capture what the session learned")}</small></span></button>
+      <button type="button" onClick={onCompact} disabled={Boolean(compactDisabledReason || busyAction)} title={compactDisabledReason}>{busyAction === "compact" ? <LoaderCircle size={15} className="spin" /> : <ArchiveRestore size={15} />}<span><strong>{bi(language, "Compacter le contexte", "Compact context")}</strong><small>{compactDisabledReason ?? bi(language, "Résumer la session pour libérer de la place", "Summarize the session to free up context")}</small></span></button>
+      <button type="button" onClick={onRefine} disabled={Boolean(busyAction)}>{busyAction === "refine" ? <LoaderCircle size={15} className="spin" /> : <WandSparkles size={15} />}<span><strong>{bi(language, "Raffiner le harness", "Refine the harness")}</strong><small>{bi(language, "Capitaliser les apprentissages de la session", "Capture what the session learned")}</small></span></button>
       {commands.length ? <><div className="popover-separator" /><div className="popover-label">{bi(language, "Skills et commandes", "Skills and commands")}</div>{commands.slice(0, 8).map((command) => <button key={command.name} type="button" onClick={() => onChoose(command)}><Zap size={15} /><span><strong>/{command.name}</strong><small>{command.description ?? command.source}</small></span></button>)}</> : null}
     </div>
   );
