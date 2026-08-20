@@ -176,20 +176,56 @@ jobs:
             throw "Expected exactly one NSIS installer and one MSI installer; found $($nsisInstallers.Count) EXE and $($msiInstallers.Count) MSI."
           }
 
-          $releaseAssetNames = @($release.assets | ForEach-Object { $_.name })
-          foreach ($installer in @($nsisInstallers + $msiInstallers)) {
-            if ($installer.Name -notin $releaseAssetNames) {
-              throw "The uploaded draft does not contain installer '$($installer.Name)'; refusing to publish a checksum for different bytes."
-            }
+          $manifestPath = Join-Path $env:GITHUB_WORKSPACE "latest.json"
+          if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+            throw "tauri-action did not generate latest.json in the workspace."
           }
+          $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+
+          # GitHub may normalize an uploaded filename (for example spaces to
+          # dots). latest.json contains the canonical API URL, so use that URL
+          # to recover the public asset name instead of comparing local names.
+          function Resolve-UpdaterAsset([string]$target, [string]$extension) {
+            $entry = $manifest.platforms.PSObject.Properties[$target].Value
+            if ($null -eq $entry -or [string]::IsNullOrWhiteSpace($entry.url)) {
+              throw "latest.json is missing the URL for '$target'."
+            }
+
+            $matches = @(
+              $release.assets |
+                Where-Object { ([string]$_.url) -ceq ([string]$entry.url) }
+            )
+            if ($matches.Count -ne 1) {
+              throw "Updater target '$target' URL does not match exactly one GitHub release asset API URL."
+            }
+            if (-not ([string]$matches[0].name).EndsWith($extension, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Updater target '$target' resolved to unexpected asset '$($matches[0].name)'."
+            }
+            return $matches[0]
+          }
+
+          $checksumSources = @(
+            [pscustomobject]@{
+              Local = $nsisInstallers[0]
+              Asset = (Resolve-UpdaterAsset "windows-x86_64-nsis" ".exe")
+            },
+            [pscustomobject]@{
+              Local = $msiInstallers[0]
+              Asset = (Resolve-UpdaterAsset "windows-x86_64-msi" ".msi")
+            }
+          )
 
           $version = (Get-Content -Raw package.json | ConvertFrom-Json).version
           $checksumPath = Join-Path $env:GITHUB_WORKSPACE "SHA256SUMS-v$version.txt"
-          $checksumLines = @($nsisInstallers + $msiInstallers) |
-            Sort-Object -Property Name |
+          $checksumLines = $checksumSources |
+            Sort-Object { $_.Asset.name } |
             ForEach-Object {
-              $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
-              "$hash  $($_.Name)"
+              $hash = (Get-FileHash -LiteralPath $_.Local.FullName -Algorithm SHA256).Hash
+              $expectedDigest = "sha256:$($hash.ToLowerInvariant())"
+              if ([int64]$_.Asset.size -ne [int64]$_.Local.Length -or ([string]$_.Asset.digest) -cne $expectedDigest) {
+                throw "GitHub asset '$($_.Asset.name)' does not match the locally built bytes for its updater platform."
+              }
+              "$hash  $($_.Asset.name)"
             }
           $checksumLines | Set-Content -LiteralPath $checksumPath -Encoding utf8NoBOM
 
@@ -284,27 +320,56 @@ jobs:
 
             $artifactName = [string]$artifactAssets[0].name
             $signatureName = "$artifactName.sig"
-            if ($signatureName -notin $assetNames) {
+            $signatureAssets = @(
+              $release.assets |
+                Where-Object { ([string]$_.name) -ceq $signatureName }
+            )
+            if ($signatureAssets.Count -ne 1) {
               throw "Updater target '$target' does not resolve to an uploaded artifact and signature."
             }
 
-            $localSignatures = @(Get-ChildItem -LiteralPath $bundleRoot -Recurse -Filter $signatureName -File)
-            if ($localSignatures.Count -ne 1) {
-              throw "Expected one local signature for '$target'; found $($localSignatures.Count)."
+            $isMsi = $target -eq "windows-x86_64-msi"
+            $bundleKind = if ($isMsi) { "msi" } else { "nsis" }
+            $artifactPattern = if ($isMsi) { "*.msi" } else { "*.exe" }
+            $localArtifacts = @(
+              Get-ChildItem -LiteralPath (Join-Path $bundleRoot $bundleKind) -Filter $artifactPattern -File
+            )
+            if ($localArtifacts.Count -ne 1) {
+              throw "Expected one local updater artifact for '$target'; found $($localArtifacts.Count)."
             }
-            $localSignature = (Get-Content -Raw -LiteralPath $localSignatures[0].FullName).Trim()
+
+            $localSignaturePath = "$($localArtifacts[0].FullName).sig"
+            if (-not (Test-Path -LiteralPath $localSignaturePath -PathType Leaf)) {
+              throw "Expected a local signature beside the '$target' updater artifact."
+            }
+
+            $artifactHash = (Get-FileHash -LiteralPath $localArtifacts[0].FullName -Algorithm SHA256).Hash
+            $artifactDigest = "sha256:$($artifactHash.ToLowerInvariant())"
+            if (
+              [int64]$artifactAssets[0].size -ne [int64]$localArtifacts[0].Length -or
+              ([string]$artifactAssets[0].digest) -cne $artifactDigest
+            ) {
+              throw "Uploaded updater artifact '$artifactName' does not match the locally built '$target' bytes."
+            }
+
+            $localSignatureFile = Get-Item -LiteralPath $localSignaturePath
+            $signatureHash = (Get-FileHash -LiteralPath $localSignaturePath -Algorithm SHA256).Hash
+            $signatureDigest = "sha256:$($signatureHash.ToLowerInvariant())"
+            if (
+              [int64]$signatureAssets[0].size -ne [int64]$localSignatureFile.Length -or
+              ([string]$signatureAssets[0].digest) -cne $signatureDigest
+            ) {
+              throw "Uploaded signature '$signatureName' does not match the locally generated '$target' signature."
+            }
+
+            $localSignature = (Get-Content -Raw -LiteralPath $localSignaturePath).Trim()
             if ($localSignature -ne ([string]$entry.signature).Trim()) {
               throw "latest.json signature does not match the generated signature for '$target'."
             }
 
             if (-not $verifiedArtifacts.ContainsKey($artifactName)) {
-              $localArtifacts = @(Get-ChildItem -LiteralPath $bundleRoot -Recurse -Filter $artifactName -File)
-              if ($localArtifacts.Count -ne 1) {
-                throw "Expected one local updater artifact for '$target'; found $($localArtifacts.Count)."
-              }
-
               $env:PRIME_ORBIT_UPDATER_ARTIFACT = $localArtifacts[0].FullName
-              $env:PRIME_ORBIT_UPDATER_SIGNATURE = $localSignatures[0].FullName
+              $env:PRIME_ORBIT_UPDATER_SIGNATURE = $localSignaturePath
               cargo test --locked --manifest-path src-tauri/Cargo.toml --test updater_signature -- --ignored --exact embedded_public_key_verifies_release_artifact
               if ($LASTEXITCODE -ne 0) {
                 throw "The updater artifact for '$target' is not signed by the public key embedded in Prime Orbit."
