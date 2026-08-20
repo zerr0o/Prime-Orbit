@@ -2167,7 +2167,14 @@ mod attachment_tests {
         .expect("strict attachment context")
         .context_id;
         let context_root = root.join(&context_id);
-        assert_eq!(retained_directory.parent(), Some(context_root.as_path()));
+        let retained_context_root = retained_directory
+            .parent()
+            .expect("staged directory belongs to its context");
+        assert_eq!(
+            crate::paths::canonicalize(retained_context_root)
+                .expect("canonical retained context root"),
+            crate::paths::canonicalize(&context_root).expect("canonical expected context root")
+        );
         reservation.commit();
         assert!(retained_directory.join("attachment.pdf").is_file());
         drop(cache);
