@@ -21,7 +21,10 @@ new Function("module", "exports", "require", buildResult.outputFiles[0].text)(
 const {
   applyAuthoritativeUserMessageStart,
   applyQueueMutationSnapshot,
+  applyRuntimeCompactingState,
   beginPromptTransaction,
+  compactResponseDisposition,
+  compactionEndPresentation,
   commitPromptTransaction,
   durableAttachmentMetadata,
   enqueueExtensionRequest,
@@ -33,8 +36,105 @@ const {
   rollbackPromptTransaction,
   selectForkEntryId,
   shouldApplyHistoryResponse,
+  shouldClearPromptRunAfterQueueDeletion,
   shouldReloadQueuedTranscript,
+  isCompactDaemonAcknowledgementTimeout,
 } = compiledModule.exports;
+
+const COMPACT_ACK_TIMEOUT = 'Timed out after 30000ms waiting for the Prime Agent daemon response to "compact". Endpoint: \\\\.\\pipe\\prime-agent';
+
+test("treats only the exact 30 second compact daemon acknowledgement timeout as pending", () => {
+  const timeout = { command: "compact", success: false, error: COMPACT_ACK_TIMEOUT };
+  assert.equal(isCompactDaemonAcknowledgementTimeout(timeout), true);
+  assert.equal(compactResponseDisposition(timeout, false), "pending");
+  assert.equal(compactResponseDisposition(timeout, true), "lifecycle_handled", "a terminal event always wins the response race");
+  assert.equal(isCompactDaemonAcknowledgementTimeout({ ...timeout, command: "refine" }), false);
+  assert.equal(isCompactDaemonAcknowledgementTimeout({ ...timeout, error: timeout.error.replace("30000ms", "60000ms") }), false);
+  assert.equal(isCompactDaemonAcknowledgementTimeout({ ...timeout, error: "Cannot compact: no model selected" }), false);
+  assert.equal(compactResponseDisposition({ command: "compact", success: false, error: "Cannot compact: no model selected" }, false), "failure");
+});
+
+test("uses compaction_end as the authoritative terminal outcome", () => {
+  assert.deepEqual(compactionEndPresentation({ aborted: false, willRetry: false }), {
+    title: "Contexte compacté",
+    detail: undefined,
+    status: "success",
+    failed: false,
+  });
+  assert.equal(compactionEndPresentation({ aborted: false, willRetry: true }).status, "running");
+  assert.equal(compactionEndPresentation({ aborted: true, willRetry: false }).status, "warning");
+  assert.deepEqual(compactionEndPresentation({
+    aborted: false,
+    willRetry: false,
+    errorMessage: "Nothing to compact",
+    errorSeverity: "warning",
+  }), {
+    title: "Compactage non nécessaire",
+    detail: "Nothing to compact",
+    status: "warning",
+    failed: false,
+  });
+  assert.equal(compactionEndPresentation({
+    aborted: false,
+    willRetry: false,
+    errorMessage: "Provider failed",
+    errorSeverity: "error",
+  }).failed, true);
+  assert.deepEqual(compactionEndPresentation({
+    aborted: false,
+    willRetry: false,
+    errorMessage: "Automatic compaction failed: provider unavailable",
+  }), {
+    title: "Échec du compactage",
+    detail: "Automatic compaction failed: provider unavailable",
+    status: "error",
+    failed: true,
+  });
+});
+
+test("keeps compaction visible when start races the first get_state response", () => {
+  const startedBeforeState = applyRuntimeCompactingState(undefined, true);
+  assert.equal(startedBeforeState.isCompacting, true);
+  assert.equal(startedBeforeState.state, undefined, "no incomplete AgentSessionState is invented");
+
+  const endedBeforeState = applyRuntimeCompactingState(startedBeforeState, false, true);
+  assert.equal(endedBeforeState.isCompacting, false);
+  assert.equal(endedBeforeState.state, undefined);
+});
+
+test("clears a phantom prompt run only after the last compact-time queue row is deleted", () => {
+  const queued = {
+    id: "queued-1",
+    role: "user",
+    content: "Continue after compact",
+    createdAt: "2026-08-20T14:23:50.000Z",
+    status: "complete",
+    queueDelivery: "follow_up",
+  };
+  const deleted = { type: "delete" };
+  const emptyActions = { queuedCount: 0, steering: [], followUps: [] };
+
+  assert.equal(shouldClearPromptRunAfterQueueDeletion(deleted, [], emptyActions, false), true);
+  assert.equal(
+    shouldClearPromptRunAfterQueueDeletion(deleted, [queued], emptyActions, false),
+    false,
+    "another local queue row still owns the optimistic run marker",
+  );
+  assert.equal(
+    shouldClearPromptRunAfterQueueDeletion(deleted, [], { ...emptyActions, followUps: ["later"] }, false),
+    false,
+    "Prime Agent still has queued work even if the local row disappeared",
+  );
+  assert.equal(
+    shouldClearPromptRunAfterQueueDeletion(deleted, [], emptyActions, true),
+    false,
+    "a real agent_start/agent_end lifecycle must not be cleared by queue editing",
+  );
+  assert.equal(
+    shouldClearPromptRunAfterQueueDeletion({ type: "move", direction: 1 }, [], emptyActions, false),
+    false,
+  );
+});
 
 test("persists a bounded thumbnail without native handles or legacy full image payloads", () => {
   const legacy = {
@@ -302,6 +402,19 @@ test("successive follow-ups remain queued while earlier work is still pending", 
   assert.equal(second.conversation.status, "queued");
 });
 
+test("a message submitted while compaction owns the session is a follow-up, not a concurrent prompt", () => {
+  const prepared = beginPromptTransaction(conversation({ status: "tool" }), {
+    message: "Continue after compaction",
+    attachments: [],
+    messageId: "user-during-compaction",
+    createdAt: "2026-08-19T10:04:15.000Z",
+  });
+
+  assert.equal(prepared.conversation.status, "queued");
+  assert.equal(prepared.conversation.messages[0].queueDelivery, "follow_up");
+  assert.equal(prepared.conversation.messages[0].queueObserved, false);
+});
+
 test("a rapid second submission is queued even before the running status rerenders", () => {
   const prepared = beginPromptTransaction(conversation({ status: "idle" }), {
     message: "Rapid follow-up",
@@ -454,6 +567,11 @@ test("a late empty queue snapshot never moves a queued user turn behind its assi
     steering: [],
     followUps: [],
   }), true, "the persisted session must resolve the missing delivery boundary");
+  assert.equal(shouldReloadQueuedTranscript(reconciled, {
+    queuedCount: 0,
+    steering: [],
+    followUps: [],
+  }, true), false, "a queue repair must never rehydrate a pre-compaction transcript");
   assert.equal(shouldReloadQueuedTranscript(reconciled, {
     queuedCount: 1,
     steering: [],

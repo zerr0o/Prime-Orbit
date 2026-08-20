@@ -116,6 +116,33 @@ struct AgentOperations {
     runtime_writes: usize,
     reloading: Option<ResourceReloadMarker>,
     next_reload_token: u64,
+    direct_session_operation: Option<DirectSessionOperationMarker>,
+    next_direct_session_operation_token: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectSessionOperationKind {
+    Compact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirectSessionOperationMarker {
+    token: u64,
+    kind: DirectSessionOperationKind,
+    acknowledgement_timed_out: bool,
+    terminal_event_seen: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RpcAdmissionClaim {
+    previous_busy: Option<bool>,
+    direct_session_operation_token: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcAdmissionError {
+    Busy,
+    Reloading,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -717,11 +744,26 @@ fn stream_records<R: Read>(
     }
 }
 
+fn is_daemon_response_acknowledgement_timeout(event: &Value, command: &str) -> bool {
+    let Some(error) = event.get("error").and_then(Value::as_str) else {
+        return false;
+    };
+    error.starts_with("Timed out after ")
+        && error.contains("waiting for the Prime Agent daemon response")
+        && error.contains(&format!("\"{command}\""))
+}
+
 fn runtime_busy_state(record: &[u8]) -> Option<bool> {
     let event: Value = serde_json::from_slice(record).ok()?;
     match event.get("type").and_then(Value::as_str) {
-        Some("agent_start" | "auto_retry_start") => Some(true),
+        Some("agent_start" | "auto_retry_start" | "compaction_start") => Some(true),
         Some("agent_end" | "turn_error") => Some(false),
+        Some("compaction_end") => Some(
+            event
+                .get("willRetry")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
         Some("auto_retry_end") if event.get("success").and_then(Value::as_bool) == Some(false) => {
             Some(false)
         }
@@ -731,24 +773,96 @@ fn runtime_busy_state(record: &[u8]) -> Option<bool> {
         {
             Some(false)
         }
-        Some("response")
-            if matches!(
-                event.get("command").and_then(Value::as_str),
-                Some("compact" | "refine")
-            ) =>
-        {
+        Some("response") if event.get("command").and_then(Value::as_str) == Some("compact") => {
+            if event.get("success").and_then(Value::as_bool) == Some(false)
+                && is_daemon_response_acknowledgement_timeout(&event, "compact")
+            {
+                None
+            } else {
+                Some(false)
+            }
+        }
+        Some("response") if event.get("command").and_then(Value::as_str) == Some("refine") => {
             Some(false)
         }
         Some("response")
             if event.get("command").and_then(Value::as_str) == Some("get_state")
                 && event.get("success").and_then(Value::as_bool) != Some(false) =>
         {
-            event
-                .get("data")
-                .and_then(|data| data.get("isStreaming"))
-                .and_then(Value::as_bool)
+            let data = event.get("data")?;
+            let is_streaming = data.get("isStreaming").and_then(Value::as_bool);
+            let is_compacting = data.get("isCompacting").and_then(Value::as_bool);
+            match (is_streaming, is_compacting) {
+                (None, None) => None,
+                (is_streaming, is_compacting) => {
+                    Some(is_streaming.unwrap_or(false) || is_compacting.unwrap_or(false))
+                }
+            }
         }
         _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectSessionOperationRuntimeEvent {
+    Terminal {
+        kind: DirectSessionOperationKind,
+    },
+    Response {
+        kind: DirectSessionOperationKind,
+        acknowledgement_timed_out: bool,
+    },
+}
+
+fn direct_session_operation_runtime_event(
+    record: &[u8],
+) -> Option<DirectSessionOperationRuntimeEvent> {
+    let event: Value = serde_json::from_slice(record).ok()?;
+    match event.get("type").and_then(Value::as_str) {
+        Some("compaction_end") => Some(DirectSessionOperationRuntimeEvent::Terminal {
+            kind: DirectSessionOperationKind::Compact,
+        }),
+        Some("response") => {
+            let kind = match event.get("command").and_then(Value::as_str) {
+                Some("compact") => DirectSessionOperationKind::Compact,
+                _ => return None,
+            };
+            Some(DirectSessionOperationRuntimeEvent::Response {
+                kind,
+                acknowledgement_timed_out: event.get("success").and_then(Value::as_bool)
+                    == Some(false)
+                    && is_daemon_response_acknowledgement_timeout(&event, "compact"),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn apply_direct_session_operation_runtime_event(
+    operations: &mut AgentOperations,
+    event: DirectSessionOperationRuntimeEvent,
+) {
+    let Some(marker) = operations.direct_session_operation.as_mut() else {
+        return;
+    };
+    match event {
+        DirectSessionOperationRuntimeEvent::Terminal { kind } if marker.kind == kind => {
+            marker.terminal_event_seen = true;
+            if marker.acknowledgement_timed_out {
+                operations.direct_session_operation = None;
+            }
+        }
+        DirectSessionOperationRuntimeEvent::Response {
+            kind,
+            acknowledgement_timed_out,
+        } if marker.kind == kind => {
+            if acknowledgement_timed_out && !marker.terminal_event_seen {
+                marker.acknowledgement_timed_out = true;
+            } else {
+                operations.direct_session_operation = None;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -838,6 +952,7 @@ fn is_current_agent_process(agents: &AgentsState, conversation_id: &str, pid: u3
 
 fn apply_runtime_record(agents: &AgentsState, conversation_id: &str, pid: u32, record: &[u8]) {
     let busy = runtime_busy_state(record);
+    let direct_session_operation_event = direct_session_operation_runtime_event(record);
     let session_path = runtime_session_path(record).and_then(resolved_runtime_session_path);
     let session_id = runtime_session_id(record).filter(|id| {
         !id.is_empty()
@@ -847,7 +962,11 @@ fn apply_runtime_record(agents: &AgentsState, conversation_id: &str, pid: u32, r
             })
     });
     let launch_options = runtime_launch_options(record);
-    if busy.is_none() && session_path.is_none() && session_id.is_none() && launch_options.is_none()
+    if busy.is_none()
+        && direct_session_operation_event.is_none()
+        && session_path.is_none()
+        && session_id.is_none()
+        && launch_options.is_none()
     {
         return;
     }
@@ -861,6 +980,9 @@ fn apply_runtime_record(agents: &AgentsState, conversation_id: &str, pid: u32, r
         }
         if let Some(busy) = busy {
             agent.busy = busy;
+        }
+        if let Some(event) = direct_session_operation_event {
+            apply_direct_session_operation_runtime_event(&mut agent.operations, event);
         }
         if let Some(session_path) = session_path {
             agent.info.session_path = Some(session_path.to_string_lossy().into_owned());
@@ -914,7 +1036,9 @@ fn acquire_owner(agent: &mut RunningAgent, owner: String) {
 }
 
 fn agent_has_native_operation(agent: &RunningAgent) -> bool {
-    agent.operations.reloading.is_some() || agent.operations.runtime_writes > 0
+    agent.operations.reloading.is_some()
+        || agent.operations.runtime_writes > 0
+        || agent.operations.direct_session_operation.is_some()
 }
 
 fn idle_release_candidate(agent: &RunningAgent) -> Option<u32> {
@@ -983,6 +1107,62 @@ fn finish_runtime_write(operations: &mut AgentOperations) {
     operations.runtime_writes = operations.runtime_writes.saturating_sub(1);
 }
 
+fn direct_session_operation_kind(payload_type: Option<&str>) -> Option<DirectSessionOperationKind> {
+    match payload_type {
+        Some("compact") => Some(DirectSessionOperationKind::Compact),
+        _ => None,
+    }
+}
+
+fn begin_rpc_admission(
+    busy: &mut bool,
+    operations: &mut AgentOperations,
+    payload_type: Option<&str>,
+) -> Result<RpcAdmissionClaim, RpcAdmissionError> {
+    let direct_kind = direct_session_operation_kind(payload_type);
+    if direct_kind.is_some() && (*busy || operations.direct_session_operation.is_some()) {
+        return Err(RpcAdmissionError::Busy);
+    }
+    begin_runtime_write(operations).map_err(|_| RpcAdmissionError::Reloading)?;
+
+    let previous_busy = rpc_starts_busy_operation(payload_type).then_some(*busy);
+    if previous_busy.is_some() {
+        // This mutation happens under the process-wide agent map lock. It
+        // closes admission before the first byte reaches stdin, so another
+        // window cannot start a direct compact in the write gap.
+        *busy = true;
+    }
+    let direct_session_operation_token = direct_kind.map(|kind| {
+        let token = operations
+            .next_direct_session_operation_token
+            .wrapping_add(1)
+            .max(1);
+        operations.next_direct_session_operation_token = token;
+        operations.direct_session_operation = Some(DirectSessionOperationMarker {
+            token,
+            kind,
+            acknowledgement_timed_out: false,
+            terminal_event_seen: false,
+        });
+        token
+    });
+    Ok(RpcAdmissionClaim {
+        previous_busy,
+        direct_session_operation_token,
+    })
+}
+
+fn finish_direct_session_operation(operations: &mut AgentOperations, token: u64) -> bool {
+    if operations
+        .direct_session_operation
+        .is_some_and(|marker| marker.token == token)
+    {
+        operations.direct_session_operation = None;
+        return true;
+    }
+    false
+}
+
 fn begin_owned_resource_reload(
     owners: &HashSet<String>,
     owner: &str,
@@ -994,7 +1174,7 @@ fn begin_owned_resource_reload(
     if operations.reloading.is_some() {
         return Err(ResourceReloadClaimError::Reloading);
     }
-    if operations.runtime_writes > 0 {
+    if operations.runtime_writes > 0 || operations.direct_session_operation.is_some() {
         return Err(ResourceReloadClaimError::RuntimeWrite);
     }
     let token = operations.next_reload_token.wrapping_add(1).max(1);
@@ -1038,6 +1218,7 @@ struct RuntimeWriteGuard {
     pid: u32,
     started_at: u64,
     restore_busy_on_error: Option<bool>,
+    direct_session_operation_token: Option<u64>,
 }
 
 impl RuntimeWriteGuard {
@@ -1047,6 +1228,7 @@ impl RuntimeWriteGuard {
         pid: u32,
         started_at: u64,
         restore_busy_on_error: Option<bool>,
+        direct_session_operation_token: Option<u64>,
     ) -> Self {
         Self {
             agents,
@@ -1054,11 +1236,13 @@ impl RuntimeWriteGuard {
             pid,
             started_at,
             restore_busy_on_error,
+            direct_session_operation_token,
         }
     }
 
     fn commit(&mut self) {
         self.restore_busy_on_error = None;
+        self.direct_session_operation_token = None;
     }
 }
 
@@ -1074,6 +1258,9 @@ impl Drop for RuntimeWriteGuard {
             };
             if let Some(previous_busy) = self.restore_busy_on_error {
                 agent.busy = previous_busy;
+            }
+            if let Some(token) = self.direct_session_operation_token {
+                finish_direct_session_operation(&mut agent.operations, token);
             }
             finish_runtime_write(&mut agent.operations);
             idle_release_candidate(agent)
@@ -1880,7 +2067,7 @@ fn send_rpc_blocking(
     }
     let option_update = requested_launch_option_update(&payload);
     let payload_type = payload.get("type").and_then(Value::as_str);
-    let (stdin, session_path, session_id, pid, started_at, previous_busy) = {
+    let (stdin, session_path, session_id, pid, started_at, admission_claim) = {
         let mut map = agents.0.lock();
         let agent = map
             .get_mut(&conversation_id)
@@ -1904,23 +2091,28 @@ fn send_rpc_blocking(
         if agent.owners.contains(&owner) {
             agent.interactive_owner = Some(owner.clone());
         }
-        begin_runtime_write(&mut agent.operations).map_err(|_| {
-            "Les ressources Prime Agent sont en cours de rechargement. Aucun message ou réglage ne peut être envoyé pendant cette opération."
-                .to_string()
+        let admission_claim = begin_rpc_admission(
+            &mut agent.busy,
+            &mut agent.operations,
+            payload_type,
+        )
+        .map_err(|error| match error {
+            RpcAdmissionError::Busy => {
+                "Prime Agent est déjà occupé. Attendez la fin du tour ou du compactage avant de lancer un nouveau compactage."
+                    .to_string()
+            }
+            RpcAdmissionError::Reloading => {
+                "Les ressources Prime Agent sont en cours de rechargement. Aucun message ou réglage ne peut être envoyé pendant cette opération."
+                    .to_string()
+            }
         })?;
-        let previous_busy = rpc_starts_busy_operation(payload_type).then_some(agent.busy);
-        if previous_busy.is_some() {
-            // Close the stdin-flush -> daemon-admission gap. A reload claim
-            // sees this under the same lock even before agent_start arrives.
-            agent.busy = true;
-        }
         (
             Arc::clone(&agent.stdin),
             agent.info.session_path.clone(),
             agent.info.session_id.clone(),
             agent.info.pid,
             agent.info.started_at,
-            previous_busy,
+            admission_claim,
         )
     };
     let mut runtime_write = RuntimeWriteGuard::new(
@@ -1928,7 +2120,8 @@ fn send_rpc_blocking(
         conversation_id.clone(),
         pid,
         started_at,
-        previous_busy,
+        admission_claim.previous_busy,
+        admission_claim.direct_session_operation_token,
     );
     // Attachment handles are owner-scoped and expanded only in native memory
     // at the last possible moment. Dropping the reservation on any
@@ -2064,6 +2257,7 @@ fn mutate_agent_queue_blocking(
         conversation_id.clone(),
         pid,
         started_at,
+        None,
         None,
     );
 
@@ -2886,9 +3080,10 @@ pub fn release_window_agents(agents: AgentsState, owner: String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_owner_lease, append_diagnostic_tail, apply_launch_option_update,
-        begin_owned_resource_reload, begin_runtime_write, begin_update_installation,
-        close_rpc_stdin_for_restart, conflicting_session_conversation,
+        acquire_owner_lease, append_diagnostic_tail, apply_direct_session_operation_runtime_event,
+        apply_launch_option_update, begin_owned_resource_reload, begin_rpc_admission,
+        begin_runtime_write, begin_update_installation, close_rpc_stdin_for_restart,
+        conflicting_session_conversation, direct_session_operation_runtime_event,
         ensure_update_installation_is_idle, finish_resource_reload, finish_runtime_write,
         is_extension_ui_request, is_reload_acknowledgement_timeout, lease_absence_attests_release,
         mark_resource_reload_unknown, owner_may_send, public_runtime_line,
@@ -2897,9 +3092,10 @@ mod tests {
         runtime_launch_options, runtime_session_id, runtime_session_path,
         should_emit_resources_reloaded, validate_queue_lane, validate_queue_mutation,
         validate_reload_result, wait_for_child_until, waiter_may_remove_slot, AgentOperations,
-        AgentResourcesReloadedEvent, AgentsState, LaunchOptionUpdate, QueuedMessageMutation,
+        AgentResourcesReloadedEvent, AgentsState, DirectSessionOperationKind,
+        DirectSessionOperationRuntimeEvent, LaunchOptionUpdate, QueuedMessageMutation,
         ReloadAgentResourcesResult, ResourceReloadClaimError, ResourceReloadPhase,
-        RestartAgentResult, RunningAgentInfo, MAX_EXIT_DIAGNOSTIC_BYTES,
+        RestartAgentResult, RpcAdmissionError, RunningAgentInfo, MAX_EXIT_DIAGNOSTIC_BYTES,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use parking_lot::Mutex;
@@ -3143,6 +3339,24 @@ mod tests {
         assert_eq!(runtime_busy_state(br#"{"type":"agent_end"}"#), Some(false));
         assert_eq!(runtime_busy_state(br#"{"type":"turn_error"}"#), Some(false));
         assert_eq!(
+            runtime_busy_state(br#"{"type":"compaction_start","reason":"manual"}"#),
+            Some(true),
+        );
+        assert_eq!(
+            runtime_busy_state(br#"{"type":"compaction_end","reason":"manual","willRetry":false}"#,),
+            Some(false),
+        );
+        assert_eq!(
+            runtime_busy_state(br#"{"type":"compaction_end","reason":"manual"}"#),
+            Some(false),
+        );
+        assert_eq!(
+            runtime_busy_state(
+                br#"{"type":"compaction_end","reason":"overflow","willRetry":true}"#,
+            ),
+            Some(true),
+        );
+        assert_eq!(
             runtime_busy_state(br#"{"type":"auto_retry_end","success":false}"#),
             Some(false),
         );
@@ -3165,9 +3379,151 @@ mod tests {
             runtime_busy_state(br#"{"type":"response","command":"compact","success":true}"#,),
             Some(false),
         );
+        assert_eq!(
+            runtime_busy_state(
+                br#"{"type":"response","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":true}}"#,
+            ),
+            Some(true),
+        );
+        assert_eq!(
+            runtime_busy_state(
+                br#"{"type":"response","command":"get_state","success":true,"data":{"isStreaming":true,"isCompacting":false}}"#,
+            ),
+            Some(true),
+        );
+        assert_eq!(
+            runtime_busy_state(
+                br#"{"type":"response","command":"compact","success":false,"error":"Timed out after 30000ms waiting for the Prime Agent daemon response to \"compact\". Socket: \\\\.\\pipe\\prime-agent-daemon."}"#,
+            ),
+            None,
+        );
+        assert_eq!(
+            runtime_busy_state(
+                br#"{"type":"response","command":"compact","success":false,"error":"Compaction refused"}"#,
+            ),
+            Some(false),
+        );
         assert!(rpc_starts_busy_operation(Some("prompt")));
         assert!(rpc_starts_busy_operation(Some("compact")));
         assert!(!rpc_starts_busy_operation(Some("get_state")));
+    }
+
+    #[test]
+    fn concurrent_direct_compaction_admission_grants_exactly_one_writer() {
+        let state = Arc::new(Mutex::new((false, AgentOperations::default())));
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let mut state = state.lock();
+                    let (busy, operations) = &mut *state;
+                    begin_rpc_admission(busy, operations, Some("compact"))
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("admission worker"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(RpcAdmissionError::Busy)))
+                .count(),
+            1,
+        );
+        let state = state.lock();
+        assert!(state.0);
+        assert_eq!(state.1.runtime_writes, 1);
+        assert_eq!(
+            state.1.direct_session_operation.map(|marker| marker.kind),
+            Some(DirectSessionOperationKind::Compact),
+        );
+    }
+
+    #[test]
+    fn compact_fence_keeps_prompts_and_state_reads_available() {
+        let mut busy = false;
+        let mut operations = AgentOperations::default();
+        let compact = begin_rpc_admission(&mut busy, &mut operations, Some("compact"))
+            .expect("initial compact admission");
+        assert_eq!(compact.previous_busy, Some(false));
+        finish_runtime_write(&mut operations);
+
+        let prompt = begin_rpc_admission(&mut busy, &mut operations, Some("prompt"))
+            .expect("queued prompt remains admissible");
+        assert_eq!(prompt.previous_busy, Some(true));
+        finish_runtime_write(&mut operations);
+        let state = begin_rpc_admission(&mut busy, &mut operations, Some("get_state"))
+            .expect("state read remains admissible");
+        assert_eq!(state.previous_busy, None);
+        finish_runtime_write(&mut operations);
+
+        assert_eq!(
+            begin_owned_resource_reload(
+                &HashSet::from(["main".to_string()]),
+                "main",
+                &mut operations,
+            ),
+            Err(ResourceReloadClaimError::RuntimeWrite),
+        );
+    }
+
+    #[test]
+    fn compact_timeout_retains_the_fence_until_compaction_end() {
+        let timeout = br#"{"type":"response","command":"compact","success":false,"error":"Timed out after 30000ms waiting for the Prime Agent daemon response to \"compact\"."}"#;
+        let ended = br#"{"type":"compaction_end","reason":"manual","willRetry":false}"#;
+        let mut busy = false;
+        let mut operations = AgentOperations::default();
+        begin_rpc_admission(&mut busy, &mut operations, Some("compact"))
+            .expect("compact admission");
+        finish_runtime_write(&mut operations);
+
+        assert_eq!(runtime_busy_state(timeout), None);
+        apply_direct_session_operation_runtime_event(
+            &mut operations,
+            direct_session_operation_runtime_event(timeout).expect("timeout transition"),
+        );
+        assert!(operations.direct_session_operation.is_some());
+        assert!(busy);
+        assert_eq!(
+            begin_rpc_admission(&mut busy, &mut operations, Some("compact")),
+            Err(RpcAdmissionError::Busy),
+        );
+
+        busy = runtime_busy_state(ended).expect("terminal busy state");
+        apply_direct_session_operation_runtime_event(
+            &mut operations,
+            direct_session_operation_runtime_event(ended).expect("terminal transition"),
+        );
+        assert!(!busy);
+        assert!(operations.direct_session_operation.is_none());
+    }
+
+    #[test]
+    fn compact_event_then_response_order_keeps_the_native_fence_closed() {
+        let ended = DirectSessionOperationRuntimeEvent::Terminal {
+            kind: DirectSessionOperationKind::Compact,
+        };
+        let success = DirectSessionOperationRuntimeEvent::Response {
+            kind: DirectSessionOperationKind::Compact,
+            acknowledgement_timed_out: false,
+        };
+        let mut busy = false;
+        let mut operations = AgentOperations::default();
+        begin_rpc_admission(&mut busy, &mut operations, Some("compact"))
+            .expect("compact admission");
+        finish_runtime_write(&mut operations);
+
+        apply_direct_session_operation_runtime_event(&mut operations, ended);
+        assert!(operations.direct_session_operation.is_some());
+        apply_direct_session_operation_runtime_event(&mut operations, success);
+        assert!(operations.direct_session_operation.is_none());
     }
 
     #[test]

@@ -4,6 +4,27 @@ All notable changes to Prime Orbit are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-08-20
+
+### Clearer agent turns
+
+- Grouped consecutive Prime Agent messages, Python executions, and other tool activity into one ordered visual turn with a single avatar and header.
+- Preserved the exact causal order of text and tools, stable streaming identity, per-turn copy/retry/fork actions, tool details, token counts, and error feedback.
+- Kept user and system messages as strict boundaries so separate instructions and replies never merge.
+
+### Reliable context compaction
+
+- Treated `compaction_start` and `compaction_end` as the authoritative lifecycle instead of reporting Prime Agent's legacy 30-second daemon acknowledgement timeout as a failed session.
+- Added persistent compacting feedback, queued messages submitted during compaction as real follow-ups, and refreshed state, history, and context statistics when compaction finishes.
+- Added a native process-wide fence so two windows cannot start overlapping compact operations, while state reads and queued prompts remain available.
+- Disabled misleading duplicate or in-run compact actions and surfaced real failures without offering a dangerous automatic retry.
+
+### Validation
+
+- 83 frontend unit tests and TypeScript production build.
+- 128 Rust tests, formatting, strict Clippy, and native multi-window compaction admission coverage.
+- Signed Windows release workflow with updater signatures, `latest.json`, and installer checksums.
+
 ## [0.1.14] - 2026-08-20
 
 ### Signed in-app updates
@@ -164,6 +185,7 @@ All notable changes to Prime Orbit are documented in this file.
 - TypeScript build and checks.
 - Strict Rust Clippy validation with warnings denied.
 
+[0.1.15]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.15
 [0.1.14]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.14
 [0.1.13]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.13
 [0.1.12]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.12
