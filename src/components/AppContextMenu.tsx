@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   Archive,
+  ArrowDown,
+  ArrowUp,
   ClipboardPaste,
   Copy,
   ExternalLink,
@@ -13,6 +15,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { orderedConversationSiblings } from "../lib/conversation-context";
 import { useI18n } from "../i18n";
 import type { Conversation, Project } from "../types";
 
@@ -34,6 +37,7 @@ interface ContextTarget {
   x: number;
   y: number;
   projectId?: string;
+  conversationId?: string;
   editable?: EditableContext;
   selectedText?: string;
   link?: {
@@ -60,6 +64,10 @@ interface AppContextMenuProps {
   onRevealProject?: (project: Project) => void | Promise<void>;
   onArchiveProjectConversations?: (project: Project) => void;
   onDeleteProject?: (project: Project) => void;
+  onMoveConversation?: (conversation: Conversation, direction: -1 | 1) => void;
+  onToggleConversationPin?: (conversation: Conversation) => void;
+  onRenameConversation?: (conversation: Conversation) => void;
+  onArchiveConversation?: (conversation: Conversation) => void;
 }
 
 function isTextControl(element: Element): element is TextControl {
@@ -196,6 +204,10 @@ export function AppContextMenu({
   onRevealProject,
   onArchiveProjectConversations,
   onDeleteProject,
+  onMoveConversation,
+  onToggleConversationPin,
+  onRenameConversation,
+  onArchiveConversation,
 }: AppContextMenuProps = {}) {
   const { t } = useI18n();
   const [context, setContext] = useState<ContextTarget>();
@@ -214,6 +226,20 @@ export function AppContextMenu({
       const target = event.target;
       if (!(target instanceof Element)) {
         setContext(undefined);
+        return;
+      }
+
+      const conversationTarget = target.closest<HTMLElement>('[data-context-type="conversation"][data-context-id]');
+      const conversationId = conversationTarget?.dataset.contextId;
+      if (conversationId) {
+        restoreFocusRef.current = target.closest<HTMLElement>("button, [tabindex]")
+          ?? conversationTarget.querySelector<HTMLElement>("button:not([tabindex='-1']), [tabindex]:not([tabindex='-1'])")
+          ?? undefined;
+        const rect = conversationTarget.getBoundingClientRect();
+        const x = event.clientX || rect.left;
+        const y = event.clientY || rect.bottom;
+        setPosition({ x, y });
+        setContext({ x, y, conversationId });
         return;
       }
 
@@ -293,6 +319,51 @@ export function AppContextMenu({
 
   const actions = useMemo<MenuAction[]>(() => {
     if (!context) return [];
+    if (context.conversationId) {
+      const conversation = conversations.find((item) => item.id === context.conversationId);
+      if (!conversation) return [];
+      const siblings = orderedConversationSiblings(conversations, conversation);
+      const conversationIndex = siblings.findIndex((item) => item.id === conversation.id);
+      return [
+        {
+          id: "move-conversation-up",
+          label: t("context.moveConversationUp"),
+          icon: ArrowUp,
+          disabled: conversationIndex <= 0,
+          group: "location",
+          run: () => onMoveConversation?.(conversation, -1),
+        },
+        {
+          id: "move-conversation-down",
+          label: t("context.moveConversationDown"),
+          icon: ArrowDown,
+          disabled: conversationIndex < 0 || conversationIndex >= siblings.length - 1,
+          group: "location",
+          run: () => onMoveConversation?.(conversation, 1),
+        },
+        {
+          id: conversation.pinned ? "unpin-conversation" : "pin-conversation",
+          label: t(conversation.pinned ? "context.unpinConversation" : "context.pinConversation"),
+          icon: conversation.pinned ? PinOff : Pin,
+          group: "archive",
+          run: () => onToggleConversationPin?.(conversation),
+        },
+        {
+          id: "rename-conversation",
+          label: t("context.renameConversation"),
+          icon: Pencil,
+          group: "archive",
+          run: () => onRenameConversation?.(conversation),
+        },
+        {
+          id: "archive-conversation",
+          label: t("context.archiveConversation"),
+          icon: Archive,
+          group: "danger",
+          run: () => onArchiveConversation?.(conversation),
+        },
+      ];
+    }
     if (context.projectId) {
       const project = projects.find((item) => item.id === context.projectId);
       if (!project) return [];
@@ -433,7 +504,7 @@ export function AppContextMenu({
       );
     }
     return result;
-  }, [context, conversations, onArchiveProjectConversations, onDeleteProject, onRenameProject, onRevealProject, onToggleProjectPin, projects, t]);
+  }, [context, conversations, onArchiveConversation, onArchiveProjectConversations, onDeleteProject, onMoveConversation, onRenameConversation, onRenameProject, onRevealProject, onToggleConversationPin, onToggleProjectPin, projects, t]);
 
   useLayoutEffect(() => {
     if (!context || !menuRef.current) return;

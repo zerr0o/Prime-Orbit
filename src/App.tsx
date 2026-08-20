@@ -54,7 +54,9 @@ import {
 import { redactText } from "./lib/redaction";
 import { loadRlmPreferences, snapshotRlmPreferences } from "./lib/rlm-preferences";
 import { runtimeNoticeToast, type RuntimeNoticeToast } from "./lib/runtime-notices";
-import type { AppView, ExtensionUiRequest, GitChange, OllamaHealth, PersistedAppState, PrimeAgentDefaults, Project, RuntimeDetection, SettingsSectionId } from "./types";
+import { printShortcutDisposition } from "./lib/app-shortcuts";
+import { conversationMoveTarget } from "./lib/conversation-context";
+import type { AppView, Conversation, ExtensionUiRequest, GitChange, OllamaHealth, PersistedAppState, PrimeAgentDefaults, Project, RuntimeDetection, SettingsSectionId } from "./types";
 
 interface InstallState {
   running: boolean;
@@ -88,6 +90,7 @@ function App() {
     selectedConversation,
     addProject,
     selectProject,
+    openProjectConversation,
     createConversation,
     importPrimeAgentSessions,
     preserveConversationReference,
@@ -137,6 +140,7 @@ function App() {
   const [projectToDelete, setProjectToDelete] = useState<Project>();
   const [projectToRename, setProjectToRename] = useState<Project>();
   const [projectToArchive, setProjectToArchive] = useState<Project>();
+  const [conversationToRename, setConversationToRename] = useState<Conversation>();
   const [ollamaHealth, setOllamaHealth] = useState<OllamaHealthState>();
   const [updateBlockingAgents, setUpdateBlockingAgents] = useState<number>();
   const [settingsSection, setSettingsSection] = useState<SettingsSectionId>("general");
@@ -375,6 +379,14 @@ function App() {
     else void openProject();
   }, [createConversation, detection?.version, globalDefaultModel, openProject, state.selectedProjectId]);
 
+  const resumeProject = useCallback((projectId: string) => {
+    openProjectConversation(
+      projectId,
+      globalDefaultModel,
+      snapshotRlmPreferences(loadRlmPreferences(), detection?.version),
+    );
+  }, [detection?.version, globalDefaultModel, openProjectConversation]);
+
   const archiveConversationAndStop = useCallback((conversationId: string) => {
     void stopAgent(conversationId)
       .then(async () => {
@@ -386,6 +398,23 @@ function App() {
         message: t("app.archiveFailed", { error: error instanceof Error ? error.message : String(error) }),
       }));
   }, [archiveConversation, t]);
+
+  const renameConversationAndSync = useCallback((conversation: Conversation, title: string) => {
+    updateConversation(conversation.id, { title, sessionNameSyncPending: true });
+    setConversationToRename(undefined);
+    if (conversation.id !== selectedConversation?.id) return;
+    void agent.renameSession(title).catch((error) => setToast({
+      tone: "error",
+      message: state.preferences.language === "en"
+        ? `Session renamed locally, but Prime Agent could not be updated: ${error instanceof Error ? error.message : String(error)}`
+        : `Session renommée localement, mais Prime Agent n’a pas pu être mis à jour : ${error instanceof Error ? error.message : String(error)}`,
+    }));
+  }, [agent, selectedConversation?.id, state.preferences.language, updateConversation]);
+
+  const moveConversationFromContext = useCallback((conversation: Conversation, direction: -1 | 1) => {
+    const target = conversationMoveTarget(state.conversations, conversation, direction);
+    if (target) reorderConversation(conversation.id, target.id, direction < 0 ? "before" : "after");
+  }, [reorderConversation, state.conversations]);
 
   const toggleInspector = useCallback(() => {
     updateState((current) => ({ ...current, preferences: { ...current.preferences, inspectorOpen: !current.preferences.inspectorOpen } }));
@@ -470,8 +499,14 @@ function App() {
 
   useEffect(() => {
     const handleKeydown = (event: globalThis.KeyboardEvent) => {
-      if (event.repeat || event.defaultPrevented) return;
       const modifier = event.ctrlKey || event.metaKey;
+      const printShortcut = printShortcutDisposition(event);
+      if (printShortcut.block) {
+        event.preventDefault();
+        if (printShortcut.notify) setToast({ tone: "info", message: t("app.printDisabled") });
+        return;
+      }
+      if (event.repeat || event.defaultPrevented) return;
       const target = event.target instanceof HTMLElement ? event.target : undefined;
       const isEditing = Boolean(target?.closest("input, textarea, select, [contenteditable='true'], [role='textbox']"));
 
@@ -487,9 +522,9 @@ function App() {
       if (modifier && event.key === "`") { event.preventDefault(); setDockMode("terminal"); setBottomDock((current) => !current); }
       if (event.key === "Escape" && commandPalette) setCommandPalette(false);
     };
-    window.addEventListener("keydown", handleKeydown);
-    return () => window.removeEventListener("keydown", handleKeydown);
-  }, [commandPalette, newConversation, openProject, setView]);
+    window.addEventListener("keydown", handleKeydown, true);
+    return () => window.removeEventListener("keydown", handleKeydown, true);
+  }, [commandPalette, newConversation, openProject, setView, t]);
 
   useEffect(() => {
     if (!toast || toast.persistent) return;
@@ -534,23 +569,16 @@ function App() {
           onPinConversation={(id, pinned) => updateConversation(id, { pinned })}
           onArchiveConversation={archiveConversationAndStop}
           onRenameConversation={(id, title) => {
-            updateConversation(id, { title, sessionNameSyncPending: true });
-            if (id === selectedConversation?.id) {
-              void agent.renameSession(title).catch((error) => setToast({
-                tone: "error",
-                message: state.preferences.language === "en"
-                  ? `Session renamed locally, but Prime Agent could not be updated: ${error instanceof Error ? error.message : String(error)}`
-                  : `Session renommée localement, mais Prime Agent n’a pas pu être mis à jour : ${error instanceof Error ? error.message : String(error)}`,
-              }));
-            }
+            const conversation = state.conversations.find((item) => item.id === id);
+            if (conversation) renameConversationAndSync(conversation, title);
           }}
           onReorderProject={reorderProject}
           onReorderConversation={reorderConversation}
         />
       ) : null}
       <main className={`app-content ${showProjectSidebar ? "has-sidebar" : ""} ${bottomDock ? "has-dock" : ""}`}>
-        {view === "home" ? <HomeView projects={state.projects} conversations={state.conversations} detection={detection} onView={setView} onProject={selectProject} onConversation={selectConversation} onOpenProject={() => void openProject()} onNewConversation={newConversation} /> : null}
-        {view === "projects" ? <ProjectsView projects={state.projects} conversations={state.conversations} onProject={selectProject} onOpenProject={() => void openProject()} onDeleteProject={(project) => setProjectToDelete(project)} /> : null}
+        {view === "home" ? <HomeView projects={state.projects} conversations={state.conversations} detection={detection} onView={setView} onProject={resumeProject} onConversation={selectConversation} onOpenProject={() => void openProject()} onNewConversation={newConversation} /> : null}
+        {view === "projects" ? <ProjectsView projects={state.projects} conversations={state.conversations} onProject={resumeProject} onOpenProject={() => void openProject()} onDeleteProject={(project) => setProjectToDelete(project)} /> : null}
         {view === "runs" ? <RunsView projects={state.projects} conversations={state.conversations} onConversation={selectConversation} /> : null}
         {view === "connections" ? <ConnectionsView models={agent.models} projectPath={terminalProjectPath} ollamaHealth={ollamaHealth?.result} ollamaHealthChecking={Boolean(ollamaHealth?.checking)} onCheckOllama={recheckOllama} onOpenSetup={openSetup} /> : null}
         {view === "settings" ? <SettingsView section={settingsSection} onSectionChange={setSettingsSection} state={state} setState={updateState} detection={detection} installState={installState} appUpdate={appUpdater.state} models={agent.models} primeAgentDefaults={primeAgentDefaults.value} primeAgentDefaultsLoading={primeAgentDefaults.loading} primeAgentDefaultsError={primeAgentDefaults.error} onPrimeAgentDefaultsChange={applyPrimeAgentDefaults} onRefreshDetection={refreshDetection} onInstall={installPrimeAgent} onCheckAppUpdate={checkAppUpdate} onDownloadAppUpdate={downloadAvailableAppUpdate} onInstallAppUpdate={() => requestAppUpdateInstall(false)} /> : null}
@@ -562,7 +590,9 @@ function App() {
             commands={agent.commands}
             stats={agent.stats}
             sessionState={agent.sessionState}
+            goalMutation={agent.goalMutation}
             isCompacting={agent.isCompacting}
+            isRefining={agent.isRefining}
             schedules={agent.schedules}
             heartbeat={agent.heartbeat}
             heartbeats={agent.heartbeats}
@@ -642,8 +672,13 @@ function App() {
         onRevealProject={revealProject}
         onArchiveProjectConversations={setProjectToArchive}
         onDeleteProject={setProjectToDelete}
+        onMoveConversation={moveConversationFromContext}
+        onToggleConversationPin={(conversation) => updateConversation(conversation.id, { pinned: !conversation.pinned })}
+        onRenameConversation={setConversationToRename}
+        onArchiveConversation={(conversation) => archiveConversationAndStop(conversation.id)}
       />
       {projectToRename ? <RenameProjectModal project={projectToRename} onClose={() => setProjectToRename(undefined)} onConfirm={renameProject} /> : null}
+      {conversationToRename ? <RenameConversationModal conversation={conversationToRename} onClose={() => setConversationToRename(undefined)} onConfirm={renameConversationAndSync} /> : null}
       {projectToArchive ? <ArchiveProjectModal project={projectToArchive} conversationCount={state.conversations.filter((conversation) => conversation.projectId === projectToArchive.id && !conversation.archived).length} onClose={() => setProjectToArchive(undefined)} onConfirm={archiveProjectConversations} /> : null}
       {projectToDelete ? <DeleteProjectModal project={projectToDelete} conversationCount={state.conversations.filter((conversation) => conversation.projectId === projectToDelete.id).length} onClose={() => setProjectToDelete(undefined)} onConfirm={removeProject} /> : null}
       {updateBlockingAgents !== undefined ? (
@@ -711,6 +746,29 @@ function RenameProjectModal({ project, onClose, onConfirm }: { project: Project;
     >
       <label className="confirmation-field">
         <span>{t("app.projectName")}</span>
+        <input value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") confirm(); }} autoFocus autoComplete="off" />
+      </label>
+    </Modal>
+  );
+}
+
+function RenameConversationModal({ conversation, onClose, onConfirm }: { conversation: Conversation; onClose: () => void; onConfirm: (conversation: Conversation, name: string) => void }) {
+  const { t } = useI18n();
+  const [name, setName] = useState(conversation.title);
+  const normalized = name.trim();
+  const confirm = () => {
+    if (!normalized) return;
+    onConfirm(conversation, normalized);
+  };
+  return (
+    <Modal
+      title={t("app.renameConversationTitle")}
+      description={t("app.renameConversationDescription")}
+      onClose={onClose}
+      footer={<><Button variant="secondary" onClick={onClose}>{t("common.cancel")}</Button><Button variant="primary" disabled={!normalized} onClick={confirm}>{t("app.renameConversationAction")}</Button></>}
+    >
+      <label className="confirmation-field">
+        <span>{t("app.conversationName")}</span>
         <input value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") confirm(); }} autoFocus autoComplete="off" />
       </label>
     </Modal>

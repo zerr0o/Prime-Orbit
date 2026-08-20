@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent } from "react";
-import ReactMarkdown from "react-markdown";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent } from "react";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Activity,
   ArchiveRestore,
@@ -55,7 +56,9 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { admitDroppedAttachment, getGitFileDiff, openGitFileFolder, pickAttachments, releaseAttachmentHandles } from "../lib/bridge";
+import { admitDroppedAttachment, getGitFileDiff, openConversationPath, openGitFileFolder, pickAttachments, releaseAttachmentHandles } from "../lib/bridge";
+import { classifyConversationLink } from "../lib/conversation-links";
+import { sessionGoalCount, type GoalMutationRuntimeState } from "../lib/goal-control";
 import { useDismissableLayer } from "../hooks/useDismissableLayer";
 import { useI18n, type AppLanguage } from "../i18n";
 import type {
@@ -82,6 +85,12 @@ function bi(language: AppLanguage, french: string, english: string) {
   return language === "en" ? english : french;
 }
 
+function useLatestCallback<Arguments extends unknown[], Result>(callback: (...args: Arguments) => Result) {
+  const callbackRef = useRef(callback);
+  callbackRef.current = callback;
+  return useCallback((...args: Arguments) => callbackRef.current(...args), []);
+}
+
 interface ConversationViewProps {
   project: Project;
   conversation: Conversation;
@@ -89,7 +98,9 @@ interface ConversationViewProps {
   commands: SlashCommand[];
   stats?: SessionStats;
   sessionState?: AgentSessionState;
+  goalMutation?: GoalMutationRuntimeState;
   isCompacting?: boolean;
+  isRefining?: boolean;
   schedules?: AgentSchedule[];
   heartbeat?: AgentSchedule | null;
   heartbeats?: AgentHeartbeatSummary[];
@@ -255,7 +266,7 @@ export function resolveComposerDraftAfterSelection(
 }
 
 export function ConversationView(props: ConversationViewProps) {
-  const { project, conversation, models, commands, stats, sessionState, isCompacting: runtimeCompacting = false, schedules = [], heartbeat, heartbeats = [], subagents = [], observedSubagent, inspectorOpen, changes, resourceReloadSupported, onToggleInspector, onDraftChange, onSend, onMutateQueuedMessage, onRetryMessage, onAbort, onModel, onThinking, onRunCommand, onObserveSubagent, onForkMessage, onCloneSession, onNewWindow, onOpenTerminal } = props;
+  const { project, conversation, models, commands, stats, sessionState, goalMutation, isCompacting: runtimeCompacting = false, isRefining = false, schedules = [], heartbeat, heartbeats = [], subagents = [], observedSubagent, inspectorOpen, changes, resourceReloadSupported, onToggleInspector, onDraftChange, onSend, onMutateQueuedMessage, onRetryMessage, onAbort, onModel, onThinking, onRunCommand, onObserveSubagent, onForkMessage, onCloneSession, onNewWindow, onOpenTerminal } = props;
   const { language } = useI18n();
   const isCompacting = runtimeCompacting || Boolean(sessionState?.isCompacting);
   const isRunning = !isCompacting && ["starting", "streaming", "tool", "queued"].includes(conversation.status);
@@ -264,6 +275,13 @@ export function ConversationView(props: ConversationViewProps) {
   const [restartDialogOpen, setRestartDialogOpen] = useState(false);
   const [restartBusy, setRestartBusy] = useState(false);
   const [restartError, setRestartError] = useState<string>();
+  // Draft persistence updates the parent conversation object while the user is
+  // typing. Stable event bridges let the transcript ignore those updates
+  // without retaining callbacks that captured an older conversation.
+  const transcriptSuggestion = useLatestCallback(onDraftChange);
+  const transcriptRunCommand = useLatestCallback(onRunCommand);
+  const transcriptRetryMessage = useLatestCallback(onRetryMessage);
+  const transcriptForkMessage = useLatestCallback(onForkMessage);
   const closePopover = useCallback(() => setOpenPopover(null), []);
   const togglePopover = useCallback((popover: Exclude<ConversationPopover, null>) => {
     setOpenPopover((current) => current === popover ? null : popover);
@@ -315,9 +333,10 @@ export function ConversationView(props: ConversationViewProps) {
           onTogglePopover={togglePopover}
           onClosePopover={closePopover}
         />
-        <Transcript conversation={conversation} project={project} onSuggestion={(text) => onDraftChange(text)} onRunCommand={onRunCommand} onRetryMessage={onRetryMessage} onForkMessage={onForkMessage} />
+        <Transcript conversation={conversation} project={project} onSuggestion={transcriptSuggestion} onRunCommand={transcriptRunCommand} onRetryMessage={transcriptRetryMessage} onForkMessage={transcriptForkMessage} />
         {isRunning ? <ActiveRunBar conversation={conversation} onAbort={onAbort} onActivity={() => { setInspectorTab("activity"); if (!inspectorOpen) onToggleInspector(); }} /> : null}
         {isCompacting ? <CompactionStatusBar /> : null}
+        {isRefining ? <RefinementStatusBar /> : null}
         <Composer
           key={conversation.id}
           project={project}
@@ -329,6 +348,7 @@ export function ConversationView(props: ConversationViewProps) {
           resourceReloadSupported={resourceReloadSupported}
           isRunning={isRunning}
           isCompacting={isCompacting}
+          isRefining={isRefining}
           onDraftChange={onDraftChange}
           onSend={onSend}
           onMutateQueuedMessage={onMutateQueuedMessage}
@@ -347,7 +367,9 @@ export function ConversationView(props: ConversationViewProps) {
           conversation={conversation}
           stats={stats}
           sessionState={sessionState}
+          goalMutation={goalMutation}
           isCompacting={isCompacting}
+          isRefining={isRefining}
           schedules={schedules}
           heartbeat={heartbeat}
           heartbeats={heartbeats}
@@ -379,7 +401,7 @@ export function ConversationView(props: ConversationViewProps) {
   );
 }
 
-type ConversationPopover = "header-model" | "header-actions" | "composer-tools" | "composer-queue" | "composer-model" | "composer-thinking" | null;
+type ConversationPopover = "header-model" | "header-actions" | "composer-tools" | "composer-queue" | "composer-context" | "composer-model" | "composer-thinking" | null;
 
 function ConversationHeader({ project, conversation, models, sessionState, resourceReloadSupported, inspectorOpen, onModel, onToggleInspector, onNewWindow, onOpenTerminal, onRunCommand, onCloneSession, onEmergencyRestart, openPopover, onTogglePopover, onClosePopover }: {
   project: Project;
@@ -474,23 +496,116 @@ function SessionActionsPopover({ sessionState, resourceReloadSupported, onChoose
   );
 }
 
-function Transcript({ conversation, project, onSuggestion, onRunCommand, onRetryMessage, onForkMessage }: { conversation: Conversation; project: Project; onSuggestion: (text: string) => void; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onRetryMessage: (assistantMessageId: string) => Promise<void>; onForkMessage: (assistantMessageId: string) => Promise<void> }) {
+interface TranscriptProps {
+  conversation: Conversation;
+  project: Project;
+  onSuggestion: (text: string) => void;
+  onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>;
+  onRetryMessage: (assistantMessageId: string) => Promise<void>;
+  onForkMessage: (assistantMessageId: string) => Promise<void>;
+}
+
+/** Drafts, inspector activity, and other conversation metadata do not affect
+ * the transcript. Keeping this comparison O(1) prevents a persisted keystroke
+ * from reparsing every historical Markdown block. */
+export function hasSameTranscriptPresentation(
+  previous: Pick<TranscriptProps, "conversation" | "project">,
+  next: Pick<TranscriptProps, "conversation" | "project">,
+) {
+  return previous.conversation.id === next.conversation.id
+    && previous.conversation.messages === next.conversation.messages
+    && previous.conversation.status === next.conversation.status
+    && previous.conversation.lastError === next.conversation.lastError
+    && previous.conversation.hasContent === next.conversation.hasContent
+    && previous.conversation.sessionId === next.conversation.sessionId
+    && previous.conversation.sessionPath === next.conversation.sessionPath
+    && previous.project.name === next.project.name
+    && previous.project.path === next.project.path;
+}
+
+function areTranscriptPropsEqual(previous: TranscriptProps, next: TranscriptProps) {
+  return hasSameTranscriptPresentation(previous, next)
+    && previous.onSuggestion === next.onSuggestion
+    && previous.onRunCommand === next.onRunCommand
+    && previous.onRetryMessage === next.onRetryMessage
+    && previous.onForkMessage === next.onForkMessage;
+}
+
+export function resetTranscriptScrollForConversation(
+  previousConversationId: string,
+  nextConversationId: string,
+  viewport: Pick<HTMLDivElement, "scrollHeight" | "scrollTop"> | null,
+) {
+  if (previousConversationId === nextConversationId) return false;
+  if (viewport) viewport.scrollTop = viewport.scrollHeight;
+  return true;
+}
+
+const Transcript = memo(function Transcript({ conversation, project, onSuggestion, onRunCommand, onRetryMessage, onForkMessage }: TranscriptProps) {
   const { language } = useI18n();
   const viewport = useRef<HTMLDivElement>(null);
+  const visibleConversationId = useRef(conversation.id);
   const [atBottom, setAtBottom] = useState(true);
-  const messages = conversation.messages.filter((message) => !message.queueDelivery);
-  const entries = buildTranscriptEntries(messages);
+  const [linkError, setLinkError] = useState<string>();
+  const messages = useMemo(
+    () => conversation.messages.filter((message) => !message.queueDelivery),
+    [conversation.messages],
+  );
+  const entries = useMemo(() => buildTranscriptEntries(messages), [messages]);
   const isHistoryLoading = messages.length === 0 && conversation.status === "starting";
 
+  useLayoutEffect(() => {
+    const changed = resetTranscriptScrollForConversation(
+      visibleConversationId.current,
+      conversation.id,
+      viewport.current,
+    );
+    visibleConversationId.current = conversation.id;
+    if (changed) {
+      setAtBottom(true);
+      setLinkError(undefined);
+    }
+  }, [conversation.id]);
+
   useEffect(() => {
-    if (atBottom) viewport.current?.scrollTo({ top: viewport.current.scrollHeight, behavior: "smooth" });
+    if (!atBottom) return;
+    // Token streams can update many times per frame. Coalesce their layout read
+    // and scroll write instead of stacking smooth-scroll animations.
+    const frame = window.requestAnimationFrame(() => {
+      const node = viewport.current;
+      if (node) node.scrollTop = node.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, [atBottom, messages]);
 
-  const handleScroll = () => {
+  const handleScroll = useCallback(() => {
     const node = viewport.current;
     if (!node) return;
-    setAtBottom(node.scrollHeight - node.scrollTop - node.clientHeight < 120);
-  };
+    const nextAtBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 120;
+    setAtBottom((current) => current === nextAtBottom ? current : nextAtBottom);
+  }, []);
+
+  const openTranscriptLink = useCallback(async (href: string) => {
+    setLinkError(undefined);
+    const target = classifyConversationLink(href);
+    try {
+      if (target.kind === "external") {
+        await openUrl(target.url);
+        return;
+      }
+      if (target.kind === "anchor") {
+        document.getElementById(target.id)?.scrollIntoView({ behavior: "smooth", block: "center" });
+        return;
+      }
+      if (target.kind === "file") {
+        await openConversationPath(project.path, target.path);
+        return;
+      }
+      setLinkError(bi(language, "Ce type de lien n’est pas autorisé dans une réponse de l’agent.", "This link type is not allowed in an agent response."));
+    } catch (error) {
+      setLinkError(error instanceof Error ? error.message : String(error));
+    }
+  }, [language, project.path]);
 
   return (
     <div className="transcript-viewport" ref={viewport} onScroll={handleScroll}>
@@ -504,8 +619,9 @@ function Transcript({ conversation, project, onSuggestion, onRunCommand, onRetry
         <div className="transcript-content">
           <div className="transcript-date"><span>{bi(language, "Aujourd’hui", "Today")}</span></div>
           {entries.map((entry) => entry.kind === "message"
-            ? <MessageItem key={entry.message.id} message={entry.message} onRetryMessage={onRetryMessage} onForkMessage={onForkMessage} />
-            : <AssistantTurn key={entry.id} messages={entry.messages} onRetryMessage={onRetryMessage} onForkMessage={onForkMessage} />)}
+            ? <MessageItem key={entry.message.id} message={entry.message} onOpenLink={openTranscriptLink} onRetryMessage={onRetryMessage} onForkMessage={onForkMessage} />
+            : <AssistantTurn key={entry.id} messages={entry.messages} onOpenLink={openTranscriptLink} onRetryMessage={onRetryMessage} onForkMessage={onForkMessage} />)}
+          {linkError ? <div className="transcript-link-error" role="alert"><CircleAlert size={15} /><span>{linkError}</span><IconButton label={bi(language, "Fermer l’erreur", "Dismiss error")} onClick={() => setLinkError(undefined)}><X size={14} /></IconButton></div> : null}
           {conversation.lastError ? (
             <div className="inline-error"><Info size={17} /><div><strong>{bi(language, "Prime Agent a besoin d’attention", "Prime Agent needs attention")}</strong><p>{conversation.lastError}</p></div><Button variant="ghost" onClick={() => void onRunCommand("get_state")}>{bi(language, "Réessayer", "Retry")}</Button></div>
           ) : null}
@@ -514,7 +630,7 @@ function Transcript({ conversation, project, onSuggestion, onRunCommand, onRetry
       {!atBottom ? <IconButton label={bi(language, "Aller au dernier message", "Go to latest message")} className="scroll-bottom" onClick={() => viewport.current?.scrollTo({ top: viewport.current.scrollHeight, behavior: "smooth" })}><ArrowDown size={17} /></IconButton> : null}
     </div>
   );
-}
+}, areTranscriptPropsEqual);
 
 function ConversationLoadError({ conversation, onRetry }: { conversation: Conversation; onRetry: () => Promise<void> }) {
   const { language } = useI18n();
@@ -602,7 +718,18 @@ function ConversationWelcome({ project, onSuggestion }: { project: Project; onSu
   );
 }
 
-function MessageItem({ message, onRetryMessage, onForkMessage, showTools = true }: { message: ChatMessage; onRetryMessage: (assistantMessageId: string) => Promise<void>; onForkMessage: (assistantMessageId: string) => Promise<void>; showTools?: boolean }) {
+const ConversationMarkdown = memo(function ConversationMarkdown({ content, onOpenLink }: { content: string; onOpenLink: (href: string) => Promise<void> }) {
+  return <ReactMarkdown remarkPlugins={[remarkGfm]} urlTransform={(url, key) => key === "href" ? url : defaultUrlTransform(url)} components={{
+    a: ({ children, href }) => {
+      const target = classifyConversationLink(href);
+      const safeHref = target.kind === "external" ? target.url : target.kind === "anchor" ? `#${encodeURIComponent(target.id)}` : "#";
+      return <a href={safeHref} aria-disabled={target.kind === "unsupported" || undefined} onClick={(event) => { event.preventDefault(); if (href) void onOpenLink(href); }}>{children}</a>;
+    },
+    code: ({ children, className, ...props }) => <code {...props} className={className}>{children}</code>,
+  }}>{content}</ReactMarkdown>;
+});
+
+const MessageItem = memo(function MessageItem({ message, onOpenLink, onRetryMessage, onForkMessage, showTools = true }: { message: ChatMessage; onOpenLink: (href: string) => Promise<void>; onRetryMessage: (assistantMessageId: string) => Promise<void>; onForkMessage: (assistantMessageId: string) => Promise<void>; showTools?: boolean }) {
   const { language, locale } = useI18n();
   const isUser = message.role === "user";
   const isSystem = message.role === "system";
@@ -613,10 +740,7 @@ function MessageItem({ message, onRetryMessage, onForkMessage, showTools = true 
         <header className="message-header"><strong>{isUser ? bi(language, "Vous", "You") : isSystem ? bi(language, "Système", "System") : "Prime Agent"}</strong><time dateTime={message.createdAt}>{formatTime(message.createdAt, locale)}</time>{message.model ? <Badge>{shortModel(message.model)}</Badge> : null}</header>
         <div className={isUser ? "user-message-card" : "assistant-message-body"}>
           {message.attachments?.length ? <AttachmentStrip attachments={message.attachments} /> : null}
-          <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
-            a: ({ children, ...props }) => <a {...props} target="_blank" rel="noreferrer">{children}</a>,
-            code: ({ children, className, ...props }) => <code {...props} className={className}>{children}</code>,
-          }}>{message.content || (message.status === "streaming" ? " " : "")}</ReactMarkdown>
+          <ConversationMarkdown content={message.content || (message.status === "streaming" ? " " : "")} onOpenLink={onOpenLink} />
           {message.status === "streaming" ? <span className="streaming-cursor" aria-hidden="true" /> : null}
         </div>
         {showTools && message.tools?.length ? <MessageToolSequence tools={message.tools} /> : null}
@@ -633,9 +757,27 @@ function MessageItem({ message, onRetryMessage, onForkMessage, showTools = true 
       </div>
     </article>
   );
+});
+
+interface AssistantTurnProps {
+  messages: ChatMessage[];
+  onOpenLink: (href: string) => Promise<void>;
+  onRetryMessage: (assistantMessageId: string) => Promise<void>;
+  onForkMessage: (assistantMessageId: string) => Promise<void>;
 }
 
-function AssistantTurn({ messages, onRetryMessage, onForkMessage }: { messages: ChatMessage[]; onRetryMessage: (assistantMessageId: string) => Promise<void>; onForkMessage: (assistantMessageId: string) => Promise<void> }) {
+export function haveSameMessageReferences(previous: readonly ChatMessage[], next: readonly ChatMessage[]) {
+  return previous.length === next.length && previous.every((message, index) => message === next[index]);
+}
+
+function areAssistantTurnPropsEqual(previous: AssistantTurnProps, next: AssistantTurnProps) {
+  return haveSameMessageReferences(previous.messages, next.messages)
+    && previous.onOpenLink === next.onOpenLink
+    && previous.onRetryMessage === next.onRetryMessage
+    && previous.onForkMessage === next.onForkMessage;
+}
+
+const AssistantTurn = memo(function AssistantTurn({ messages, onOpenLink, onRetryMessage, onForkMessage }: AssistantTurnProps) {
   const { language, locale } = useI18n();
   const firstMessage = messages[0]!;
   const model = [...messages].reverse().find((message) => message.model)?.model;
@@ -659,10 +801,7 @@ function AssistantTurn({ messages, onRetryMessage, onForkMessage }: { messages: 
             <div className={`assistant-turn-content ${segment.message.status === "error" ? "is-error" : ""}`} key={segment.id}>
               {segment.message.attachments?.length ? <AttachmentStrip attachments={segment.message.attachments} /> : null}
               <div className="assistant-message-body">
-                <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
-                  a: ({ children, ...props }) => <a {...props} target="_blank" rel="noreferrer">{children}</a>,
-                  code: ({ children, className, ...props }) => <code {...props} className={className}>{children}</code>,
-                }}>{segment.message.content || (segment.message.status === "streaming" ? " " : "")}</ReactMarkdown>
+                <ConversationMarkdown content={segment.message.content || (segment.message.status === "streaming" ? " " : "")} onOpenLink={onOpenLink} />
                 {segment.message.status === "streaming" ? <span className="streaming-cursor" aria-hidden="true" /> : null}
               </div>
               {segment.message.status === "error" ? <p className="assistant-turn-error" role="alert"><CircleAlert size={14} />{bi(language, "Cette partie de la réponse a été interrompue.", "This part of the response was interrupted.")}</p> : null}
@@ -682,7 +821,7 @@ function AssistantTurn({ messages, onRetryMessage, onForkMessage }: { messages: 
       </div>
     </article>
   );
-}
+}, areAssistantTurnPropsEqual);
 
 export type TranscriptEntry =
   | { kind: "message"; message: ChatMessage }
@@ -739,8 +878,12 @@ export function buildAssistantTurnSegments(messages: ChatMessage[]): AssistantTu
   return segments;
 }
 
-function MessageToolSequence({ tools }: { tools: ToolActivity[] }) {
-  const segments: Array<{ kind: "tool"; tool: ToolActivity } | { kind: "python"; tools: ToolActivity[] }> = [];
+export type ToolSequenceSegment =
+  | { kind: "tool"; tool: ToolActivity }
+  | { kind: "python"; tools: ToolActivity[] };
+
+export function buildToolSequenceSegments(tools: ToolActivity[]): ToolSequenceSegment[] {
+  const segments: ToolSequenceSegment[] = [];
   for (let index = 0; index < tools.length;) {
     if (!isPythonTool(tools[index]!)) {
       segments.push({ kind: "tool", tool: tools[index]! });
@@ -752,15 +895,23 @@ function MessageToolSequence({ tools }: { tools: ToolActivity[] }) {
       pythonTools.push(tools[index]!);
       index += 1;
     }
-    if (pythonTools.length === 1) segments.push({ kind: "tool", tool: pythonTools[0]! });
-    else segments.push({ kind: "python", tools: pythonTools });
+    segments.push({ kind: "python", tools: pythonTools });
   }
+  return segments;
+}
+
+function haveSameToolReferences(previous: readonly ToolActivity[], next: readonly ToolActivity[]) {
+  return previous.length === next.length && previous.every((tool, index) => tool === next[index]);
+}
+
+const MessageToolSequence = memo(function MessageToolSequence({ tools }: { tools: ToolActivity[] }) {
+  const segments = buildToolSequenceSegments(tools);
   return <div className="message-tools">{segments.map((segment) => segment.kind === "tool"
     ? <ToolCard key={segment.tool.id} tool={segment.tool} />
     : <PythonExecutionGroup key={`python:${segment.tools[0]!.id}`} tools={segment.tools} />)}</div>;
-}
+}, (previous, next) => haveSameToolReferences(previous.tools, next.tools));
 
-function AttachmentStrip({ attachments }: { attachments: Attachment[] }) {
+const AttachmentStrip = memo(function AttachmentStrip({ attachments }: { attachments: Attachment[] }) {
   const { language, locale } = useI18n();
   return (
     <div className="message-attachments">
@@ -771,7 +922,7 @@ function AttachmentStrip({ attachments }: { attachments: Attachment[] }) {
       ))}
     </div>
   );
-}
+});
 
 function attachmentExtension(attachment: Pick<Attachment, "name" | "mimeType" | "isImage">) {
   const extension = attachment.name.match(/\.([a-z0-9]{1,10})$/i)?.[1];
@@ -805,11 +956,17 @@ function attachmentMetaLabel(attachment: Attachment, language: AppLanguage, loca
   return `${attachmentExtension(attachment)} · ${formatBytes(attachment.size, language, locale)}`;
 }
 
+export function initialPythonExecutionGroupExpanded() {
+  return false;
+}
+
 function PythonExecutionGroup({ tools }: { tools: ToolActivity[] }) {
   const { language } = useI18n();
   const executions = mergeToolCalls(tools);
   const summary = summarizePythonTools(executions);
-  const [open, setOpen] = useState(summary.failed > 0);
+  // Python output can grow very quickly. Keep the group quiet from its first
+  // running event instead of opening live and collapsing only after completion.
+  const [open, setOpen] = useState(initialPythonExecutionGroupExpanded);
   const previousFailures = useRef(summary.failed);
   useEffect(() => {
     if (summary.failed > previousFailures.current) setOpen(true);
@@ -832,7 +989,7 @@ function PythonExecutionGroup({ tools }: { tools: ToolActivity[] }) {
         <ChevronDown size={15} className={open ? "is-open" : ""} />
       </button>
       {open ? <div className="python-execution-list">{executions.map((tool, index) => (
-        <ToolCard key={tool.id} tool={{ ...tool, title: `${bi(language, "Python", "Python")} #${index + 1}` }} />
+        <ToolCard key={tool.id} tool={{ ...tool, title: `${bi(language, "Python", "Python")} #${index + 1}` }} compactByDefault />
       ))}</div> : null}
     </section>
   );
@@ -876,9 +1033,13 @@ function summarizePythonTools(tools: ToolActivity[]) {
   }, { running: 0, completed: 0, failed: 0, cancelled: 0 });
 }
 
-function ToolCard({ tool }: { tool: ToolActivity }) {
+export function initialToolCardExpanded(tool: Pick<ToolActivity, "status">, compactByDefault = false) {
+  return !compactByDefault && tool.status === "running";
+}
+
+function ToolCard({ tool, compactByDefault = false }: { tool: ToolActivity; compactByDefault?: boolean }) {
   const { language } = useI18n();
-  const [open, setOpen] = useState(tool.status === "running");
+  const [open, setOpen] = useState(() => initialToolCardExpanded(tool, compactByDefault));
   const previousStatus = useRef(tool.status);
   useEffect(() => {
     if (previousStatus.current === "running" && tool.status !== "running") setOpen(false);
@@ -937,6 +1098,20 @@ function CompactionStatusBar() {
   );
 }
 
+function RefinementStatusBar() {
+  const { language } = useI18n();
+  return (
+    <div className="refinement-status-bar" role="status" aria-live="polite">
+      <span className="refinement-status-icon" aria-hidden="true"><WandSparkles size={16} /></span>
+      <div>
+        <strong>{bi(language, "Raffinement en cours…", "Refinement in progress…")}</strong>
+        <small>{bi(language, "Prime Agent consolide les apprentissages de cette session. La navigation reste disponible.", "Prime Agent is consolidating what this session learned. Navigation remains available.")}</small>
+      </div>
+      <LoaderCircle size={15} className="spin" aria-hidden="true" />
+    </div>
+  );
+}
+
 /** Attachment handles are ephemeral native capabilities, so they are kept in
  * this renderer window only. This preserves an unsent composer when navigating
  * between conversations without ever serializing the handles to app state. */
@@ -979,7 +1154,67 @@ export async function releaseAllConversationAttachmentDrafts() {
   await releaseConversationAttachmentDrafts([...conversationAttachmentDrafts.keys()]);
 }
 
-function Composer({ project, conversation, models, commands, stats, sessionState, resourceReloadSupported, isRunning, isCompacting, onDraftChange, onSend, onMutateQueuedMessage, onAbort, onModel, onThinking, onRunCommand, openPopover, onTogglePopover, onClosePopover }: {
+export type ContextUsageStatus = "available" | "warning" | "critical" | "compacting" | "unavailable";
+
+export interface ContextUsageSnapshot {
+  usedTokens: number | null;
+  contextWindow: number | null;
+  availableTokens: number | null;
+  percent: number | null;
+  ringPercent: number;
+  status: ContextUsageStatus;
+  autoCompactionEnabled?: boolean;
+}
+
+function finiteMetric(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Keep context display derived exclusively from metrics reported by Prime
+ * Agent. Missing counters stay unavailable instead of being replaced by a
+ * convincing-looking estimate.
+ */
+export function buildContextUsageSnapshot(
+  stats?: SessionStats,
+  sessionState?: AgentSessionState,
+  runtimeCompacting = false,
+): ContextUsageSnapshot {
+  const rawTokens = finiteMetric(stats?.contextUsage?.tokens);
+  const rawWindow = finiteMetric(stats?.contextUsage?.contextWindow);
+  const usedTokens = rawTokens === null ? null : Math.max(0, rawTokens);
+  const contextWindow = rawWindow === null || rawWindow <= 0 ? null : rawWindow;
+  const reportedPercent = finiteMetric(stats?.contextUsage?.percent);
+  const percent = reportedPercent === null
+    ? usedTokens !== null && contextWindow !== null
+      ? (usedTokens / contextWindow) * 100
+      : null
+    : Math.max(0, reportedPercent);
+  const availableTokens = usedTokens === null || contextWindow === null
+    ? null
+    : Math.max(0, contextWindow - usedTokens);
+  const compacting = runtimeCompacting || Boolean(sessionState?.isCompacting);
+  const status: ContextUsageStatus = compacting
+    ? "compacting"
+    : percent === null
+      ? "unavailable"
+      : percent >= 85
+        ? "critical"
+        : percent >= 65
+          ? "warning"
+          : "available";
+  return {
+    usedTokens,
+    contextWindow,
+    availableTokens,
+    percent,
+    ringPercent: Math.min(100, Math.max(0, percent ?? 0)),
+    status,
+    autoCompactionEnabled: sessionState?.autoCompactionEnabled,
+  };
+}
+
+function Composer({ project, conversation, models, commands, stats, sessionState, resourceReloadSupported, isRunning, isCompacting, isRefining, onDraftChange, onSend, onMutateQueuedMessage, onAbort, onModel, onThinking, onRunCommand, openPopover, onTogglePopover, onClosePopover }: {
   project: Project;
   conversation: Conversation;
   models: ModelInfo[];
@@ -989,6 +1224,7 @@ function Composer({ project, conversation, models, commands, stats, sessionState
   resourceReloadSupported: boolean;
   isRunning: boolean;
   isCompacting: boolean;
+  isRefining: boolean;
   onDraftChange: (draft: string) => void;
   onSend: (message: string, attachments: Attachment[], delivery?: "steer" | "follow_up") => Promise<void>;
   onMutateQueuedMessage: (input: { messageId: string; lane: "steering" | "followUp"; index: number; expectedText: string; mutation: { type: "delete" } | { type: "replace"; text: string; lane: "steering" | "followUp" } }) => Promise<void>;
@@ -1176,7 +1412,7 @@ function Composer({ project, conversation, models, commands, stats, sessionState
   };
 
   const runToolAction = async (action: "compact" | "refine") => {
-    if (toolActionBusy) return;
+    if (toolActionBusy || (action === "refine" && isRefining)) return;
     setToolActionBusy(action);
     setCommandError(undefined);
     onClosePopover();
@@ -1486,7 +1722,7 @@ function Composer({ project, conversation, models, commands, stats, sessionState
     }
   };
 
-  const contextPercent = stats?.contextUsage?.percent;
+  const contextUsage = buildContextUsageSnapshot(stats, sessionState, isCompacting);
   const queuedRows = buildQueuedRows(conversation, sessionState);
   const applyQueuedMutation = async (
     item: QueuedMessageRow,
@@ -1609,7 +1845,7 @@ function Composer({ project, conversation, models, commands, stats, sessionState
           {activeSlashCommand ? <button type="button" className="active-slash-command" onClick={clearActiveSlashCommand} title={bi(language, `Retirer la commande /${activeSlashCommand.command.name}`, `Remove /${activeSlashCommand.command.name} command`)}>{slashCommandIcon(activeSlashCommand.command)}<span>{activeSlashCommand.command.label}</span><X size={12} /></button> : null}
           <div className="composer-popover-wrap" data-dismissable-layer="composer-tools">
             <button type="button" className="composer-chip" aria-haspopup="menu" aria-expanded={openPopover === "composer-tools"} onClick={() => onTogglePopover("composer-tools")}><Box size={14} />{bi(language, "Outils", "Tools")}<ChevronDown size={13} /></button>
-            {openPopover === "composer-tools" ? <ToolsPopover commands={commands} busyAction={toolActionBusy} compactDisabledReason={compactDisabledReason} onChoose={(command) => { updateDraft(`/${command.name} `); onClosePopover(); textarea.current?.focus(); }} onCompact={() => void runToolAction("compact")} onRefine={() => void runToolAction("refine")} /> : null}
+            {openPopover === "composer-tools" ? <ToolsPopover commands={commands} busyAction={toolActionBusy} compactDisabledReason={compactDisabledReason} isRefining={isRefining} onChoose={(command) => { updateDraft(`/${command.name} `); onClosePopover(); textarea.current?.focus(); }} onCompact={() => void runToolAction("compact")} onRefine={() => void runToolAction("refine")} /> : null}
           </div>
           <div className="composer-popover-wrap" data-dismissable-layer="composer-queue">
             <button type="button" className="composer-chip permission-chip" aria-haspopup="menu" aria-expanded={openPopover === "composer-queue"} title={bi(language, "File d’instructions réellement gérée par Prime Agent", "Instruction queue managed by Prime Agent")} onClick={() => onTogglePopover("composer-queue")}><Layers3 size={14} />{queueLabel(sessionState, language)}<ChevronDown size={13} /></button>
@@ -1617,7 +1853,7 @@ function Composer({ project, conversation, models, commands, stats, sessionState
           </div>
         </div>
         <div className="composer-tools-right">
-          {typeof contextPercent === "number" ? <span className={`context-meter ${contextPercent > 84 ? "is-warning" : ""}`} title={`${Math.round(contextPercent)} % ${bi(language, "du contexte utilisé", "of context used")}`}><i style={{ "--context": `${contextPercent}%` } as React.CSSProperties} />{Math.round(contextPercent)}%</span> : null}
+          {stats?.contextUsage ? <div className="composer-popover-wrap" data-dismissable-layer="composer-context"><button type="button" className={`context-meter is-${contextUsage.status}`} aria-haspopup="dialog" aria-expanded={openPopover === "composer-context"} aria-controls={openPopover === "composer-context" ? "context-usage-popover" : undefined} aria-label={contextUsage.percent === null ? bi(language, "Détails du contexte, utilisation indisponible", "Context details, usage unavailable") : `${Math.round(contextUsage.percent)} % ${bi(language, "du contexte utilisé. Afficher les détails", "of context used. Show details")}`} onClick={() => onTogglePopover("composer-context")}><i aria-hidden="true" style={{ "--context": `${contextUsage.ringPercent}%` } as React.CSSProperties} /><span>{contextUsage.percent === null ? "—" : `${Math.round(contextUsage.percent)}%`}</span></button>{openPopover === "composer-context" ? <ContextUsagePopover snapshot={contextUsage} /> : null}</div> : null}
           <div className="composer-popover-wrap" data-dismissable-layer="composer-model">
             <button type="button" className="model-compact-button" aria-haspopup="menu" aria-expanded={openPopover === "composer-model"} aria-label={`${bi(language, "Modèle", "Model")}: ${activeModel?.name ?? activeModel?.id ?? shortModel(conversation.model) ?? bi(language, "non sélectionné", "not selected")}`} onClick={() => onTogglePopover("composer-model")}><Sparkles size={14} /><span>{activeModel?.name ?? activeModel?.id ?? shortModel(conversation.model) ?? bi(language, "Modèle", "Model")}</span><ChevronDown size={13} /></button>
             {openPopover === "composer-model" ? <ModelPopover models={models} active={conversation.model} align="right" onChoose={(model) => { void onModel(model); onClosePopover(); }} /> : null}
@@ -1635,12 +1871,63 @@ function Composer({ project, conversation, models, commands, stats, sessionState
   );
 }
 
-function RunInspector({ project, conversation, stats, sessionState, isCompacting, schedules, heartbeat, heartbeats, subagents, observedSubagent, changes, tab, onTab, onClose, onRunCommand, onObserveSubagent, onCloneSession, onDraftChange }: {
+function contextStatusLabel(status: ContextUsageStatus, language: AppLanguage) {
+  if (status === "compacting") return bi(language, "Compactage en cours", "Compacting");
+  if (status === "critical") return bi(language, "Presque saturé", "Nearly full");
+  if (status === "warning") return bi(language, "À surveiller", "Filling up");
+  if (status === "available") return bi(language, "Disponible", "Available");
+  return bi(language, "Indisponible", "Unavailable");
+}
+
+function contextStatusTone(status: ContextUsageStatus): "success" | "warning" | "danger" | "accent" | "neutral" {
+  if (status === "compacting") return "accent";
+  if (status === "critical") return "danger";
+  if (status === "warning") return "warning";
+  if (status === "available") return "success";
+  return "neutral";
+}
+
+function ContextUsagePopover({ snapshot }: { snapshot: ContextUsageSnapshot }) {
+  const { language, locale } = useI18n();
+  const metric = (value: number | null) => value === null ? "—" : compactNumber(value, locale);
+  const percent = snapshot.percent === null ? "—" : `${Math.round(snapshot.percent)}%`;
+  const autoCompaction = snapshot.autoCompactionEnabled === undefined
+    ? bi(language, "Non signalée", "Not reported")
+    : snapshot.autoCompactionEnabled
+      ? bi(language, "Activée", "Enabled")
+      : bi(language, "Désactivée", "Disabled");
+  return (
+    <div id="context-usage-popover" className={`popover context-usage-popover is-${snapshot.status}`} role="dialog" aria-labelledby="context-usage-title">
+      <header className="context-usage-header">
+        <span className="context-usage-icon" aria-hidden="true">{snapshot.status === "compacting" ? <LoaderCircle size={16} className="spin" /> : <ArchiveRestore size={16} />}</span>
+        <span><strong id="context-usage-title">{bi(language, "Contexte du modèle", "Model context")}</strong><small>{bi(language, "État remonté par Prime Agent", "State reported by Prime Agent")}</small></span>
+        <Badge tone={contextStatusTone(snapshot.status)}>{contextStatusLabel(snapshot.status, language)}</Badge>
+      </header>
+      <div className="context-usage-progress">
+        <div><strong>{percent}</strong><span>{bi(language, "utilisé", "used")}</span></div>
+        <progress max={100} value={snapshot.ringPercent} aria-label={bi(language, "Pourcentage du contexte utilisé", "Context percentage used")} />
+      </div>
+      <dl className="context-usage-metrics">
+        <div><dt>{bi(language, "Tokens utilisés", "Tokens used")}</dt><dd>{metric(snapshot.usedTokens)}</dd></div>
+        <div><dt>{bi(language, "Disponibles", "Available")}</dt><dd>{metric(snapshot.availableTokens)}</dd></div>
+        <div><dt>{bi(language, "Fenêtre", "Window")}</dt><dd>{metric(snapshot.contextWindow)}</dd></div>
+        <div><dt>{bi(language, "Compactage auto", "Auto compaction")}</dt><dd>{autoCompaction}</dd></div>
+      </dl>
+      <p className="context-usage-note"><Info size={13} />{snapshot.status === "compacting"
+        ? bi(language, "Les compteurs seront actualisés quand Prime Agent terminera le compactage.", "Counters will refresh when Prime Agent finishes compaction.")
+        : bi(language, "Les valeurs et calculs utilisent uniquement les compteurs remontés par Prime Agent ; les données absentes restent indiquées par —.", "Values and calculations use only counters reported by Prime Agent; missing data remains marked with —.")}</p>
+    </div>
+  );
+}
+
+function RunInspector({ project, conversation, stats, sessionState, goalMutation, isCompacting, isRefining, schedules, heartbeat, heartbeats, subagents, observedSubagent, changes, tab, onTab, onClose, onRunCommand, onObserveSubagent, onCloneSession, onDraftChange }: {
   project: Project;
   conversation: Conversation;
   stats?: SessionStats;
   sessionState?: AgentSessionState;
+  goalMutation?: GoalMutationRuntimeState;
   isCompacting: boolean;
+  isRefining: boolean;
   schedules: AgentSchedule[];
   heartbeat?: AgentSchedule | null;
   heartbeats: AgentHeartbeatSummary[];
@@ -1668,9 +1955,9 @@ function RunInspector({ project, conversation, stats, sessionState, isCompacting
       <nav className="inspector-tabs" aria-label={bi(language, "Inspecteur de session", "Session inspector")}>{tabs.map((item) => { const TabIcon = item.icon; return <button key={item.id} type="button" className={tab === item.id ? "is-active" : ""} onClick={() => onTab(item.id)}><TabIcon size={14} />{item.label}{item.count ? <span>{item.count}</span> : null}</button>; })}</nav>
       <div className="inspector-content">
         {tab === "activity" ? <ActivityPanel activities={conversation.activities} conversation={conversation} /> : null}
-        {tab === "session" ? <SessionPanel project={project} conversation={conversation} sessionState={sessionState} schedules={schedules} heartbeat={heartbeat} heartbeats={heartbeats} subagents={subagents} observedSubagent={observedSubagent} onRunCommand={onRunCommand} onObserveSubagent={onObserveSubagent} /> : null}
+        {tab === "session" ? <SessionPanel project={project} conversation={conversation} sessionState={sessionState} goalMutation={goalMutation} schedules={schedules} heartbeat={heartbeat} heartbeats={heartbeats} subagents={subagents} observedSubagent={observedSubagent} onRunCommand={onRunCommand} onObserveSubagent={onObserveSubagent} /> : null}
         {tab === "changes" ? <ChangesPanel projectPath={project.path} changes={changes} draft={conversation.draft} onDraftChange={onDraftChange} /> : null}
-        {tab === "details" ? <DetailsPanel project={project} conversation={conversation} stats={stats} sessionState={sessionState} isCompacting={isCompacting} onRunCommand={onRunCommand} onCloneSession={onCloneSession} /> : null}
+        {tab === "details" ? <DetailsPanel project={project} conversation={conversation} stats={stats} sessionState={sessionState} isCompacting={isCompacting} isRefining={isRefining} onRunCommand={onRunCommand} onCloneSession={onCloneSession} /> : null}
       </div>
     </aside>
   );
@@ -1702,40 +1989,130 @@ function ActivityPanel({ activities, conversation }: { activities: ActivityItem[
   );
 }
 
-function SessionPanel({ project, conversation, sessionState, schedules, heartbeat, heartbeats, subagents, observedSubagent, onRunCommand, onObserveSubagent }: { project: Project; conversation: Conversation; sessionState?: AgentSessionState; schedules: AgentSchedule[]; heartbeat?: AgentSchedule | null; heartbeats: AgentHeartbeatSummary[]; subagents: AgentRlmChild[]; observedSubagent?: { activeSessionId: string; messages: ChatMessage[]; closed?: boolean; error?: string }; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onObserveSubagent: (activeSessionId?: string) => Promise<void> }) {
+export type SessionPanelSection = "runtime" | "attachments" | "goal" | "agents" | "supervision";
+
+export interface SessionPanelSummary {
+  attachments: number;
+  queued: number;
+  hasActiveAction: boolean;
+  goals: number;
+  agents: number;
+  supervision: number;
+}
+
+export function buildSessionPanelSummary(
+  conversation: Pick<Conversation, "messages">,
+  sessionState: AgentSessionState | undefined,
+  schedules: AgentSchedule[],
+  heartbeat: AgentSchedule | null | undefined,
+  heartbeats: AgentHeartbeatSummary[],
+  subagents: AgentRlmChild[],
+): SessionPanelSummary {
+  const actions = sessionState?.sessionActions;
+  const remoteHeartbeats = heartbeats.filter((item) => (
+    item.job.id !== heartbeat?.id && ["active", "paused"].includes(item.job.status)
+  ));
+  const activeSchedules = schedules.filter((job) => (
+    job.source !== "heartbeat" && job.source !== "rlm_heartbeat" && job.status === "active"
+  ));
+  return {
+    attachments: conversation.messages.reduce((count, message) => count + (message.attachments?.length ?? 0), 0),
+    queued: (actions?.steering.length ?? 0) + (actions?.followUps.length ?? 0),
+    hasActiveAction: Boolean(actions?.active),
+    goals: sessionGoalCount(sessionState?.goal),
+    agents: subagents.length,
+    supervision: (heartbeat ? 1 : 0) + activeSchedules.length + remoteHeartbeats.length,
+  };
+}
+
+function SessionPanel({ project, conversation, sessionState, goalMutation, schedules, heartbeat, heartbeats, subagents, observedSubagent, onRunCommand, onObserveSubagent }: { project: Project; conversation: Conversation; sessionState?: AgentSessionState; goalMutation?: GoalMutationRuntimeState; schedules: AgentSchedule[]; heartbeat?: AgentSchedule | null; heartbeats: AgentHeartbeatSummary[]; subagents: AgentRlmChild[]; observedSubagent?: { activeSessionId: string; messages: ChatMessage[]; closed?: boolean; error?: string }; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onObserveSubagent: (activeSessionId?: string) => Promise<void> }) {
   const { language, locale } = useI18n();
+  const [section, setSection] = useState<SessionPanelSection>("runtime");
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState<string>();
+  useEffect(() => {
+    setRefreshing(false);
+    setRefreshError(undefined);
+  }, [conversation.id]);
   const attachments = conversation.messages.flatMap((message) => message.attachments ?? []);
   const sessionActions = sessionState?.sessionActions;
   const queued = [
     ...(sessionActions?.steering ?? []).map((text) => ({ lane: bi(language, "Immédiate", "Immediate"), text })),
     ...(sessionActions?.followUps ?? []).map((text) => ({ lane: bi(language, "Suivi", "Follow-up"), text })),
   ];
+  const summary = buildSessionPanelSummary(conversation, sessionState, schedules, heartbeat, heartbeats, subagents);
+  const sections: Array<{ id: SessionPanelSection; label: string; icon: React.ReactNode; count: number }> = [
+    { id: "runtime", label: "Session", icon: <ListTree size={14} />, count: summary.queued + Number(summary.hasActiveAction) },
+    { id: "attachments", label: bi(language, "Fichiers", "Files"), icon: <Paperclip size={14} />, count: summary.attachments },
+    { id: "goal", label: "Goal", icon: <Target size={14} />, count: summary.goals },
+    { id: "agents", label: bi(language, "Agents", "Agents"), icon: <Bot size={14} />, count: summary.agents },
+    { id: "supervision", label: bi(language, "Suivi", "Monitor"), icon: <HeartPulse size={14} />, count: summary.supervision },
+  ];
+  const refreshSession = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    setRefreshError(undefined);
+    try {
+      await onRunCommand("get_state");
+    } catch (error) {
+      setRefreshError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRefreshing(false);
+    }
+  };
+  const handleSectionKeyDown = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
+    let nextIndex = index;
+    if (event.key === "ArrowRight") nextIndex = (index + 1) % sections.length;
+    else if (event.key === "ArrowLeft") nextIndex = (index - 1 + sections.length) % sections.length;
+    else if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = sections.length - 1;
+    else return;
+    event.preventDefault();
+    setSection(sections[nextIndex]!.id);
+    event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>("[role=tab]")[nextIndex]?.focus();
+  };
   return (
-    <div className="inspector-section">
-      <div className="section-title"><span>{bi(language, "Espace de travail", "Workspace")}</span></div>
-      <div className="detail-card"><div><FolderIcon /><span><strong>{project.name}</strong><small>{project.path}</small></span></div><Badge tone="success">{bi(language, "Local", "Local")}</Badge></div>
-      <div className="section-title"><span>{bi(language, "Pièces jointes explicites", "Explicit attachments")}</span><small>{attachments.length} {attachments.length === 1 ? bi(language, "fichier", "file") : bi(language, "fichiers", "files")}</small></div>
-      {attachments.length ? <div className="context-files">{attachments.map((attachment) => <div key={attachment.id}>{attachment.isImage && attachment.previewDataUrl ? <img className="context-file-preview" src={attachment.previewDataUrl} alt="" /> : <AttachmentGlyph attachment={attachment} size={16} />}<span><strong>{attachment.name}</strong><small>{attachmentMetaLabel(attachment, language, locale)}</small></span></div>)}</div> : <InspectorEmpty icon={<Layers3 size={22} />} text={bi(language, "Ajoutez des fichiers ou des images depuis le composer.", "Add files or images from the composer.")} />}
-      <div className="section-title"><span>{bi(language, "File d’instructions Prime Agent", "Prime Agent instruction queue")}</span><Badge tone={queued.length ? "accent" : "neutral"}>{queued.length}</Badge></div>
-      {sessionActions?.active ? <div className="detail-card"><div><LoaderCircle size={16} className="spin" /><span><strong>{bi(language, "Action active", "Active action")}</strong><small>{sessionActions.active.label ?? (sessionActions.active.kind === "turn" ? bi(language, "Tour de l’agent", "Agent turn") : bi(language, "Commande de session", "Session command"))} · {sessionActions.active.phase}</small></span></div><Badge tone="accent">Live</Badge></div> : null}
-      {queued.length ? <div className="context-files queue-items">{queued.map((item, index) => <div key={`${item.lane}:${index}:${item.text.slice(0, 32)}`}><Layers3 size={16} /><span><strong>{item.lane}</strong><small>{item.text}</small></span></div>)}</div> : <InspectorEmpty icon={<Layers3 size={22} />} text={bi(language, "Aucune instruction en attente dans Prime Agent.", "No instruction is queued in Prime Agent.")} />}
-      <GoalPanel conversation={conversation} goal={sessionState?.goal} onRunCommand={onRunCommand} />
-      <SubagentsPanel subagents={subagents} observed={observedSubagent} onObserve={onObserveSubagent} />
-      <SupervisionPanel schedules={schedules} heartbeat={heartbeat} heartbeats={heartbeats} onRunCommand={onRunCommand} />
-      <Button variant="ghost" className="full-button" onClick={() => void onRunCommand("get_state")}><RefreshCw size={14} />{bi(language, "Actualiser la session", "Refresh session")}</Button>
+    <div className="inspector-section session-panel">
+      <nav className="session-section-tabs" role="tablist" aria-label={bi(language, "Sections de la session", "Session sections")}>
+        {sections.map((item, index) => <button id={`session-tab-${item.id}`} key={item.id} type="button" role="tab" aria-selected={section === item.id} aria-controls={`session-panel-${item.id}`} tabIndex={section === item.id ? 0 : -1} className={section === item.id ? "is-active" : ""} onClick={() => setSection(item.id)} onKeyDown={(event) => handleSectionKeyDown(event, index)}>{item.icon}<span className="session-tab-label">{item.label}</span><span className="session-tab-count">{item.count}</span></button>)}
+      </nav>
+      <div id={`session-panel-${section}`} className="session-area-content" role="tabpanel" aria-labelledby={`session-tab-${section}`}>
+        {section === "runtime" ? <>
+          <header className="session-area-heading"><div><h3>{bi(language, "État de la session", "Session state")}</h3><p>{bi(language, "Processus actif, espace de travail et file d’instructions remontés par Prime Agent.", "Live process, workspace, and instruction queue reported by Prime Agent.")}</p></div><Badge tone={sessionState ? "success" : "neutral"}>{sessionState ? bi(language, "État disponible", "State available") : bi(language, "En attente", "Pending")}</Badge></header>
+          <div className="detail-card"><div><FolderIcon /><span><strong>{project.name}</strong><small>{project.path}</small></span></div><Badge tone="success">{bi(language, "Local", "Local")}</Badge></div>
+          <div className="section-title"><span>{bi(language, "File d’instructions", "Instruction queue")}</span><Badge tone={queued.length ? "accent" : "neutral"}>{queued.length}</Badge></div>
+          {sessionActions?.active ? <div className="detail-card session-active-action"><div><LoaderCircle size={16} className="spin" /><span><strong>{bi(language, "Action active", "Active action")}</strong><small>{sessionActions.active.label ?? (sessionActions.active.kind === "turn" ? bi(language, "Tour de l’agent", "Agent turn") : bi(language, "Commande de session", "Session command"))} · {sessionActions.active.phase}</small></span></div><Badge tone="accent">Live</Badge></div> : null}
+          {queued.length ? <div className="context-files queue-items">{queued.map((item, index) => <div key={`${item.lane}:${index}:${item.text.slice(0, 32)}`}><Layers3 size={16} /><span><strong>{item.lane}</strong><small>{item.text}</small></span></div>)}</div> : <InspectorEmpty icon={<Layers3 size={22} />} text={bi(language, "Aucune instruction en attente dans Prime Agent.", "No instruction is queued in Prime Agent.")} />}
+          <Button variant="ghost" className="full-button" loading={refreshing} disabled={refreshing} onClick={() => void refreshSession()}>{refreshing ? null : <RefreshCw size={14} />}{bi(language, "Actualiser l’état", "Refresh state")}</Button>
+          {refreshError ? <p className="trust-note" role="alert"><CircleAlert size={14} />{refreshError}</p> : null}
+        </> : null}
+        {section === "attachments" ? <>
+          <header className="session-area-heading"><div><h3>{bi(language, "Pièces jointes", "Attachments")}</h3><p>{bi(language, "Fichiers et images explicitement associés aux messages de cette conversation.", "Files and images explicitly associated with messages in this conversation.")}</p></div><Badge tone={attachments.length ? "accent" : "neutral"}>{attachments.length}</Badge></header>
+          {attachments.length ? <div className="context-files session-attachment-list">{attachments.map((attachment, index) => <div key={`${attachment.id}:${index}`}>{attachment.isImage && attachment.previewDataUrl ? <img className="context-file-preview" src={attachment.previewDataUrl} alt={attachment.name} /> : <AttachmentGlyph attachment={attachment} size={16} />}<span><strong>{attachment.name}</strong><small>{attachmentMetaLabel(attachment, language, locale)}</small></span></div>)}</div> : <InspectorEmpty icon={<Paperclip size={22} />} text={bi(language, "Aucune pièce jointe dans les messages de cette conversation.", "No attachment is present in this conversation's messages.")} />}
+        </> : null}
+        {section === "goal" ? <GoalPanel key={`goal:${conversation.id}`} conversation={conversation} goal={sessionState?.goal} goalMutation={goalMutation} onRunCommand={onRunCommand} /> : null}
+        {section === "agents" ? <SubagentsPanel key={`agents:${conversation.id}`} subagents={subagents} observed={observedSubagent} onObserve={onObserveSubagent} /> : null}
+        {section === "supervision" ? <SupervisionPanel key={`supervision:${conversation.id}`} schedules={schedules} heartbeat={heartbeat} heartbeats={heartbeats} onRunCommand={onRunCommand} /> : null}
+      </div>
     </div>
   );
 }
 
-function GoalPanel({ conversation, goal, onRunCommand }: { conversation: Conversation; goal?: AgentSessionState["goal"]; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void> }) {
+export function isGoalPanelBusy(localBusy: boolean, goalMutation?: GoalMutationRuntimeState): boolean {
+  return localBusy || Boolean(goalMutation && goalMutation.phase !== "error");
+}
+
+function GoalPanel({ conversation, goal, goalMutation, onRunCommand }: { conversation: Conversation; goal?: AgentSessionState["goal"]; goalMutation?: GoalMutationRuntimeState; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void> }) {
   const { language, locale } = useI18n();
   const [editing, setEditing] = useState(false);
   const [objective, setObjective] = useState("");
   const [budget, setBudget] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [localBusy, setLocalBusy] = useState(false);
   const [error, setError] = useState<string>();
+  const busy = isGoalPanelBusy(localBusy, goalMutation);
+  const displayError = error ?? (goalMutation?.phase === "error" ? goalMutation.error : undefined);
   const runGoal = async (command: string) => {
-    setBusy(true);
+    setLocalBusy(true);
     setError(undefined);
     try {
       await onRunCommand("prompt", {
@@ -1746,7 +2123,7 @@ function GoalPanel({ conversation, goal, onRunCommand }: { conversation: Convers
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      setBusy(false);
+      setLocalBusy(false);
     }
   };
   const submit = () => {
@@ -1756,7 +2133,61 @@ function GoalPanel({ conversation, goal, onRunCommand }: { conversation: Convers
     void runGoal(`/goal${Number.isFinite(parsedBudget) && parsedBudget > 0 ? ` --budget ${parsedBudget}` : ""} ${trimmed}`);
   };
   const tokens = goal?.tokensUsed ? compactNumber(goal.tokensUsed, locale) : "0";
-  return <section className="goal-panel"><div className="section-title"><span>{bi(language, "Objectif persistant", "Persistent goal")}</span><Badge tone={goal?.status === "active" ? "accent" : goal?.status === "error" ? "danger" : "neutral"}>{goal?.status ?? bi(language, "inactif", "inactive")}</Badge></div><p className="supervision-explainer">{bi(language, "Le mode Goal poursuit un objectif entre plusieurs tours et peut continuer jusqu’à son achèvement ou sa limite de tokens.", "Goal mode pursues an objective across turns and can continue until completion or its token limit.")}</p>{goal?.objective ? <div className="goal-card"><Target size={17} /><div><strong>{goal.objective}</strong><small>{tokens} {bi(language, "tokens utilisés", "tokens used")}{goal.tokenBudget ? ` / ${compactNumber(goal.tokenBudget, locale)}` : ""}{goal.lastReason ? ` · ${goal.lastReason}` : ""}</small></div></div> : <InspectorEmpty icon={<Target size={21} />} text={bi(language, "Aucun objectif persistant pour cette session.", "No persistent goal for this session.")} />}{goal?.objective ? <div className="goal-actions">{goal.status === "paused" ? <Button variant="ghost" disabled={busy} onClick={() => void runGoal("/goal resume")}><Play size={14} />{bi(language, "Reprendre", "Resume")}</Button> : <Button variant="ghost" disabled={busy || goal.status !== "active"} onClick={() => void runGoal("/goal pause")}><Pause size={14} />{bi(language, "Pause", "Pause")}</Button>}<Button variant="ghost" disabled={busy} onClick={() => void runGoal("/goal clear")}><X size={14} />{bi(language, "Effacer", "Clear")}</Button></div> : <Button variant="ghost" onClick={() => setEditing((current) => !current)}><Plus size={14} />{bi(language, "Nouvel objectif", "New goal")}</Button>}{editing ? <div className="supervision-editor"><label><span>{bi(language, "Objectif", "Objective")}</span><textarea rows={3} value={objective} onChange={(event) => setObjective(event.target.value)} autoFocus /></label><label><span>{bi(language, "Budget de tokens (optionnel)", "Token budget (optional)")}</span><input inputMode="numeric" value={budget} onChange={(event) => setBudget(event.target.value.replace(/[^0-9]/g, ""))} placeholder="50000" /></label><Button disabled={!objective.trim() || busy} onClick={submit}>{busy ? <LoaderCircle size={14} className="spin" /> : <Target size={14} />}{bi(language, "Démarrer", "Start")}</Button></div> : null}{error ? <p className="trust-note" role="alert"><CircleAlert size={14} />{error}</p> : null}</section>;
+  const statusLabel = goal?.status === "active"
+    ? bi(language, "actif", "active")
+    : goal?.status === "paused"
+      ? bi(language, "en pause", "paused")
+      : goal?.status === "budget_limited"
+        ? bi(language, "budget atteint", "budget reached")
+        : goal?.status === "complete"
+          ? bi(language, "terminé", "complete")
+          : goal?.status === "error"
+            ? bi(language, "en erreur", "error")
+            : bi(language, "inactif", "inactive");
+  const terminal = goal?.status === "complete" || goal?.status === "error";
+  const badgeTone = goal?.status === "active"
+    ? "accent"
+    : goal?.status === "complete"
+      ? "success"
+      : goal?.status === "error"
+        ? "danger"
+        : "neutral";
+  return (
+    <section className="goal-panel" aria-busy={busy}>
+      <div className="section-title">
+        <span>{bi(language, "Objectif persistant", "Persistent goal")}</span>
+        <Badge tone={badgeTone}>{statusLabel}</Badge>
+      </div>
+      <p className="supervision-explainer">
+        {goal?.status === "complete"
+          ? bi(language, "Prime Agent conserve le dernier objectif terminé comme historique. Vous pouvez l’effacer ou démarrer directement un nouvel objectif.", "Prime Agent retains the last completed goal as history. You can clear it or start a new goal directly.")
+          : bi(language, "Le mode Goal poursuit un objectif entre plusieurs tours et peut continuer jusqu’à son achèvement ou sa limite de tokens.", "Goal mode pursues an objective across turns and can continue until completion or its token limit.")}
+      </p>
+      {goal?.objective ? (
+        <div className="goal-card">
+          <Target size={17} />
+          <div>
+            <strong>{goal.objective}</strong>
+            <small>{tokens} {bi(language, "tokens utilisés", "tokens used")}{goal.tokenBudget ? ` / ${compactNumber(goal.tokenBudget, locale)}` : ""}{goal.lastReason ? ` · ${goal.lastReason}` : ""}</small>
+          </div>
+        </div>
+      ) : <InspectorEmpty icon={<Target size={21} />} text={bi(language, "Aucun objectif persistant pour cette session.", "No persistent goal for this session.")} />}
+      {goal?.objective ? (
+        <div className="goal-actions">
+          {goal.status === "active" ? <Button variant="ghost" disabled={busy} onClick={() => void runGoal("/goal pause")}><Pause size={14} />{bi(language, "Pause", "Pause")}</Button> : null}
+          {goal.status === "paused" ? <Button variant="ghost" disabled={busy} onClick={() => void runGoal("/goal resume")}><Play size={14} />{bi(language, "Reprendre", "Resume")}</Button> : null}
+          {terminal ? <Button variant="ghost" disabled={busy} onClick={() => setEditing((current) => !current)}><Plus size={14} />{bi(language, "Nouvel objectif", "New goal")}</Button> : null}
+          <Button variant="ghost" disabled={busy} onClick={() => void runGoal("/goal clear")}>
+            {busy ? <LoaderCircle size={14} className="spin" /> : <X size={14} />}
+            {busy ? bi(language, "En attente…", "Waiting…") : bi(language, "Effacer", "Clear")}
+          </Button>
+        </div>
+      ) : <Button variant="ghost" disabled={busy} onClick={() => setEditing((current) => !current)}><Plus size={14} />{bi(language, "Nouvel objectif", "New goal")}</Button>}
+      {busy ? <p className="trust-note" role="status" aria-live="polite"><LoaderCircle size={14} className="spin" />{bi(language, "Prime Agent applique la modification. Elle peut attendre la fin du tour en cours.", "Prime Agent is applying the change. It may wait for the current turn to finish.")}</p> : null}
+      {editing ? <div className="supervision-editor"><label><span>{bi(language, "Objectif", "Objective")}</span><textarea rows={3} value={objective} onChange={(event) => setObjective(event.target.value)} autoFocus /></label><label><span>{bi(language, "Budget de tokens (optionnel)", "Token budget (optional)")}</span><input inputMode="numeric" value={budget} onChange={(event) => setBudget(event.target.value.replace(/[^0-9]/g, ""))} placeholder="50000" /></label><Button disabled={!objective.trim() || busy} onClick={submit}>{busy ? <LoaderCircle size={14} className="spin" /> : <Target size={14} />}{bi(language, "Démarrer", "Start")}</Button></div> : null}
+      {displayError ? <p className="trust-note" role="alert"><CircleAlert size={14} />{displayError}</p> : null}
+    </section>
+  );
 }
 
 function SubagentsPanel({ subagents, observed, onObserve }: { subagents: AgentRlmChild[]; observed?: { activeSessionId: string; messages: ChatMessage[]; closed?: boolean; error?: string }; onObserve: (activeSessionId?: string) => Promise<void> }) {
@@ -1810,7 +2241,9 @@ function SupervisionPanel({ schedules, heartbeat, heartbeats, onRunCommand }: { 
     }
   };
   const activeSchedules = schedules.filter((job) => job.source !== "heartbeat" && job.source !== "rlm_heartbeat" && job.status === "active");
-  const remoteHeartbeats = heartbeats.filter((item) => item.job.id !== heartbeat?.id);
+  const remoteHeartbeats = heartbeats.filter((item) => (
+    item.job.id !== heartbeat?.id && ["active", "paused"].includes(item.job.status)
+  ));
   const supervisionCount = (heartbeat ? 1 : 0) + activeSchedules.length + remoteHeartbeats.length;
   return (
     <section className="supervision-panel">
@@ -1819,7 +2252,7 @@ function SupervisionPanel({ schedules, heartbeat, heartbeats, onRunCommand }: { 
       {heartbeat ? <div className="supervision-job"><HeartPulse size={16} /><span><strong>{bi(language, "Heartbeat de cette session", "This session heartbeat")}</strong><small>{heartbeat.schedule.expression} · {heartbeat.deliveryMode === "follow_up" ? bi(language, "nouveau tour", "new turn") : bi(language, "oriente le tour", "steers turn")}{heartbeat.nextRunAt ? ` · ${new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit" }).format(new Date(heartbeat.nextRunAt))}` : ""}</small></span><IconButton label={heartbeat.status === "paused" ? bi(language, "Reprendre", "Resume") : bi(language, "Mettre en pause", "Pause")} onClick={() => void runAction("update_heartbeat", { action: heartbeat.status === "paused" ? "resume" : "pause" })}>{heartbeat.status === "paused" ? <Play size={14} /> : <Pause size={14} />}</IconButton><IconButton label={bi(language, "Supprimer le heartbeat", "Clear heartbeat")} onClick={() => void runAction("update_heartbeat", { action: "clear" })}><X size={14} /></IconButton></div> : null}
       {activeSchedules.map((job) => <div className="supervision-job" key={job.id}><CalendarClock size={16} /><span><strong>{job.label || job.prompt}</strong><small>{job.schedule.expression}{job.nextRunAt ? ` · ${new Intl.DateTimeFormat(locale, { dateStyle: "short", timeStyle: "short" }).format(new Date(job.nextRunAt))}` : ""}</small></span><IconButton label={bi(language, "Annuler la tâche", "Cancel job")} onClick={() => void runAction("cancel_schedule", { jobId: job.id })}><X size={14} /></IconButton></div>)}
       {remoteHeartbeats.slice(0, 8).map((item) => <div className="supervision-job is-remote" key={item.job.id}><HeartPulse size={16} /><span><strong>{item.sessionName || item.firstMessage || item.job.label || item.job.sessionId}</strong><small>{item.job.schedule.expression} · {item.job.status}</small></span><IconButton label={item.job.status === "paused" ? bi(language, "Reprendre", "Resume") : bi(language, "Mettre en pause", "Pause")} onClick={() => void runAction("manage_heartbeat", { activeSessionId: item.job.activeSessionId, jobId: item.job.id, action: item.job.status === "paused" ? "resume" : "pause" })}>{item.job.status === "paused" ? <Play size={14} /> : <Pause size={14} />}</IconButton><IconButton label={bi(language, "Arrêter", "Stop")} onClick={() => void runAction("manage_heartbeat", { activeSessionId: item.job.activeSessionId, jobId: item.job.id, action: "stop" })}><X size={14} /></IconButton></div>)}
-      {!heartbeat && activeSchedules.length === 0 ? <InspectorEmpty icon={<HeartPulse size={21} />} text={bi(language, "Aucune supervision planifiée pour cette session.", "No scheduled supervision for this session.")} /> : null}
+      {!heartbeat && activeSchedules.length === 0 && remoteHeartbeats.length === 0 ? <InspectorEmpty icon={<HeartPulse size={21} />} text={bi(language, "Aucune supervision planifiée pour cette session.", "No scheduled supervision for this session.")} /> : null}
       <div className="supervision-actions"><Button variant="ghost" onClick={() => setEditor((current) => current === "heartbeat" ? undefined : "heartbeat")}><HeartPulse size={14} />{bi(language, "Heartbeat", "Heartbeat")}</Button><Button variant="ghost" onClick={() => setEditor((current) => current === "schedule" ? undefined : "schedule")}><CalendarClock size={14} />{bi(language, "Planifier", "Schedule")}</Button></div>
       {error && !editor ? <p className="trust-note" role="alert"><CircleAlert size={14} />{error}</p> : null}
       {editor ? <div className="supervision-editor"><label><span>{bi(language, "Fréquence ou date", "Frequency or date")}</span><input value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="every 30m" /></label><label><span>{bi(language, "Instruction à exécuter", "Instruction to run")}</span><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={3} /></label>{editor === "heartbeat" ? <label><span>{bi(language, "Si l’agent travaille déjà", "If the agent is already working")}</span><select value={deliveryMode} onChange={(event) => setDeliveryMode(event.target.value as "steer" | "follow_up")}><option value="steer">{bi(language, "Orienter le travail en cours", "Steer current work")}</option><option value="follow_up">{bi(language, "Attendre puis ouvrir un nouveau tour", "Wait, then start a new turn")}</option></select></label> : null}{error ? <p className="trust-note" role="alert"><CircleAlert size={14} />{error}</p> : null}<Button disabled={!prompt.trim() || !schedule.trim() || submitting} onClick={() => void submit()}>{submitting ? <LoaderCircle size={14} className="spin" /> : <Check size={14} />}{bi(language, "Activer", "Enable")}</Button></div> : null}
@@ -1949,11 +2382,16 @@ function ChangesPanel({ projectPath, changes, draft, onDraftChange }: { projectP
   );
 }
 
-function DetailsPanel({ project, conversation, stats, sessionState, isCompacting, onRunCommand, onCloneSession }: { project: Project; conversation: Conversation; stats?: SessionStats; sessionState?: AgentSessionState; isCompacting: boolean; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onCloneSession: () => Promise<void> }) {
+export function isRefineControlBusy(isRefining: boolean, localAction?: string) {
+  return isRefining || localAction === "refine";
+}
+
+function DetailsPanel({ project, conversation, stats, sessionState, isCompacting, isRefining, onRunCommand, onCloneSession }: { project: Project; conversation: Conversation; stats?: SessionStats; sessionState?: AgentSessionState; isCompacting: boolean; isRefining: boolean; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onCloneSession: () => Promise<void> }) {
   const { language, locale } = useI18n();
   const [busyAction, setBusyAction] = useState<string>();
   const [actionError, setActionError] = useState<string>();
   const conversationBusy = ["starting", "streaming", "tool", "queued"].includes(conversation.status);
+  const refineBusy = isRefineControlBusy(isRefining, busyAction);
   const runAction = async (key: string, action: () => Promise<void>) => {
     if (busyAction) return;
     setBusyAction(key);
@@ -1978,19 +2416,21 @@ function DetailsPanel({ project, conversation, stats, sessionState, isCompacting
       <dl className="details-list"><div><dt>{bi(language, "Modèle", "Model")}</dt><dd>{sessionState?.model?.name ?? shortModel(conversation.model) ?? bi(language, "Par défaut", "Default")}</dd></div><div><dt>{bi(language, "Raisonnement", "Reasoning")}</dt><dd>{thinkingLabel(conversation.thinkingLevel, language)}</dd></div><div><dt>{bi(language, "Projet", "Project")}</dt><dd>{project.name}</dd></div><div><dt>Session</dt><dd className="mono">{sessionState?.sessionId?.slice(0, 12) ?? conversation.sessionId?.slice(0, 12) ?? bi(language, "En attente", "Pending")}</dd></div><div><dt>{bi(language, "Persistance", "Persistence")}</dt><dd>{conversation.sessionPath ? bi(language, "Activée", "Enabled") : bi(language, "Nouvelle session", "New session")}</dd></div></dl>
       <div className="section-title"><span>{bi(language, "Maintenance", "Maintenance")}</span></div>
       {isCompacting ? <p className="maintenance-status" role="status"><LoaderCircle size={14} className="spin" />{bi(language, "Compactage en cours. Les statistiques seront actualisées à la fin.", "Compaction in progress. Statistics will refresh when it finishes.")}</p> : null}
-      <div className="maintenance-actions"><Button variant="secondary" loading={isCompacting || busyAction === "compact"} disabled={Boolean(busyAction) || conversationBusy || isCompacting} onClick={() => void runAction("compact", () => onRunCommand("compact"))}><ArchiveRestore size={15} />{bi(language, "Compacter", "Compact")}</Button><Button variant="secondary" loading={busyAction === "refine"} disabled={Boolean(busyAction) || isCompacting} onClick={() => void runAction("refine", () => onRunCommand("refine"))}><WandSparkles size={15} />{bi(language, "Raffiner", "Refine")}</Button><Button variant="secondary" loading={busyAction === "clone"} disabled={Boolean(busyAction)} onClick={() => void runAction("clone", onCloneSession)}><Copy size={15} />{bi(language, "Dupliquer", "Duplicate")}</Button><Button variant="secondary" loading={busyAction === "export_html"} disabled={Boolean(busyAction)} onClick={() => void runAction("export_html", () => onRunCommand("export_html"))}><ArrowDown size={15} />{bi(language, "Exporter", "Export")}</Button></div>
+      {isRefining ? <p className="maintenance-status" role="status"><LoaderCircle size={14} className="spin" />{bi(language, "Raffinement en cours. Prime Agent consolide les apprentissages de cette session.", "Refinement in progress. Prime Agent is consolidating what this session learned.")}</p> : null}
+      <div className="maintenance-actions"><Button variant="secondary" loading={isCompacting || busyAction === "compact"} disabled={Boolean(busyAction) || conversationBusy || isCompacting} onClick={() => void runAction("compact", () => onRunCommand("compact"))}><ArchiveRestore size={15} />{bi(language, "Compacter", "Compact")}</Button><Button variant="secondary" loading={refineBusy} disabled={Boolean(busyAction) || isCompacting || refineBusy} onClick={() => void runAction("refine", () => onRunCommand("refine"))}>{refineBusy ? null : <WandSparkles size={15} />}{bi(language, "Raffiner", "Refine")}</Button><Button variant="secondary" loading={busyAction === "clone"} disabled={Boolean(busyAction)} onClick={() => void runAction("clone", onCloneSession)}><Copy size={15} />{bi(language, "Dupliquer", "Duplicate")}</Button><Button variant="secondary" loading={busyAction === "export_html"} disabled={Boolean(busyAction)} onClick={() => void runAction("export_html", () => onRunCommand("export_html"))}><ArrowDown size={15} />{bi(language, "Exporter", "Export")}</Button></div>
       {actionError ? <p className="popover-inline-error" role="alert"><CircleAlert size={14} />{actionError}</p> : null}
     </div>
   );
 }
 
-function ToolsPopover({ commands, busyAction, compactDisabledReason, onChoose, onCompact, onRefine }: { commands: SlashCommand[]; busyAction?: "compact" | "refine"; compactDisabledReason?: string; onChoose: (command: SlashCommand) => void; onCompact: () => void; onRefine: () => void }) {
+function ToolsPopover({ commands, busyAction, compactDisabledReason, isRefining, onChoose, onCompact, onRefine }: { commands: SlashCommand[]; busyAction?: "compact" | "refine"; compactDisabledReason?: string; isRefining: boolean; onChoose: (command: SlashCommand) => void; onCompact: () => void; onRefine: () => void }) {
   const { language } = useI18n();
+  const refineBusy = isRefineControlBusy(isRefining, busyAction);
   return (
     <div className="popover tools-popover">
       <div className="popover-label">{bi(language, "Actions rapides", "Quick actions")}</div>
       <button type="button" onClick={onCompact} disabled={Boolean(compactDisabledReason || busyAction)} title={compactDisabledReason}>{busyAction === "compact" ? <LoaderCircle size={15} className="spin" /> : <ArchiveRestore size={15} />}<span><strong>{bi(language, "Compacter le contexte", "Compact context")}</strong><small>{compactDisabledReason ?? bi(language, "Résumer la session pour libérer de la place", "Summarize the session to free up context")}</small></span></button>
-      <button type="button" onClick={onRefine} disabled={Boolean(busyAction)}>{busyAction === "refine" ? <LoaderCircle size={15} className="spin" /> : <WandSparkles size={15} />}<span><strong>{bi(language, "Raffiner le harness", "Refine the harness")}</strong><small>{bi(language, "Capitaliser les apprentissages de la session", "Capture what the session learned")}</small></span></button>
+      <button type="button" onClick={onRefine} disabled={Boolean(busyAction) || refineBusy} aria-busy={refineBusy}>{refineBusy ? <LoaderCircle size={15} className="spin" /> : <WandSparkles size={15} />}<span><strong>{refineBusy ? bi(language, "Raffinement en cours…", "Refinement in progress…") : bi(language, "Raffiner le harness", "Refine the harness")}</strong><small>{refineBusy ? bi(language, "Prime Agent consolide cette session", "Prime Agent is consolidating this session") : bi(language, "Capitaliser les apprentissages de la session", "Capture what the session learned")}</small></span></button>
       {commands.length ? <><div className="popover-separator" /><div className="popover-label">{bi(language, "Skills et commandes", "Skills and commands")}</div>{commands.slice(0, 8).map((command) => <button key={command.name} type="button" onClick={() => onChoose(command)}><Zap size={15} /><span><strong>/{command.name}</strong><small>{command.description ?? command.source}</small></span></button>)}</> : null}
     </div>
   );

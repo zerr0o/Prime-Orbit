@@ -133,6 +133,7 @@ struct AgentOperations {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectSessionOperationKind {
     Compact,
+    Refine,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -793,7 +794,13 @@ fn runtime_busy_state(record: &[u8]) -> Option<bool> {
             }
         }
         Some("response") if event.get("command").and_then(Value::as_str) == Some("refine") => {
-            Some(false)
+            if event.get("success").and_then(Value::as_bool) == Some(false)
+                && is_daemon_response_acknowledgement_timeout(&event, "refine")
+            {
+                None
+            } else {
+                Some(false)
+            }
         }
         Some("response")
             if event.get("command").and_then(Value::as_str) == Some("get_state")
@@ -835,13 +842,20 @@ fn direct_session_operation_runtime_event(
         Some("response") => {
             let kind = match event.get("command").and_then(Value::as_str) {
                 Some("compact") => DirectSessionOperationKind::Compact,
+                Some("refine") => DirectSessionOperationKind::Refine,
                 _ => return None,
             };
             Some(DirectSessionOperationRuntimeEvent::Response {
                 kind,
                 acknowledgement_timed_out: event.get("success").and_then(Value::as_bool)
                     == Some(false)
-                    && is_daemon_response_acknowledgement_timeout(&event, "compact"),
+                    && is_daemon_response_acknowledgement_timeout(
+                        &event,
+                        match kind {
+                            DirectSessionOperationKind::Compact => "compact",
+                            DirectSessionOperationKind::Refine => "refine",
+                        },
+                    ),
             })
         }
         _ => None,
@@ -1120,6 +1134,7 @@ fn finish_runtime_write(operations: &mut AgentOperations) {
 fn direct_session_operation_kind(payload_type: Option<&str>) -> Option<DirectSessionOperationKind> {
     match payload_type {
         Some("compact") => Some(DirectSessionOperationKind::Compact),
+        Some("refine") => Some(DirectSessionOperationKind::Refine),
         _ => None,
     }
 }
@@ -1139,7 +1154,7 @@ fn begin_rpc_admission(
     if previous_busy.is_some() {
         // This mutation happens under the process-wide agent map lock. It
         // closes admission before the first byte reaches stdin, so another
-        // window cannot start a direct compact in the write gap.
+        // window cannot start another direct compact/refine in the write gap.
         *busy = true;
     }
     let direct_session_operation_token = direct_kind.map(|kind| {
@@ -2210,10 +2225,12 @@ fn send_rpc_blocking(
             payload_type,
         )
         .map_err(|error| match error {
-            RpcAdmissionError::Busy => {
+            RpcAdmissionError::Busy if payload_type == Some("refine") =>
+                "Prime Agent est déjà occupé. Attendez la fin du tour ou du raffinement avant de lancer un nouveau raffinement."
+                    .to_string(),
+            RpcAdmissionError::Busy =>
                 "Prime Agent est déjà occupé. Attendez la fin du tour ou du compactage avant de lancer un nouveau compactage."
-                    .to_string()
-            }
+                    .to_string(),
             RpcAdmissionError::Reloading => {
                 "Les ressources Prime Agent sont en cours de rechargement. Aucun message ou réglage ne peut être envoyé pendant cette opération."
                     .to_string()
@@ -3530,6 +3547,18 @@ mod tests {
             ),
             Some(false),
         );
+        assert_eq!(
+            runtime_busy_state(
+                br#"{"type":"response","command":"refine","success":false,"error":"Timed out after 600000ms waiting for the Prime Agent daemon response to \"refine\"."}"#,
+            ),
+            None,
+        );
+        assert_eq!(
+            runtime_busy_state(
+                br#"{"type":"response","command":"refine","success":false,"error":"Refinement refused"}"#,
+            ),
+            Some(false),
+        );
         assert!(rpc_starts_busy_operation(Some("prompt")));
         assert!(rpc_starts_busy_operation(Some("compact")));
         assert!(!rpc_starts_busy_operation(Some("get_state")));
@@ -3570,6 +3599,44 @@ mod tests {
         assert_eq!(
             state.1.direct_session_operation.map(|marker| marker.kind),
             Some(DirectSessionOperationKind::Compact),
+        );
+    }
+
+    #[test]
+    fn concurrent_direct_refine_admission_grants_exactly_one_writer() {
+        let state = Arc::new(Mutex::new((false, AgentOperations::default())));
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let mut state = state.lock();
+                    let (busy, operations) = &mut *state;
+                    begin_rpc_admission(busy, operations, Some("refine"))
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("admission worker"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(RpcAdmissionError::Busy)))
+                .count(),
+            1,
+        );
+        let state = state.lock();
+        assert!(state.0);
+        assert_eq!(state.1.runtime_writes, 1);
+        assert_eq!(
+            state.1.direct_session_operation.map(|marker| marker.kind),
+            Some(DirectSessionOperationKind::Refine),
         );
     }
 
@@ -3651,6 +3718,66 @@ mod tests {
         assert!(operations.direct_session_operation.is_some());
         apply_direct_session_operation_runtime_event(&mut operations, success);
         assert!(operations.direct_session_operation.is_none());
+    }
+
+    #[test]
+    fn refine_timeout_retains_an_unknown_fence_until_process_replacement() {
+        let timeout = br#"{"type":"response","command":"refine","success":false,"error":"Timed out after 600000ms waiting for the Prime Agent daemon response to \"refine\"."}"#;
+        let mut busy = false;
+        let mut operations = AgentOperations::default();
+        begin_rpc_admission(&mut busy, &mut operations, Some("refine")).expect("refine admission");
+        finish_runtime_write(&mut operations);
+
+        assert_eq!(runtime_busy_state(timeout), None);
+        apply_direct_session_operation_runtime_event(
+            &mut operations,
+            direct_session_operation_runtime_event(timeout).expect("timeout transition"),
+        );
+        assert!(busy);
+        assert!(operations
+            .direct_session_operation
+            .is_some_and(|marker| marker.kind == DirectSessionOperationKind::Refine
+                && marker.acknowledgement_timed_out));
+        assert!(direct_session_operation_runtime_event(
+            br#"{"type":"refine_complete","result":{}}"#
+        )
+        .is_none());
+        assert!(direct_session_operation_runtime_event(
+            br#"{"type":"refine_failed","error":"late automatic refinement"}"#,
+        )
+        .is_none());
+        assert_eq!(
+            begin_rpc_admission(&mut busy, &mut operations, Some("refine")),
+            Err(RpcAdmissionError::Busy),
+        );
+
+        let prompt = begin_rpc_admission(&mut busy, &mut operations, Some("prompt"))
+            .expect("prompts remain admissible while refine acknowledgement is unknown");
+        assert_eq!(prompt.previous_busy, Some(true));
+        finish_runtime_write(&mut operations);
+        let state = begin_rpc_admission(&mut busy, &mut operations, Some("get_state"))
+            .expect("state reads remain admissible while refine acknowledgement is unknown");
+        assert_eq!(state.previous_busy, None);
+        finish_runtime_write(&mut operations);
+        assert!(operations.direct_session_operation.is_some());
+    }
+
+    #[test]
+    fn normal_refine_response_releases_the_exact_native_fence() {
+        let response = br#"{"type":"response","command":"refine","success":true,"data":{}}"#;
+        let mut busy = false;
+        let mut operations = AgentOperations::default();
+        begin_rpc_admission(&mut busy, &mut operations, Some("refine")).expect("refine admission");
+        finish_runtime_write(&mut operations);
+
+        busy = runtime_busy_state(response).expect("terminal refine response");
+        apply_direct_session_operation_runtime_event(
+            &mut operations,
+            direct_session_operation_runtime_event(response).expect("refine response transition"),
+        );
+        assert!(!busy);
+        assert!(operations.direct_session_operation.is_none());
+        assert!(begin_rpc_admission(&mut busy, &mut operations, Some("refine")).is_ok());
     }
 
     #[test]

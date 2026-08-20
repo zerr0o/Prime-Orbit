@@ -492,6 +492,17 @@ export async function openGitFileFolder(cwd: string, path: string): Promise<void
   await invoke("open_git_file_folder", { cwd, path });
 }
 
+export async function openConversationPath(
+  cwd: string,
+  path: string,
+): Promise<void> {
+  if (!isNative()) return;
+  await invoke("open_conversation_path", {
+    cwd,
+    path,
+  });
+}
+
 export async function inspectPrimeAgentConnections(cwd?: string): Promise<PrimeAgentConnections> {
   if (!isNative()) {
     return {

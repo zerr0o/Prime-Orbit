@@ -4,6 +4,31 @@ All notable changes to Prime Orbit are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-08-21
+
+### Reliable session controls
+
+- Reconciled accepted Steer and follow-up messages from Prime Agent's persisted history when a fast queue transition or background navigation hides the live user event, preserving the authoritative turn order and attachment identity.
+- Made Goal mutations wait for the matching Prime Agent `goal_update`, survive navigation, and resynchronize the originating session. Completed goals remain inspectable history, are no longer counted as active, and can be cleared reliably.
+- Added explicit refinement progress and a native process-wide Compact/Refine admission fence so concurrent windows cannot start overlapping context maintenance operations.
+
+### Faster, clearer conversations
+
+- Isolated the transcript from draft persistence so typing in a long conversation no longer refilters, regroups, and reparses every historical Markdown message.
+- Memoized stable turns and tool content, limited streaming updates to the affected turn, and coalesced automatic scrolling per animation frame.
+- Collapsed Python executions by default, added detailed context-usage feedback, and reorganized Session into dedicated runtime, files, Goal, agents, and monitoring sections.
+
+### Navigation and desktop safety
+
+- Added the full conversation context menu outside the sidebar, including move, pin, rename, and archive actions.
+- Reopened the most recently updated active conversation when selecting a project instead of always creating a new one.
+- Moved main-agent and advisory RLM defaults into Models, blocked the WebView print shortcut, and routed Markdown links through explicit web or project-confined file handling.
+
+### Validation
+
+- Added targeted coverage for queue reconciliation, duplicate turns and attachments, Goal lifecycle races, long-transcript memoization, project navigation, conversation menus, safe links, keyboard shortcuts, context details, and Session sections.
+- Revalidated the TypeScript production build, complete frontend and Rust test suites, formatting, strict Clippy, Rust 1.88 compatibility, and the signed Windows release gates.
+
 ## [0.1.16] - 2026-08-20
 
 ### Transactional Prime Agent 0.7.4 runtime
@@ -205,6 +230,7 @@ All notable changes to Prime Orbit are documented in this file.
 - TypeScript build and checks.
 - Strict Rust Clippy validation with warnings denied.
 
+[0.1.17]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.17
 [0.1.16]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.16
 [0.1.15]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.15
 [0.1.14]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.14

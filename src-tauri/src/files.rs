@@ -1595,6 +1595,78 @@ fn validated_project_folder(path: String) -> Result<PathBuf, String> {
         .map_err(|error| format!("Impossible de résoudre {}: {error}", path.display()))
 }
 
+fn project_path_metadata(root: &Path, candidate: &Path) -> Result<fs::Metadata, String> {
+    let relative = candidate
+        .strip_prefix(root)
+        .map_err(|_| "Prime Orbit refuse d’ouvrir un chemin situé hors du projet".to_string())?;
+    let mut current = root.to_path_buf();
+    let mut metadata = fs::symlink_metadata(&current)
+        .map_err(|error| format!("Le projet {} est inaccessible: {error}", root.display()))?;
+    for component in relative.components() {
+        let Component::Normal(segment) = component else {
+            continue;
+        };
+        current.push(segment);
+        metadata = fs::symlink_metadata(&current).map_err(|error| {
+            format!(
+                "Le fichier proposé par Prime Agent est inaccessible ({}): {error}",
+                current.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(
+                "Prime Orbit refuse d’ouvrir un lien symbolique proposé par l’agent".to_string(),
+            );
+        }
+    }
+    Ok(metadata)
+}
+
+fn resolve_conversation_path(cwd: String, requested_path: String) -> Result<PathBuf, String> {
+    let root = validated_project_folder(cwd)?;
+    if requested_path.trim().is_empty() || requested_path.contains('\0') {
+        return Err("Le chemin proposé par Prime Agent est invalide".to_string());
+    }
+    let requested = PathBuf::from(requested_path);
+    if requested
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err("Prime Orbit refuse les chemins qui sortent du projet".to_string());
+    }
+    let candidate = if requested.is_absolute() {
+        if !requested.starts_with(&root) {
+            return Err("Prime Orbit refuse d’ouvrir un chemin situé hors du projet".to_string());
+        }
+        requested
+    } else {
+        if requested
+            .components()
+            .any(|component| matches!(component, Component::RootDir | Component::Prefix(_)))
+        {
+            return Err("Prime Orbit refuse les chemins qui sortent du projet".to_string());
+        }
+        root.join(requested)
+    };
+    let metadata = project_path_metadata(&root, &candidate)?;
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err(format!(
+            "{} n’est ni un fichier ni un dossier ouvrable",
+            candidate.display()
+        ));
+    }
+    let resolved = canonicalize(&candidate).map_err(|error| {
+        format!(
+            "Impossible de résoudre le chemin proposé par Prime Agent ({}): {error}",
+            candidate.display()
+        )
+    })?;
+    if !resolved.starts_with(&root) {
+        return Err("Prime Orbit refuse d’ouvrir un chemin situé hors du projet".to_string());
+    }
+    Ok(resolved)
+}
+
 fn containing_git_folder(cwd: String, relative_path: String) -> Result<PathBuf, String> {
     let root = validated_git_cwd(cwd)?;
     let relative = PathBuf::from(relative_path);
@@ -1640,6 +1712,21 @@ pub async fn open_git_file_folder(app: AppHandle, cwd: String, path: String) -> 
         app.opener()
             .open_path(folder.to_string_lossy().into_owned(), None::<&str>)
             .map_err(|error| format!("Impossible d’ouvrir {}: {error}", folder.display()))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn open_conversation_path(
+    app: AppHandle,
+    cwd: String,
+    path: String,
+) -> Result<(), String> {
+    crate::run_blocking(move || {
+        let resolved = resolve_conversation_path(cwd, path)?;
+        app.opener()
+            .open_path(resolved.to_string_lossy().into_owned(), None::<&str>)
+            .map_err(|error| format!("Impossible d’ouvrir {}: {error}", resolved.display()))
     })
     .await
 }
@@ -2832,7 +2919,8 @@ pub async fn get_git_file_diff(
 mod tests {
     use super::{
         containing_git_folder, get_git_file_diff_blocking, list_git_changes_blocking,
-        parse_numstat_z, parse_porcelain_z, safe_git_relative_path, validated_project_folder,
+        parse_numstat_z, parse_porcelain_z, resolve_conversation_path, safe_git_relative_path,
+        validated_project_folder,
     };
     use std::{
         fs,
@@ -2984,5 +3072,91 @@ mod tests {
         let error = validated_project_folder(file.to_string_lossy().into_owned())
             .expect_err("regular files must be rejected");
         assert!(error.contains("n’est pas un dossier"));
+    }
+
+    #[test]
+    fn conversation_paths_open_only_inside_the_project() {
+        let project = tempfile::tempdir().expect("temporary project");
+        let inside = project.path().join("output.html");
+        fs::write(&inside, b"fixture").expect("write project file");
+        let resolved_inside = resolve_conversation_path(
+            project.path().to_string_lossy().into_owned(),
+            "output.html".to_string(),
+        )
+        .expect("resolve project file");
+        assert_eq!(
+            resolved_inside,
+            crate::paths::canonicalize(&inside).unwrap()
+        );
+
+        let external = tempfile::NamedTempFile::new().expect("external file");
+        let error = resolve_conversation_path(
+            project.path().to_string_lossy().into_owned(),
+            external.path().to_string_lossy().into_owned(),
+        )
+        .expect_err("external paths must be rejected");
+        assert!(error.contains("hors du projet"));
+
+        let traversal = resolve_conversation_path(
+            project.path().to_string_lossy().into_owned(),
+            "../outside.txt".to_string(),
+        )
+        .expect_err("relative traversal must be rejected before disk access");
+        assert!(traversal.contains("sortent du projet"));
+
+        let absolute_traversal = project.path().join("nested").join("..").join("output.html");
+        let error = resolve_conversation_path(
+            project.path().to_string_lossy().into_owned(),
+            absolute_traversal.to_string_lossy().into_owned(),
+        )
+        .expect_err("absolute traversal must be rejected before disk access");
+        assert!(error.contains("sortent du projet"));
+    }
+
+    #[test]
+    fn conversation_paths_reject_missing_and_invalid_targets() {
+        let project = tempfile::tempdir().expect("temporary project");
+        assert!(resolve_conversation_path(
+            project.path().to_string_lossy().into_owned(),
+            "missing.txt".to_string(),
+        )
+        .is_err());
+        assert!(resolve_conversation_path(
+            project.path().to_string_lossy().into_owned(),
+            "\0invalid".to_string(),
+        )
+        .is_err());
+        #[cfg(windows)]
+        {
+            let error = resolve_conversation_path(
+                project.path().to_string_lossy().into_owned(),
+                r"\\127.0.0.1\prime-orbit-does-not-exist\report.pdf".to_string(),
+            )
+            .expect_err("UNC paths must be rejected without network access");
+            assert!(error.contains("hors du projet"));
+        }
+    }
+
+    #[test]
+    fn conversation_paths_reject_symlinks_that_escape_the_project() {
+        let project = tempfile::tempdir().expect("temporary project");
+        let external = tempfile::NamedTempFile::new().expect("external file");
+        let link = project.path().join("outside-link.txt");
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(external.path(), &link).is_ok();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(external.path(), &link).is_ok();
+        if !linked {
+            // Windows developer mode may be disabled on some builders. The
+            // production canonical containment check remains covered whenever
+            // the platform permits creating the fixture.
+            return;
+        }
+        let error = resolve_conversation_path(
+            project.path().to_string_lossy().into_owned(),
+            "outside-link.txt".to_string(),
+        )
+        .expect_err("a symlink must not escape the project");
+        assert!(error.contains("lien symbolique"));
     }
 }

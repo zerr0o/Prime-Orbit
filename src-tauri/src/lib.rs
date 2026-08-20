@@ -101,6 +101,7 @@ pub fn run() {
             files::get_git_file_diff,
             files::open_project_folder,
             files::open_git_file_folder,
+            files::open_conversation_path,
             connections::inspect_prime_agent_connections,
             connections::inspect_prime_agent_defaults,
             connections::save_prime_agent_defaults,
