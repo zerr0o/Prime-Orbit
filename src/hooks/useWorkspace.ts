@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type SetStateAction } from "react";
 import { defaultAppState } from "../lib/demo";
+import { latestProjectConversation } from "../lib/project-navigation";
 import type { RlmDelegationSnapshot } from "../lib/rlm-preferences";
 import {
   durableState,
@@ -353,6 +354,37 @@ export function useWorkspace() {
     setView("chat");
   }, []);
 
+  const openProjectConversation = useCallback(
+    (projectId: string, globalDefaultModel?: string, rlmSnapshot?: RlmDelegationSnapshot) => {
+      setState((current) => {
+        const project = current.projects.find((item) => item.id === projectId);
+        if (!project) return current;
+
+        const existing = latestProjectConversation(current.conversations, projectId);
+        const conversation = existing ?? createConversationRecord(
+          projectId,
+          current.preferences.defaultThinking,
+          undefined,
+          nextHeadOrder(current.conversations.filter((item) => item.projectId === projectId)),
+          resolveNewConversationModel(undefined, project.defaultModel, globalDefaultModel),
+          rlmSnapshot,
+        );
+        const timestamp = new Date().toISOString();
+        return {
+          ...current,
+          conversations: existing ? current.conversations : [conversation, ...current.conversations],
+          selectedProjectId: projectId,
+          selectedConversationId: conversation.id,
+          projects: current.projects.map((item) =>
+            item.id === projectId ? { ...item, lastOpenedAt: timestamp } : item,
+          ),
+        };
+      });
+      setView("chat");
+    },
+    [setState],
+  );
+
   const createConversation = useCallback(
     (projectId = state.selectedProjectId, title?: string, globalDefaultModel?: string, rlmSnapshot?: RlmDelegationSnapshot) => {
       if (!projectId) return undefined;
@@ -604,6 +636,7 @@ export function useWorkspace() {
     projectConversations,
     addProject,
     selectProject,
+    openProjectConversation,
     createConversation,
     importPrimeAgentSessions,
     preserveConversationReference,

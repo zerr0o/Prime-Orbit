@@ -20,6 +20,14 @@ import {
 } from "../lib/bridge";
 import { redactText, redactValue } from "../lib/redaction";
 import { buildRlmDelegationPrompt } from "../lib/rlm-preferences";
+import {
+  goalAcknowledgementDisposition,
+  goalForSessionSnapshot,
+  goalMutationDescriptor,
+  goalMutationEventMatches,
+  type GoalMutationDescriptor,
+  type GoalMutationRuntimeState,
+} from "../lib/goal-control";
 import type { RuntimeNotice } from "../lib/runtime-notices";
 import type {
   ActivityItem,
@@ -31,6 +39,7 @@ import type {
   ChatMessage,
   Conversation,
   ExtensionUiRequest,
+  GoalState,
   ModelInfo,
   PendingExtensionUiRequest,
   Project,
@@ -45,6 +54,7 @@ import type {
 
 interface ConversationRuntime {
   isCompacting?: boolean;
+  isRefining?: boolean;
   state?: AgentSessionState;
   models: ModelInfo[];
   commands: SlashCommand[];
@@ -59,6 +69,7 @@ interface ConversationRuntime {
     closed?: boolean;
     error?: string;
   };
+  goalMutation?: GoalMutationRuntimeState;
   logs: Array<{ id: string; stream: "rpc" | "stderr"; text: string; createdAt: string }>;
 }
 
@@ -78,6 +89,7 @@ interface PendingSelectionRequest {
   transcriptEpoch?: number;
   statsEpoch?: number;
   stateEpoch?: number;
+  goalEpoch?: number;
   resolve?: (message: RpcEnvelope) => void;
   reject?: (error: Error) => void;
 }
@@ -85,8 +97,18 @@ interface PendingSelectionRequest {
 interface PendingConversationRequest {
   conversationId: string;
   timeout: number;
+  purpose?: ConversationResponsePurpose;
   resolve: (message: RpcEnvelope) => void;
   reject: (error: Error) => void;
+}
+
+type ConversationResponsePurpose = "goal_mutation";
+
+export function shouldConsumeConversationResponse(
+  purpose: ConversationResponsePurpose | undefined,
+  isSuppressedLateResponse = false,
+): boolean {
+  return isSuppressedLateResponse || purpose === "goal_mutation";
 }
 
 export function applyRuntimeCompactingState(
@@ -126,10 +148,18 @@ const HISTORY_RESPONSE_TIMEOUT_MS = 30_000;
 const HISTORY_REQUEST_ATTEMPTS = 1;
 const PASSIVE_RESPONSE_TIMEOUT_MS = 30_000;
 const HTML_EXPORT_RESPONSE_TIMEOUT_MS = 20 * 60_000;
+// Prime Agent v0.7.4 gives daemon refinements a ten-minute window. Orbit keeps
+// the request conversation-scoped (so navigation cannot cancel it) and adds a
+// small transport margin without pretending that a timeout cancelled the work.
+const REFINE_RESPONSE_TIMEOUT_MS = 12 * 60_000;
 // Compaction can legitimately take far longer than the daemon's legacy 30 s
 // acknowledgement window. The lifecycle events remain authoritative and the
 // emergency restart is the explicit escape hatch for a truly stuck operation.
 const COMPACTION_LIFECYCLE_TIMEOUT_MS = 24 * 60 * 60_000;
+// A goal slash command may legitimately wait behind a long-running turn. Keep
+// the lifecycle waiter conversation-scoped and avoid presenting a short local
+// timeout as proof that Prime Agent rejected the mutation.
+const GOAL_MUTATION_LIFECYCLE_TIMEOUT_MS = 24 * 60 * 60_000;
 const RECENT_COMPACTION_END_MS = 10_000;
 const SELECTION_SCOPED_COMMANDS = new Set([
   "get_state",
@@ -161,6 +191,56 @@ export function isCompactDaemonAcknowledgementTimeout(message: Pick<RpcEnvelope,
   return /^Timed out after 30000ms waiting for the Prime Agent daemon response to "compact"\.(?:\s|$)/.test(
     message.error.trim(),
   );
+}
+
+interface PendingGoalMutation {
+  conversationId: string;
+  descriptor: GoalMutationDescriptor;
+  settled: boolean;
+  timeout: number;
+  promise: Promise<GoalState>;
+  resolve: (goal: GoalState) => void;
+  reject: (error: Error) => void;
+}
+
+export function isRefineDaemonAcknowledgementTimeout(message: Pick<RpcEnvelope, "command" | "success" | "error">): boolean {
+  if (message.command !== "refine" || message.success !== false || typeof message.error !== "string") return false;
+  return /^Timed out after \d+ms waiting for the Prime Agent daemon response to "refine"\.(?:\s|$)/.test(
+    message.error.trim(),
+  );
+}
+
+export function refineLifecycleDisposition(hasLocalDirectRequest: boolean): "await_local_response" | "passive_terminal" {
+  // Prime Agent does not identify which refine request emitted a terminal
+  // lifecycle event. A window that owns a direct request must therefore wait
+  // for its correlated RPC response; the event may belong to another window
+  // or to an automatic refinement.
+  return hasLocalDirectRequest ? "await_local_response" : "passive_terminal";
+}
+
+export interface RefinementPresentation {
+  activityId?: string;
+  title: string;
+  detail?: string;
+  appliedEdits: number;
+}
+
+export function refinementResultPresentation(value: unknown): RefinementPresentation {
+  const result = asRecord(value);
+  const id = textValue(result?.id);
+  const summary = cleanDiagnostic(result?.summary);
+  const scope = result?.scope === "global" ? "globale" : result?.scope === "local" ? "locale" : undefined;
+  const edits = Array.isArray(result?.appliedEdits) ? result.appliedEdits : [];
+  const appliedEdits = edits.filter((edit) => asRecord(edit)?.applied === true).length;
+  const count = appliedEdits === 0
+    ? "Aucune modification appliquée"
+    : `${appliedEdits} modification${appliedEdits === 1 ? "" : "s"} appliquée${appliedEdits === 1 ? "" : "s"}`;
+  return {
+    activityId: id ? `refinement:${id}` : undefined,
+    title: appliedEdits > 0 ? "Raffinement appliqué" : "Raffinement terminé",
+    detail: [summary, count, scope ? `Portée ${scope}` : undefined].filter(Boolean).join(" · "),
+    appliedEdits,
+  };
 }
 
 export type CompactResponseDisposition = "not_compact" | "success" | "pending" | "lifecycle_handled" | "failure";
@@ -364,10 +444,56 @@ export function reconcileQueuedMessages(
   return changed ? { ...conversation, messages } : conversation;
 }
 
-/** A previously observed queue row can disappear without a message_start when
- * the terminal queue snapshot races the final assistant events. In that one
- * idle/empty state, reload the persisted session instead of guessing where the
- * user turn belongs. Prime Agent's JSONL history is the ordering authority. */
+function sameAttachmentSet(left: Attachment[] | undefined, right: Attachment[] | undefined) {
+  const leftAttachments = left ?? [];
+  const rightAttachments = right ?? [];
+  if (leftAttachments.length !== rightAttachments.length) return false;
+  return leftAttachments.every((attachment, index) => {
+    const candidate = rightAttachments[index];
+    if (!candidate) return false;
+    return attachment.name === candidate.name
+      && attachment.mimeType === candidate.mimeType
+      && attachment.size === candidate.size
+      && attachment.isImage === candidate.isImage;
+  });
+}
+
+function queuedDeliveryCandidateIndex(
+  conversation: Conversation,
+  normalizedText: string,
+  authoritativeAttachments: Attachment[],
+): number {
+  let candidates = conversation.messages.flatMap((message, index) => (
+    message.queueDelivery
+      && normalizeQueuedText(message.queueText ?? message.content) === normalizedText
+      && (normalizedText.length > 0 || (message.attachments?.length ?? 0) > 0 || authoritativeAttachments.length > 0)
+      ? [index]
+      : []
+  ));
+  if (candidates.length === 0) return -1;
+
+  // Native message metadata is the strongest identity available for duplicate
+  // prompts and cross-window collisions. Absence is meaningful too: a
+  // text-only event must never consume a same-text row that owns attachments.
+  candidates = candidates.filter((index) => (
+    sameAttachmentSet(conversation.messages[index]?.attachments, authoritativeAttachments)
+  ));
+  if (candidates.length === 0) return -1;
+  if (candidates.length === 1) return candidates[0]!;
+
+  // Prime Agent gives steering actions priority over follow-ups. Resolve a
+  // cross-lane duplicate only when that priority leaves one unique candidate;
+  // duplicate rows within the same lane remain history-owned.
+  const steering = candidates.filter((index) => conversation.messages[index]?.queueDelivery === "steer");
+  if (steering.length === 1) return steering[0]!;
+  return -1;
+}
+
+/** An accepted queue row can disappear without a message_start when it is
+ * consumed before Orbit observes its lane (or while another conversation is
+ * selected). In the terminal idle/empty state, reload the persisted session
+ * instead of guessing where the user turn belongs. Prime Agent's JSONL
+ * history is the ordering authority. */
 export function shouldReloadQueuedTranscript(
   conversation: Conversation | undefined,
   actions: AgentSessionState["sessionActions"] | undefined,
@@ -379,7 +505,9 @@ export function shouldReloadQueuedTranscript(
     || (actions.steering?.length ?? 0) > 0
     || (actions.followUps?.length ?? 0) > 0
   ) return false;
-  return conversation.messages.some((message) => message.queueDelivery && message.queueObserved);
+  return conversation.messages.some((message) => (
+    message.queueDelivery && (message.queueAccepted || message.queueObserved)
+  ));
 }
 
 /** Normal bootstrap histories remain applicable without an epoch. A targeted
@@ -429,9 +557,7 @@ export function applyAuthoritativeUserMessageStart(
     && (message.id === authoritativeMessageId || message.entryId === authoritativeMessageId)
   ))) return conversation;
   const normalized = normalizeQueuedText(visibleText);
-  const queuedIndex = conversation.messages.findIndex((message) => message.queueDelivery
-    && normalizeQueuedText(message.queueText ?? message.content) === normalized
-    && (normalized.length > 0 || (message.attachments?.length ?? 0) > 0 || authoritativeAttachments.length > 0));
+  const queuedIndex = queuedDeliveryCandidateIndex(conversation, normalized, authoritativeAttachments);
   if (queuedIndex >= 0) {
     const messages = [...conversation.messages];
     const [queued] = messages.splice(queuedIndex, 1);
@@ -446,33 +572,46 @@ export function applyAuthoritativeUserMessageStart(
     return { ...conversation, hasContent: true, messages };
   }
 
-  let pendingIndex = -1;
-  for (let index = conversation.messages.length - 1; index >= 0; index -= 1) {
-    const message = conversation.messages[index]!;
-    if (message.role === "user"
+  const pendingCandidates = conversation.messages.flatMap((message, index) => (
+    message.role === "user"
       && message.status === "pending"
       && (
         normalizeQueuedText(message.content) === normalized
         || (!normalized && authoritativeAttachments.length > 0 && (message.attachments?.length ?? 0) > 0)
       )
-      && (normalized.length > 0 || (message.attachments?.length ?? 0) > 0 || authoritativeAttachments.length > 0)) {
-      pendingIndex = index;
-      break;
-    }
-  }
-  if (pendingIndex >= 0) {
+      && (normalized.length > 0 || (message.attachments?.length ?? 0) > 0 || authoritativeAttachments.length > 0)
+      && sameAttachmentSet(message.attachments, authoritativeAttachments)
+      ? [index]
+      : []
+  ));
+  // Two windows can optimistically submit the same prompt before either sees
+  // the shared lifecycle. Without a native origin id, choosing one candidate
+  // would silently steal the other window's turn. Keep both local rows intact
+  // and append the authoritative event; persisted history will own the order.
+  if (pendingCandidates.length === 1) {
+    const pendingIndex = pendingCandidates[0]!;
     const messages = [...conversation.messages];
-    messages[pendingIndex] = {
-      ...messages[pendingIndex]!,
+    const [pending] = messages.splice(pendingIndex, 1);
+    if (!pending) return conversation;
+    messages.push({
+      ...pending,
       ...(authoritativeMessageId ? { entryId: authoritativeMessageId } : {}),
       status: "complete",
-    };
+    });
     return { ...conversation, hasContent: true, messages };
   }
 
   const lastVisible = [...conversation.messages].reverse().find((message) => !message.queueDelivery);
-  if (lastVisible?.role === "user"
+  const conflictingEntryIdentity = Boolean(
+    authoritativeMessageId
+      && lastVisible?.entryId
+      && lastVisible.entryId !== authoritativeMessageId,
+  );
+  if (pendingCandidates.length === 0
+    && lastVisible?.role === "user"
     && normalizeQueuedText(lastVisible.content) === normalized
+    && sameAttachmentSet(lastVisible.attachments, authoritativeAttachments)
+    && !conflictingEntryIdentity
     && (normalized.length > 0 || (lastVisible.attachments?.length ?? 0) > 0 || authoritativeAttachments.length > 0)) {
     return conversation;
   }
@@ -693,6 +832,8 @@ export function useAgentRuntime(options: {
   const transcriptEpoch = useRef(new Map<string, number>());
   const statsEpoch = useRef(new Map<string, number>());
   const stateEpoch = useRef(new Map<string, number>());
+  const goalEpoch = useRef(new Map<string, number>());
+  const latestGoalByConversation = useRef(new Map<string, GoalState>());
   const localHistoryInFlight = useRef(new Map<string, Promise<void>>());
   const localHistoryLoaded = useRef(new Set<string>());
   const localHistoryApplied = useRef(new Map<string, string>());
@@ -700,6 +841,10 @@ export function useAgentRuntime(options: {
   const bootstrapGeneration = useRef(new Map<string, number>());
   const pendingSelectionRequests = useRef(new Map<string, PendingSelectionRequest>());
   const pendingConversationRequests = useRef(new Map<string, PendingConversationRequest>());
+  const suppressedConversationResponses = useRef(new Set<string>());
+  const pendingGoalMutations = useRef(new Map<string, PendingGoalMutation>());
+  const directRefinementActivities = useRef(new Map<string, string>());
+  const uncertainRefinementConversations = useRef(new Set<string>());
   // Unlike selection-scoped bootstrap requests, compaction belongs to the
   // conversation process and must survive navigation. Every window receives
   // the same native lifecycle events; only the initiating window owns a
@@ -770,6 +915,12 @@ export function useAgentRuntime(options: {
     if (!pending) return;
     pendingConversationRequests.current.delete(requestId);
     window.clearTimeout(pending.timeout);
+    // A timed-out/cancelled Goal acknowledgement can still arrive after the
+    // lifecycle event. Retain its correlation id so that late response remains
+    // owned by the Goal action instead of poisoning the whole conversation.
+    if (error && shouldConsumeConversationResponse(pending.purpose)) {
+      suppressedConversationResponses.current.add(requestId);
+    }
     if (error) pending.reject(error);
   }, []);
 
@@ -785,6 +936,7 @@ export function useAgentRuntime(options: {
     type: string,
     fields: Record<string, unknown> = {},
     timeoutMs = PASSIVE_RESPONSE_TIMEOUT_MS,
+    purpose?: ConversationResponsePurpose,
   ): Promise<RpcEnvelope> => {
     const requestId = uid(type);
     let resolveResponse!: (message: RpcEnvelope) => void;
@@ -802,6 +954,7 @@ export function useAgentRuntime(options: {
     pendingConversationRequests.current.set(requestId, {
       conversationId,
       timeout,
+      purpose,
       resolve: resolveResponse,
       reject: rejectResponse,
     });
@@ -844,6 +997,7 @@ export function useAgentRuntime(options: {
       transcriptEpoch: requestMetadata.transcriptEpoch,
       statsEpoch: type === "get_session_stats" ? (statsEpoch.current.get(conversationId) ?? 0) : undefined,
       stateEpoch: type === "get_state" ? (stateEpoch.current.get(conversationId) ?? 0) : undefined,
+      goalEpoch: type === "get_state" ? (goalEpoch.current.get(conversationId) ?? 0) : undefined,
       resolve: resolveResponse,
       reject: rejectResponse,
     });
@@ -966,6 +1120,32 @@ export function useAgentRuntime(options: {
     });
   }, []);
 
+  const setGoalMutationState = useCallback((
+    conversationId: string,
+    mutation: ConversationRuntime["goalMutation"],
+  ) => {
+    setRuntimes((current) => {
+      const runtime = current[conversationId] ?? { models: [], commands: [], logs: [] };
+      if (runtime.goalMutation === mutation) return current;
+      return { ...current, [conversationId]: { ...runtime, goalMutation: mutation } };
+    });
+  }, []);
+
+  const rejectGoalMutation = useCallback((conversationId: string, reason: string) => {
+    const pending = pendingGoalMutations.current.get(conversationId);
+    if (!pending) return;
+    pendingGoalMutations.current.delete(conversationId);
+    window.clearTimeout(pending.timeout);
+    const error = new Error(reason);
+    setGoalMutationState(conversationId, {
+      command: pending.descriptor.command,
+      kind: pending.descriptor.kind,
+      phase: "error",
+      error: reason,
+    });
+    pending.reject(error);
+  }, [setGoalMutationState]);
+
   const addActivity = useCallback(
     (conversationId: string, activity: Omit<ActivityItem, "id" | "createdAt"> & { id?: string; createdAt?: string }) => {
       updateConversation(conversationId, (conversation) => {
@@ -994,6 +1174,16 @@ export function useAgentRuntime(options: {
     [updateConversation],
   );
 
+  const removeActivity = useCallback((conversationId: string, activityId: string) => {
+    updateConversation(conversationId, (conversation) => {
+      if (!conversation.activities.some((activity) => activity.id === activityId)) return conversation;
+      return {
+        ...conversation,
+        activities: conversation.activities.filter((activity) => activity.id !== activityId),
+      };
+    });
+  }, [updateConversation]);
+
   const addLog = useCallback((conversationId: string, stream: "rpc" | "stderr", text: string) => {
     setRuntimes((current) => {
       const runtime = current[conversationId] ?? { models: [], commands: [], logs: [] };
@@ -1013,6 +1203,14 @@ export function useAgentRuntime(options: {
       const next = applyRuntimeCompactingState(runtime, isCompacting, clearContextUsage);
       if (next === runtime) return current;
       return { ...current, [conversationId]: next };
+    });
+  }, []);
+
+  const setRuntimeRefining = useCallback((conversationId: string, isRefining: boolean) => {
+    setRuntimes((current) => {
+      const runtime = current[conversationId] ?? { models: [], commands: [], logs: [] };
+      if (runtime.isRefining === isRefining) return current;
+      return { ...current, [conversationId]: { ...runtime, isRefining } };
     });
   }, []);
 
@@ -1080,9 +1278,75 @@ export function useAgentRuntime(options: {
     void loadConversationHistory(conversationId, token.generation, epoch).catch(() => undefined);
   }, [isCurrentSelection, loadConversationHistory]);
 
+  /** Apply a complete state snapshot without coupling it to the current
+   * selection. Goal mutations and their final reconciliation belong to the
+   * originating conversation and must survive navigation. */
+  const applySessionStateSnapshot = useCallback((
+    conversationId: string,
+    rawSessionState: AgentSessionState,
+    requestedGoalEpoch: number,
+  ) => {
+    const currentGoalEpoch = goalEpoch.current.get(conversationId) ?? 0;
+    const goal = goalForSessionSnapshot({
+      snapshot: rawSessionState.goal,
+      latestEvent: latestGoalByConversation.current.get(conversationId),
+      requestedEventEpoch: requestedGoalEpoch,
+      currentEventEpoch: currentGoalEpoch,
+    });
+    if (goal) latestGoalByConversation.current.set(conversationId, goal);
+    else latestGoalByConversation.current.delete(conversationId);
+    const sessionState: AgentSessionState = {
+      ...rawSessionState,
+      goal,
+      sessionActions: normalizePrimeOrbitSessionActions(rawSessionState.sessionActions),
+    };
+    if (sessionState.isCompacting) compactingConversations.current.add(conversationId);
+    else compactingConversations.current.delete(conversationId);
+    sessionActionsByConversation.current.set(conversationId, sessionState.sessionActions);
+    setRuntimes((current) => ({
+      ...current,
+      [conversationId]: {
+        ...(current[conversationId] ?? { models: [], commands: [], logs: [] }),
+        isCompacting: sessionState.isCompacting,
+        state: sessionState,
+      },
+    }));
+    updateConversation(conversationId, (conversation) => reconcileQueuedMessages({
+      ...conversation,
+      title: !conversation.sessionNameSyncPending && sessionState.sessionName?.trim()
+        ? sessionState.sessionName.trim()
+        : conversation.title,
+      sessionPath: sessionState.sessionFile ?? conversation.sessionPath,
+      sessionId: sessionState.sessionId ?? conversation.sessionId,
+      model: sessionState.model ? `${sessionState.model.provider}/${sessionState.model.id}` : conversation.model,
+      thinkingLevel: sessionState.thinkingLevel ?? conversation.thinkingLevel,
+      // Keep the central loading state visible until get_messages has
+      // actually populated the transcript.
+      status: sessionState.isCompacting
+        ? "tool"
+        : sessionState.isStreaming
+          ? "streaming"
+          : sessionState.sessionActions.queuedCount > 0
+            || sessionState.sessionActions.steering.length > 0
+            || sessionState.sessionActions.followUps.length > 0
+            ? "queued"
+          : conversation.status === "starting"
+            ? "starting"
+            : "idle",
+      lastError: undefined,
+    }, sessionState.sessionActions));
+    if (!sessionState.isStreaming) {
+      window.setTimeout(() => reloadDeliveredQueueTranscript(conversationId, sessionState.sessionActions), 0);
+    }
+  }, [reloadDeliveredQueueTranscript, updateConversation]);
+
   const handleResponse = useCallback(
     (conversationId: string, message: RpcEnvelope) => {
       const requestId = textValue(message.id);
+      const isSuppressedLateResponse = requestId
+        ? suppressedConversationResponses.current.delete(requestId)
+        : false;
+      if (shouldConsumeConversationResponse(undefined, isSuppressedLateResponse)) return;
       const scopedCommand = SELECTION_SCOPED_COMMANDS.has(message.command ?? "");
       const persistentPending = requestId ? pendingConversationRequests.current.get(requestId) : undefined;
       if (persistentPending) {
@@ -1093,10 +1357,11 @@ export function useAgentRuntime(options: {
           return;
         }
         persistentPending.resolve(message);
+        if (shouldConsumeConversationResponse(persistentPending.purpose)) return;
         // Export is completed by the initiating command after native
         // validation. It must not change the health of the conversation when
         // the file operation itself fails.
-        if (message.command === "export_html") return;
+        if (message.command === "export_html" || message.command === "refine") return;
       }
       const pending = requestId ? pendingSelectionRequests.current.get(requestId) : undefined;
       if (pending) {
@@ -1115,6 +1380,12 @@ export function useAgentRuntime(options: {
         // selection. This also drops late responses after rapid navigation.
         return;
       }
+
+      // Refinement responses are handled by the exact conversation-scoped
+      // request that initiated them. Lifecycle events below remain the source
+      // for background/other-window feedback, and a failed refinement must not
+      // mark the whole conversation runtime as broken.
+      if (message.command === "refine") return;
 
       const compactDisposition = compactResponseDisposition(
         message,
@@ -1151,50 +1422,16 @@ export function useAgentRuntime(options: {
 
       const data = message.data as Record<string, unknown> | undefined;
       if (message.command === "get_state" && data) {
-        if (pending?.stateEpoch !== (stateEpoch.current.get(conversationId) ?? 0)) return;
-        const rawSessionState = data as unknown as AgentSessionState;
-        const sessionState = {
-          ...rawSessionState,
-          sessionActions: normalizePrimeOrbitSessionActions(rawSessionState.sessionActions),
-        };
-        if (sessionState.isCompacting) compactingConversations.current.add(conversationId);
-        else compactingConversations.current.delete(conversationId);
-        sessionActionsByConversation.current.set(conversationId, sessionState.sessionActions);
-        setRuntimes((current) => ({
-          ...current,
-          [conversationId]: {
-            ...(current[conversationId] ?? { models: [], commands: [], logs: [] }),
-            isCompacting: sessionState.isCompacting,
-            state: sessionState,
-          },
-        }));
-        updateConversation(conversationId, (conversation) => reconcileQueuedMessages({
-          ...conversation,
-          title: !conversation.sessionNameSyncPending && sessionState.sessionName?.trim()
-            ? sessionState.sessionName.trim()
-            : conversation.title,
-          sessionPath: sessionState.sessionFile ?? conversation.sessionPath,
-          sessionId: sessionState.sessionId ?? conversation.sessionId,
-          model: sessionState.model ? `${sessionState.model.provider}/${sessionState.model.id}` : conversation.model,
-          thinkingLevel: sessionState.thinkingLevel ?? conversation.thinkingLevel,
-          // Keep the central loading state visible until get_messages has
-          // actually populated the transcript.
-          status: sessionState.isCompacting
-            ? "tool"
-            : sessionState.isStreaming
-              ? "streaming"
-              : sessionState.sessionActions.queuedCount > 0
-                || sessionState.sessionActions.steering.length > 0
-                || sessionState.sessionActions.followUps.length > 0
-                ? "queued"
-              : conversation.status === "starting"
-                ? "starting"
-                : "idle",
-          lastError: undefined,
-        }, sessionState.sessionActions));
-        if (!sessionState.isStreaming) {
-          window.setTimeout(() => reloadDeliveredQueueTranscript(conversationId, sessionState.sessionActions), 0);
-        }
+        // Conversation-scoped callers apply their own snapshot after resolving
+        // the request. Selection-scoped bootstrap remains guarded by both the
+        // runtime epoch and the goal-event epoch captured at request time.
+        if (!pending) return;
+        if (pending.stateEpoch !== (stateEpoch.current.get(conversationId) ?? 0)) return;
+        applySessionStateSnapshot(
+          conversationId,
+          data as unknown as AgentSessionState,
+          pending.goalEpoch ?? (goalEpoch.current.get(conversationId) ?? 0),
+        );
         return;
       }
 
@@ -1367,7 +1604,7 @@ export function useAgentRuntime(options: {
         updateConversation(conversationId, { model: `${model.provider}/${model.id}` });
       }
     },
-    [addActivity, isCurrentSelection, loadConversationHistory, recentCompactionEnd, reloadDeliveredQueueTranscript, sendSelectionRequest, setRuntimeCompacting, updateConversation],
+    [addActivity, applySessionStateSnapshot, isCurrentSelection, loadConversationHistory, recentCompactionEnd, sendSelectionRequest, setRuntimeCompacting, updateConversation],
   );
 
   const handleAgentEvent = useCallback(
@@ -1481,6 +1718,42 @@ export function useAgentRuntime(options: {
           );
         }
         refreshAfterCompaction(conversationId);
+        return;
+      }
+      if (eventType === "refine_complete") {
+        const directActivityId = directRefinementActivities.current.get(conversationId);
+        if (refineLifecycleDisposition(Boolean(directActivityId)) === "passive_terminal") {
+          uncertainRefinementConversations.current.delete(conversationId);
+          setRuntimeRefining(conversationId, false);
+        }
+        const presentation = refinementResultPresentation(event.result);
+        addActivity(conversationId, {
+          id: presentation.activityId,
+          type: eventType,
+          title: presentation.title,
+          detail: presentation.detail,
+          status: "success",
+          raw: event,
+        });
+        const token = activeSelection.current;
+        if (token.conversationId === conversationId && isCurrentSelection(conversationId, token.generation)) {
+          void sendSelectionRequest(conversationId, token.generation, "get_state").catch(() => undefined);
+        }
+        return;
+      }
+      if (eventType === "refine_failed") {
+        const directActivityId = directRefinementActivities.current.get(conversationId);
+        if (refineLifecycleDisposition(Boolean(directActivityId)) === "passive_terminal") {
+          uncertainRefinementConversations.current.delete(conversationId);
+          setRuntimeRefining(conversationId, false);
+        }
+        addActivity(conversationId, {
+          type: eventType,
+          title: "Échec du raffinement",
+          detail: cleanDiagnostic(event.error) ?? "Prime Agent n’a pas pu appliquer le raffinement.",
+          status: "error",
+          raw: event,
+        });
         return;
       }
       if (eventType === "agent_end") {
@@ -1713,16 +1986,38 @@ export function useAgentRuntime(options: {
         return;
       }
       if (eventType === "goal_update") {
+        const goalState = event.goal as GoalState;
+        goalEpoch.current.set(conversationId, (goalEpoch.current.get(conversationId) ?? 0) + 1);
+        latestGoalByConversation.current.set(conversationId, goalState);
         setRuntimes((current) => {
           const runtime = current[conversationId] ?? { models: [], commands: [], logs: [] };
           return {
             ...current,
             [conversationId]: {
               ...runtime,
-              state: runtime.state ? { ...runtime.state, goal: event.goal as AgentSessionState["goal"] } : runtime.state,
+              state: runtime.state ? { ...runtime.state, goal: goalState } : runtime.state,
             },
           };
         });
+        const pendingGoal = pendingGoalMutations.current.get(conversationId);
+        if (
+          pendingGoal
+          && !pendingGoal.settled
+          && goalMutationEventMatches(
+            { conversationId: pendingGoal.conversationId, descriptor: pendingGoal.descriptor },
+            conversationId,
+            goalState,
+          )
+        ) {
+          pendingGoal.settled = true;
+          window.clearTimeout(pendingGoal.timeout);
+          setGoalMutationState(conversationId, {
+            command: pendingGoal.descriptor.command,
+            kind: pendingGoal.descriptor.kind,
+            phase: "reconciling",
+          });
+          pendingGoal.resolve(goalState);
+        }
         const goal = asRecord(event.goal);
         const goalStatus = textValue(goal?.status) ?? "idle";
         addActivity(conversationId, {
@@ -1750,7 +2045,7 @@ export function useAgentRuntime(options: {
         addActivity(conversationId, { type: eventType, title: humanizeEvent(eventType), status: "info", raw: event });
       }
     },
-    [addActivity, handleResponse, invalidateCompactionHistory, recentCompactionEnd, refreshAfterCompaction, reloadDeliveredQueueTranscript, sendSelectionRequest, setRuntimeCompacting, settleCompactionWaiter, updateConversation],
+    [addActivity, handleResponse, invalidateCompactionHistory, isCurrentSelection, recentCompactionEnd, refreshAfterCompaction, reloadDeliveredQueueTranscript, removeActivity, sendSelectionRequest, setGoalMutationState, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation],
   );
 
   useEffect(() => {
@@ -1783,7 +2078,10 @@ export function useAgentRuntime(options: {
         activeCompactionActivities.current.delete(conversationId);
         recentCompactionEnds.current.delete(conversationId);
         compactionRefreshPending.current.delete(conversationId);
+        directRefinementActivities.current.delete(conversationId);
+        uncertainRefinementConversations.current.delete(conversationId);
         setRuntimeCompacting(conversationId, false, true);
+        setRuntimeRefining(conversationId, false);
         setExtensionRequests((current) => current.filter((request) => request.conversationId !== conversationId));
         started.current.delete(conversationId);
         startInFlight.current.delete(conversationId);
@@ -1808,6 +2106,10 @@ export function useAgentRuntime(options: {
           conversationId,
           exitDiagnostic ?? "Prime Agent s’est arrêté pendant l’opération en arrière-plan.",
         );
+        rejectGoalMutation(
+          conversationId,
+          exitDiagnostic ?? "Prime Agent s’est arrêté avant de confirmer la modification de l’objectif.",
+        );
         const terminalToolStatus: ToolActivity["status"] = expected ? "cancelled" : "failed";
         const boundaryTime = now();
         updateConversation(conversationId, (conversation) => ({
@@ -1830,7 +2132,7 @@ export function useAgentRuntime(options: {
       if (isNative()) setEventsReady(false);
       unlisten?.();
     };
-  }, [addActivity, addLog, cancelConversationRequests, cancelPersistentConversationRequests, handleAgentEvent, onInstallComplete, onInstallProgress, setRuntimeCompacting, settleCompactionWaiter, updateConversation]);
+  }, [addActivity, addLog, cancelConversationRequests, cancelPersistentConversationRequests, handleAgentEvent, onInstallComplete, onInstallProgress, rejectGoalMutation, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation]);
 
   const ensureProcessStarted = useCallback(
     async (conversation: Conversation, project: Project) => {
@@ -1976,6 +2278,10 @@ export function useAgentRuntime(options: {
         conversationId,
         "Le redémarrage d’urgence a interrompu l’opération en arrière-plan.",
       );
+      rejectGoalMutation(
+        conversationId,
+        "Le redémarrage d’urgence a interrompu la modification de l’objectif.",
+      );
     }
     setRuntimes((current) => {
       const runtime = current[conversationId];
@@ -2043,7 +2349,7 @@ export function useAgentRuntime(options: {
       }
       throw error;
     }
-  }, [cancelConversationRequests, cancelPersistentConversationRequests, ensureProcessStarted, isCurrentSelection, loadConversationHistory, sendSelectionRequest, updateConversation]);
+  }, [cancelConversationRequests, cancelPersistentConversationRequests, ensureProcessStarted, isCurrentSelection, loadConversationHistory, rejectGoalMutation, sendSelectionRequest, updateConversation]);
 
   const trackMaintenanceRefresh = useCallback((conversationId: string, kind: MaintenanceKind) => {
     const key = maintenanceEventKey(kind, conversationId);
@@ -2374,12 +2680,15 @@ export function useAgentRuntime(options: {
     } finally {
       activeAgentLifecycles.current.delete(selectedConversation.id);
       activePromptRuns.current.delete(selectedConversation.id);
+      directRefinementActivities.current.delete(selectedConversation.id);
+      uncertainRefinementConversations.current.delete(selectedConversation.id);
+      setRuntimeRefining(selectedConversation.id, false);
       updateConversation(selectedConversation.id, (conversation) => ({
         ...finalizeConversationTools(conversation, "cancelled", now()),
         status: "idle",
       }));
     }
-  }, [selectedConversation, updateConversation]);
+  }, [selectedConversation, setRuntimeRefining, updateConversation]);
 
   const closeRuntime = useCallback(async () => {
     if (!selectedConversation) return;
@@ -2389,12 +2698,15 @@ export function useAgentRuntime(options: {
     } finally {
       activeAgentLifecycles.current.delete(selectedConversation.id);
       activePromptRuns.current.delete(selectedConversation.id);
+      directRefinementActivities.current.delete(selectedConversation.id);
+      uncertainRefinementConversations.current.delete(selectedConversation.id);
+      setRuntimeRefining(selectedConversation.id, false);
       updateConversation(selectedConversation.id, (conversation) => ({
         ...finalizeConversationTools(conversation, "cancelled", now()),
         status: "idle",
       }));
     }
-  }, [selectedConversation, updateConversation]);
+  }, [selectedConversation, setRuntimeRefining, updateConversation]);
 
   const chooseModel = useCallback(
     async (model: ModelInfo) => {
@@ -2416,6 +2728,115 @@ export function useAgentRuntime(options: {
     [ensureStarted, selectedConversation, selectedProject, updateConversation],
   );
 
+  const runGoalMutation = useCallback(async (
+    conversationId: string,
+    descriptor: GoalMutationDescriptor,
+    fields: Record<string, unknown>,
+  ) => {
+    if (pendingGoalMutations.current.has(conversationId)) {
+      throw new Error("Une modification de l’objectif est déjà en attente pour cette conversation.");
+    }
+
+    let resolveGoal!: (goal: GoalState) => void;
+    let rejectGoal!: (error: Error) => void;
+    const promise = new Promise<GoalState>((resolve, reject) => {
+      resolveGoal = resolve;
+      rejectGoal = reject;
+    });
+    // The acknowledgement and the goal event may race. Attach a rejection
+    // handler before writing to stdin so an immediate failure stays owned by
+    // this command instead of becoming an unhandled promise.
+    void promise.catch(() => undefined);
+    const pending = {} as PendingGoalMutation;
+    const timeout = window.setTimeout(() => {
+      if (pendingGoalMutations.current.get(conversationId) !== pending) return;
+      rejectGoalMutation(
+        conversationId,
+        "Prime Agent n’a pas confirmé la modification de l’objectif. Son état reste inchangé dans Prime Orbit ; actualisez l’état avant de réessayer.",
+      );
+    }, GOAL_MUTATION_LIFECYCLE_TIMEOUT_MS);
+    Object.assign(pending, {
+      conversationId,
+      descriptor,
+      settled: false,
+      timeout,
+      promise,
+      resolve: resolveGoal,
+      reject: rejectGoal,
+    } satisfies PendingGoalMutation);
+    pendingGoalMutations.current.set(conversationId, pending);
+    setGoalMutationState(conversationId, {
+      command: descriptor.command,
+      kind: descriptor.kind,
+      phase: "sending",
+    });
+
+    const acknowledgement = sendConversationRequest(
+      conversationId,
+      "prompt",
+      { ...fields, message: descriptor.command },
+      PASSIVE_RESPONSE_TIMEOUT_MS,
+      "goal_mutation",
+    );
+    void acknowledgement.then((response) => {
+      const disposition = goalAcknowledgementDisposition({
+        isCurrent: pendingGoalMutations.current.get(conversationId) === pending,
+        settled: pending.settled,
+        success: response.success,
+      });
+      if (disposition === "ignore") return;
+      if (disposition === "reject") {
+        rejectGoalMutation(
+          conversationId,
+          response.error ?? "Prime Agent a refusé la modification de l’objectif.",
+        );
+        return;
+      }
+      setGoalMutationState(conversationId, {
+        command: descriptor.command,
+        kind: descriptor.kind,
+        phase: "waiting",
+      });
+    }).catch((error) => {
+      if (pendingGoalMutations.current.get(conversationId) !== pending || pending.settled) return;
+      rejectGoalMutation(conversationId, error instanceof Error ? error.message : String(error));
+    });
+
+    try {
+      await promise;
+      const requestedGoalEpoch = goalEpoch.current.get(conversationId) ?? 0;
+      try {
+        const stateResponse = await sendConversationRequest(conversationId, "get_state");
+        if (stateResponse.success === false) {
+          throw new Error(stateResponse.error ?? "Prime Agent n’a pas renvoyé l’état de l’objectif.");
+        }
+        if (stateResponse.data) {
+          applySessionStateSnapshot(
+            conversationId,
+            stateResponse.data as unknown as AgentSessionState,
+            requestedGoalEpoch,
+          );
+        }
+      } catch (error) {
+        // The matching goal_update already proves the mutation succeeded. A
+        // failed verification must remain a warning rather than turn that real
+        // success into a fake failure.
+        addActivity(conversationId, {
+          type: "goal_reconciliation",
+          title: "Objectif modifié, resynchronisation différée",
+          detail: error instanceof Error ? error.message : String(error),
+          status: "warning",
+        });
+      }
+    } finally {
+      if (pendingGoalMutations.current.get(conversationId) === pending) {
+        pendingGoalMutations.current.delete(conversationId);
+        window.clearTimeout(timeout);
+        setGoalMutationState(conversationId, undefined);
+      }
+    }
+  }, [addActivity, applySessionStateSnapshot, rejectGoalMutation, sendConversationRequest, setGoalMutationState]);
+
   const runCommand = useCallback(
     async (type: string, fields: Record<string, unknown> = {}) => {
       if (!selectedConversation || !selectedProject) return;
@@ -2426,13 +2847,17 @@ export function useAgentRuntime(options: {
         const previousEventVersion = maintenanceEventVersions.current.get(maintenanceKey) ?? 0;
         cancelConversationRequests(conversationId, "La connexion Prime Agent redémarre.");
         cancelPersistentConversationRequests(conversationId, "Le redémarrage d’urgence a interrompu l’opération en arrière-plan.");
+        rejectGoalMutation(conversationId, "Le redémarrage d’urgence a interrompu la modification de l’objectif.");
         settleCompactionWaiter(conversationId, new Error("Le redémarrage d’urgence a interrompu le compactage."));
         compactingConversations.current.delete(conversationId);
         compactionLifecycleStarted.current.delete(conversationId);
         activeCompactionActivities.current.delete(conversationId);
         recentCompactionEnds.current.delete(conversationId);
         compactionRefreshPending.current.delete(conversationId);
+        directRefinementActivities.current.delete(conversationId);
+        uncertainRefinementConversations.current.delete(conversationId);
         setRuntimeCompacting(conversationId, false, true);
+        setRuntimeRefining(conversationId, false);
         processExitErrors.current.delete(conversationId);
         lastStderr.current.delete(conversationId);
         historyLoaded.current.delete(conversationId);
@@ -2517,7 +2942,97 @@ export function useAgentRuntime(options: {
         return;
       }
       await ensureStarted(selectedConversation, selectedProject);
+      const goalMutation = type === "prompt" ? goalMutationDescriptor(fields.message) : undefined;
+      if (goalMutation) {
+        await runGoalMutation(selectedConversation.id, goalMutation, fields);
+        return;
+      }
       const token = activeSelection.current;
+      if (type === "refine") {
+        const conversationId = selectedConversation.id;
+        if (uncertainRefinementConversations.current.has(conversationId)) {
+          throw new Error("L’état du dernier raffinement est encore inconnu. Attendez son événement terminal ou utilisez le redémarrage d’urgence avant de relancer.");
+        }
+        if (directRefinementActivities.current.has(conversationId)) {
+          throw new Error("Un raffinement demandé depuis cette fenêtre est déjà en cours pour cette conversation.");
+        }
+        const activityId = uid("refinement-request");
+        directRefinementActivities.current.set(conversationId, activityId);
+        setRuntimeRefining(conversationId, true);
+        addActivity(conversationId, {
+          id: activityId,
+          type: "refine_start",
+          title: "Raffinement du contexte en cours",
+          detail: "Prime Agent analyse puis met à jour sa mémoire de travail. Cette opération continue si vous changez de conversation.",
+          status: "running",
+        });
+        try {
+          const response = await sendConversationRequest(
+            conversationId,
+            type,
+            fields,
+            REFINE_RESPONSE_TIMEOUT_MS,
+          );
+          if (response.success === false) {
+            if (isRefineDaemonAcknowledgementTimeout(response)) {
+              uncertainRefinementConversations.current.add(conversationId);
+              addActivity(conversationId, {
+                id: activityId,
+                type: "refine_start",
+                title: "Raffinement toujours en cours",
+                detail: "Le daemon n’a pas confirmé la fin dans son délai, mais cela n’annule pas le travail. N’envoyez pas une deuxième demande ; le résultat apparaîtra à l’événement terminal.",
+                status: "warning",
+                raw: response,
+              });
+              return;
+            }
+            throw new Error(response.error ?? "Prime Agent n’a pas pu raffiner le contexte.");
+          }
+          const presentation = refinementResultPresentation(response.data);
+          setRuntimeRefining(conversationId, false);
+          removeActivity(conversationId, activityId);
+          addActivity(conversationId, {
+            id: presentation.activityId ?? activityId,
+            type: "refine_complete",
+            title: presentation.title,
+            detail: presentation.detail,
+            status: "success",
+            raw: response,
+          });
+          const current = activeSelection.current;
+          if (current.conversationId === conversationId && isCurrentSelection(conversationId, current.generation)) {
+            void sendSelectionRequest(conversationId, current.generation, "get_state").catch(() => undefined);
+          }
+        } catch (error) {
+          const detail = cleanDiagnostic(error instanceof Error ? error.message : String(error))
+            ?? "Prime Agent n’a pas pu raffiner le contexte.";
+          if (detail.includes("n’a pas répondu à refine dans le délai prévu")) {
+            uncertainRefinementConversations.current.add(conversationId);
+            addActivity(conversationId, {
+              id: activityId,
+              type: "refine_start",
+              title: "État du raffinement inconnu",
+              detail: "Prime Orbit a perdu l’accusé terminal. Le travail peut toujours continuer : n’envoyez pas une seconde demande avant un événement terminal ou un redémarrage d’urgence.",
+              status: "warning",
+            });
+            return;
+          }
+          addActivity(conversationId, {
+            id: activityId,
+            type: "refine_failed",
+            title: "Échec du raffinement",
+            detail,
+            status: "error",
+          });
+          setRuntimeRefining(conversationId, false);
+          throw error;
+        } finally {
+          if (directRefinementActivities.current.get(conversationId) === activityId) {
+            directRefinementActivities.current.delete(conversationId);
+          }
+        }
+        return;
+      }
       if (type === "compact") {
         const conversationId = selectedConversation.id;
         if (
@@ -2688,7 +3203,7 @@ export function useAgentRuntime(options: {
       }
       await sendRpc(selectedConversation.id, { id: uid(type), type, ...fields });
     },
-    [addActivity, awaitMaintenanceRefresh, cancelConversationRequests, cancelPersistentConversationRequests, detection?.mode, ensureProcessStarted, ensureStarted, loadConversationHistory, onNotice, recentCompactionEnd, selectedConversation, selectedProject, sendConversationRequest, sendSelectionRequest, setRuntimeCompacting, settleCompactionWaiter, updateConversation],
+    [addActivity, awaitMaintenanceRefresh, cancelConversationRequests, cancelPersistentConversationRequests, detection?.mode, ensureProcessStarted, ensureStarted, isCurrentSelection, loadConversationHistory, onNotice, recentCompactionEnd, rejectGoalMutation, removeActivity, runGoalMutation, selectedConversation, selectedProject, sendConversationRequest, sendSelectionRequest, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation],
   );
 
   const observeSubagent = useCallback(async (activeSessionId?: string) => {
@@ -2858,7 +3373,9 @@ export function useAgentRuntime(options: {
     commands: runtime?.commands ?? [],
     stats: runtime?.stats,
     sessionState: runtime?.state,
+    goalMutation: runtime?.goalMutation,
     isCompacting: runtime?.isCompacting ?? runtime?.state?.isCompacting ?? false,
+    isRefining: runtime?.isRefining ?? false,
     schedules: runtime?.schedules ?? [],
     heartbeat: runtime?.heartbeat,
     heartbeats: runtime?.heartbeats ?? [],
