@@ -4,6 +4,26 @@ All notable changes to Prime Orbit are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-08-20
+
+### Transactional Prime Agent 0.7.4 runtime
+
+- Pinned managed installations to the verified official Prime Agent `v0.7.4` tag and exact commit.
+- Prepared every managed update in a fresh versioned runtime, then selected it only after repository, dependency, build, kernel, and `--version` verification. A failed candidate leaves the previous runtime selected, while side-by-side files avoid the Windows `EPERM` collisions caused by replacing loaded binaries in place.
+- Assigned each versioned managed runtime generation a stable private daemon socket shared by every Prime Orbit window. Queue mutations, resource reloads, and restarts retain that endpoint, while a newer generation cannot collide with the daemon used by active sessions.
+
+### Official defaults and advisory RLM preferences
+
+- Added native read/write support for Prime Agent's official global `defaultProvider`, `defaultModel`, and `defaultThinkingLevel` settings, with validation, compatible locking, backup, atomic persistence, and multi-window refresh without exposing unrelated configuration or secrets.
+- Applied the official main-agent defaults to new conversations unless a project or conversation makes a more specific choice.
+- Added separate local model and reasoning preferences for future `rlm.run` delegations. Each new conversation captures a bounded advisory instruction; Prime Agent remains free to select an available compatible fallback, and RLM thinking is enabled only for Prime Agent 0.7.4 or newer.
+
+### Validation
+
+- Added targeted native coverage for transactional runtime generations, exact-version activation, generation-scoped daemon sockets, global settings isolation, and compatible settings writes.
+- Added frontend coverage for official default precedence, multi-window updates, immutable RLM snapshots, advisory prompt construction, and Prime Agent version gating.
+- Kept the signed Windows draft workflow responsible for full frontend, Rust, formatting, Clippy, MSRV, updater signature, digest, and checksum gates.
+
 ## [0.1.15] - 2026-08-20
 
 ### Clearer agent turns
@@ -185,6 +205,7 @@ All notable changes to Prime Orbit are documented in this file.
 - TypeScript build and checks.
 - Strict Rust Clippy validation with warnings denied.
 
+[0.1.16]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.16
 [0.1.15]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.15
 [0.1.14]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.14
 [0.1.13]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.13

@@ -20,8 +20,10 @@ use tauri::AppHandle;
 use std::ffi::OsStr;
 
 pub const OFFICIAL_REPOSITORY_URL: &str = "https://github.com/PrimeIntellect-ai/prime-agent.git";
-pub const SUPPORTED_PRIME_AGENT_TAG: &str = "v0.7.3";
-pub const SUPPORTED_PRIME_AGENT_COMMIT: &str = "61131b2d195ba7a67a4ce8ac60bb10cecae07b67";
+pub const SUPPORTED_PRIME_AGENT_TAG: &str = "v0.7.4";
+pub const SUPPORTED_PRIME_AGENT_COMMIT: &str = "af0b8e00b9f704e834787fd321065ca78281f2aa";
+const LEGACY_MANAGED_SOURCE_DIR_NAME: &str = "prime-agent";
+const MANAGED_SOURCE_DIR_PREFIX: &str = "prime-agent-";
 const MINIMUM_PRIME_AGENT_NODE_VERSION: (u64, u64) = (22, 8);
 const STARTUP_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -139,7 +141,61 @@ pub fn managed_runtime_root(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 pub fn managed_source_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(managed_runtime_root(app)?.join("prime-agent"))
+    Ok(managed_runtime_root(app)?.join(LEGACY_MANAGED_SOURCE_DIR_NAME))
+}
+
+fn is_managed_source_name(name: &str) -> bool {
+    if name == LEGACY_MANAGED_SOURCE_DIR_NAME {
+        return true;
+    }
+    let Some(generation) = name.strip_prefix(MANAGED_SOURCE_DIR_PREFIX) else {
+        return false;
+    };
+    let Some(generation) = generation.strip_prefix('v') else {
+        return false;
+    };
+    let Some((version, identifier)) = generation.rsplit_once('-') else {
+        return false;
+    };
+    let mut version_parts = version.split('.');
+    let valid_version = (0..3).all(|_| {
+        version_parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    }) && version_parts.next().is_none();
+    let valid_identifier = identifier.len() == 32
+        && identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    valid_version && valid_identifier
+}
+
+/// Managed installs are immutable, versioned siblings under Orbit's private
+/// runtime root. Keeping the previous source directory in place lets already
+/// running agents finish while a new release is installed transactionally.
+fn is_managed_source_dir_under_root(runtime_root: &Path, source_dir: &Path) -> bool {
+    let Ok(runtime_root) = canonicalize(runtime_root) else {
+        return false;
+    };
+    let Ok(metadata) = fs::symlink_metadata(source_dir) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return false;
+    }
+    let Ok(actual) = canonicalize(source_dir) else {
+        return false;
+    };
+    actual.parent() == Some(runtime_root.as_path())
+        && actual
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_managed_source_name)
+}
+
+pub fn is_managed_source_dir(app: &AppHandle, source_dir: &Path) -> bool {
+    managed_runtime_root(app)
+        .is_ok_and(|runtime_root| is_managed_source_dir_under_root(&runtime_root, source_dir))
 }
 
 fn is_regular_file(path: &Path) -> bool {
@@ -411,12 +467,7 @@ pub fn detect_internal(
             }
             if let Some(source_dir) = config.source_dir.as_deref() {
                 let configured_source = Path::new(source_dir);
-                let managed = managed_source_dir(app)
-                    .ok()
-                    .and_then(|path| canonicalize(path).ok())
-                    .zip(canonicalize(configured_source).ok())
-                    .map(|(expected, actual)| expected == actual)
-                    .unwrap_or(false);
+                let managed = is_managed_source_dir(app, configured_source);
                 match source_launch_spec(&config, configured_source, managed) {
                     Ok(spec) => {
                         if let Some((detection, spec)) = inspect_launch_candidate(
@@ -782,7 +833,7 @@ fn parse_semver_prefix(value: &str) -> Option<(u64, u64)> {
     Some((numbers.next()?.parse().ok()?, numbers.next()?.parse().ok()?))
 }
 
-fn capture_launch_version(spec: &LaunchSpec) -> Result<String, String> {
+pub(crate) fn capture_launch_version(spec: &LaunchSpec) -> Result<String, String> {
     let arguments = vec![OsString::from("--version")];
     let mut command = spec.command(&arguments);
     capture_command_output_with_timeout(
@@ -1194,7 +1245,8 @@ mod tests {
     use super::{capture_command_output, external_command, find_program};
     use super::{
         capture_command_output_with_timeout, detection_from_spec, ensure_supported_node,
-        inspect_launch_candidate, parse_semver_prefix, LaunchSpec,
+        inspect_launch_candidate, is_managed_source_dir_under_root, parse_semver_prefix,
+        LaunchSpec,
     };
     #[cfg(windows)]
     use std::ffi::OsString;
@@ -1230,6 +1282,27 @@ mod tests {
             fs::set_permissions(&path, permissions).unwrap();
             path
         }
+    }
+
+    #[test]
+    fn recognizes_only_direct_managed_runtime_generations() {
+        let directory = tempfile::tempdir().expect("runtime root");
+        let root = directory.path().join("runtime");
+        fs::create_dir(&root).expect("runtime directory");
+        let legacy = root.join("prime-agent");
+        let generation = root.join("prime-agent-v0.7.4-0123456789abcdef0123456789abcdef");
+        let unrelated = root.join("custom-source");
+        let malformed = root.join("prime-agent-evil");
+        let nested = root.join("nested").join("prime-agent-v0.7.4-nested");
+        for path in [&legacy, &generation, &unrelated, &malformed, &nested] {
+            fs::create_dir_all(path).expect("source fixture");
+        }
+
+        assert!(is_managed_source_dir_under_root(&root, &legacy));
+        assert!(is_managed_source_dir_under_root(&root, &generation));
+        assert!(!is_managed_source_dir_under_root(&root, &unrelated));
+        assert!(!is_managed_source_dir_under_root(&root, &malformed));
+        assert!(!is_managed_source_dir_under_root(&root, &nested));
     }
 
     #[test]

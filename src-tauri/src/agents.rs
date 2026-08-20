@@ -42,6 +42,14 @@ const QUEUE_BRIDGE_SCRIPT: &str = include_str!("../assets/prime-agent-queue-brid
 const SESSION_CONTROL_BRIDGE_SCRIPT: &str =
     include_str!("../assets/prime-agent-session-control-bridge.cjs");
 const MAX_QUEUED_MESSAGE_TEXT: usize = 128 * 1024;
+const LEGACY_MANAGED_SOURCE_DIR_NAME: &str = "prime-agent";
+const VERSIONED_MANAGED_SOURCE_DIR_PREFIX: &str = "prime-agent-v";
+const MAX_MANAGED_GENERATION_NAME_BYTES: usize = 80;
+const PRIME_ORBIT_DAEMON_SOCKET_ENV: &str = "PRIME_ORBIT_DAEMON_SOCKET";
+#[cfg(windows)]
+const MAX_GENERATION_DAEMON_SOCKET_BYTES: usize = 240;
+#[cfg(not(windows))]
+const MAX_GENERATION_DAEMON_SOCKET_BYTES: usize = 100;
 
 #[derive(Clone)]
 pub struct AgentsState(Arc<Mutex<HashMap<String, RunningAgent>>>, Arc<AtomicBool>);
@@ -87,6 +95,8 @@ fn ensure_update_installation_is_idle(agents: &AgentsState) -> Result<(), String
 #[derive(Clone)]
 struct RunningAgent {
     info: RunningAgentInfo,
+    append_system_prompt: Option<String>,
+    daemon_socket: Option<PathBuf>,
     launch_spec: LaunchSpec,
     child: Arc<Mutex<Child>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
@@ -1669,11 +1679,94 @@ fn wait_for_child(child: &Arc<Mutex<Child>>) -> Result<ExitStatus, String> {
     }
 }
 
+fn is_versioned_managed_generation_name(name: &str) -> bool {
+    if name.len() > MAX_MANAGED_GENERATION_NAME_BYTES {
+        return false;
+    }
+    let Some(generation) = name.strip_prefix(VERSIONED_MANAGED_SOURCE_DIR_PREFIX) else {
+        return false;
+    };
+    let Some((version, identifier)) = generation.rsplit_once('-') else {
+        return false;
+    };
+    let mut version_parts = version.split('.');
+    let valid_version = (0..3).all(|_| {
+        version_parts.next().is_some_and(|part| {
+            !part.is_empty() && part.len() <= 10 && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    }) && version_parts.next().is_none();
+    let valid_identifier = identifier.len() == 32
+        && identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    valid_version && valid_identifier
+}
+
+/// Assigns an immutable managed runtime generation its own daemon endpoint.
+/// The value is derived only from the strictly validated generation directory,
+/// so separate Orbit windows that use the same generation converge on the same
+/// daemon while a side-by-side update cannot collide with the old generation.
+fn managed_generation_daemon_socket(launch_spec: &LaunchSpec) -> Result<Option<PathBuf>, String> {
+    let LaunchSpec::Source {
+        source_dir,
+        managed,
+        ..
+    } = launch_spec
+    else {
+        return Ok(None);
+    };
+    if !managed {
+        return Ok(None);
+    }
+    let generation = source_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Le nom de la génération Prime Agent gérée est invalide.".to_string())?;
+    if generation == LEGACY_MANAGED_SOURCE_DIR_NAME {
+        return Ok(None);
+    }
+    if !is_versioned_managed_generation_name(generation) {
+        return Err(format!(
+            "La génération Prime Agent gérée {generation:?} n’a pas un identifiant versionné valide."
+        ));
+    }
+
+    #[cfg(windows)]
+    let socket = PathBuf::from(format!(r"\\.\pipe\prime-orbit-daemon-{generation}"));
+    #[cfg(not(windows))]
+    let socket = PathBuf::from(format!("/tmp/prime-orbit-daemon-{generation}.sock"));
+
+    let socket_text = socket.to_str().ok_or_else(|| {
+        "Le socket de daemon Prime Agent calculé n’est pas représentable en UTF-8.".to_string()
+    })?;
+    if socket_text.is_empty()
+        || socket_text.len() > MAX_GENERATION_DAEMON_SOCKET_BYTES
+        || socket_text.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(
+            "Le socket de daemon Prime Agent calculé est invalide ou trop long.".to_string(),
+        );
+    }
+    Ok(Some(socket))
+}
+
+fn configure_bridge_daemon_socket(command: &mut std::process::Command, socket: Option<&Path>) {
+    // A user-defined parent environment must never redirect Orbit's private
+    // bridges. Only the endpoint selected and retained by the native runtime is
+    // allowed to cross this process boundary.
+    command.env_remove(PRIME_ORBIT_DAEMON_SOCKET_ENV);
+    if let Some(socket) = socket {
+        command.env(PRIME_ORBIT_DAEMON_SOCKET_ENV, socket);
+    }
+}
+
 fn rpc_launch_arguments(
     session_path: Option<&Path>,
     provider: Option<&str>,
     model: Option<&str>,
     thinking: Option<&str>,
+    append_system_prompt: Option<&str>,
+    daemon_socket: Option<&Path>,
 ) -> Vec<OsString> {
     let mut arguments = vec![OsString::from("--mode"), OsString::from("rpc")];
     if let Some(path) = session_path {
@@ -1692,6 +1785,14 @@ fn rpc_launch_arguments(
         arguments.push(OsString::from("--thinking"));
         arguments.push(OsString::from(value));
     }
+    if let Some(value) = append_system_prompt {
+        arguments.push(OsString::from("--append-system-prompt"));
+        arguments.push(OsString::from(value));
+    }
+    if let Some(path) = daemon_socket {
+        arguments.push(OsString::from("--daemon-socket"));
+        arguments.push(path.as_os_str().to_owned());
+    }
     arguments
 }
 
@@ -1705,6 +1806,8 @@ fn spawn_rpc_agent(
     provider: Option<String>,
     model: Option<String>,
     thinking: Option<String>,
+    append_system_prompt: Option<String>,
+    daemon_socket: Option<&Path>,
     launch_spec: &LaunchSpec,
 ) -> Result<SpawnedRpcAgent, String> {
     let arguments = rpc_launch_arguments(
@@ -1712,12 +1815,14 @@ fn spawn_rpc_agent(
         provider.as_deref(),
         model.as_deref(),
         thinking.as_deref(),
+        append_system_prompt.as_deref(),
+        daemon_socket,
     );
 
     let mut command = launch_spec.command(&arguments);
     #[cfg(windows)]
-    if matches!(launch_spec, LaunchSpec::Source { .. }) {
-        crate::node_compat::configure_source_rpc(app, &mut command)?;
+    if let LaunchSpec::Source { source_dir, .. } = launch_spec {
+        crate::node_compat::configure_source_rpc(app, &mut command, Some(source_dir))?;
     }
     command
         .current_dir(cwd)
@@ -1847,6 +1952,7 @@ fn start_agent_blocking(
     provider: Option<String>,
     model: Option<String>,
     thinking: Option<String>,
+    append_system_prompt: Option<String>,
 ) -> Result<RunningAgentInfo, String> {
     ensure_update_installation_is_idle(&agents)?;
     let conversation_id = validated_identifier(conversation_id)?;
@@ -1886,6 +1992,8 @@ fn start_agent_blocking(
             ));
         }
     }
+    let append_system_prompt =
+        validated_option(append_system_prompt, "appendSystemPrompt", 4 * 1024)?;
 
     let (detection, launch_spec) = detect_internal(&app)?;
     let launch_spec = launch_spec.ok_or_else(|| {
@@ -1898,6 +2006,7 @@ fn start_agent_blocking(
             "Prime Agent est introuvable. Lancez l’installation rapide ou configurez son runtime{details}"
         )
     })?;
+    let daemon_socket = managed_generation_daemon_socket(&launch_spec)?;
 
     let mut map = agents.0.lock();
     ensure_update_installation_is_idle(&agents)?;
@@ -1924,6 +2033,8 @@ fn start_agent_blocking(
         provider,
         model,
         thinking,
+        append_system_prompt.clone(),
+        daemon_socket.as_deref(),
         &launch_spec,
     )?;
     let info = spawned.info.clone();
@@ -1931,6 +2042,8 @@ fn start_agent_blocking(
         conversation_id.clone(),
         RunningAgent {
             info: info.clone(),
+            append_system_prompt,
+            daemon_socket,
             launch_spec,
             child: Arc::clone(&spawned.child),
             stdin: Arc::clone(&spawned.stdin),
@@ -2221,7 +2334,7 @@ fn mutate_agent_queue_blocking(
     validate_queued_message_text(&expected_text, "Le message attendu", true)?;
     validate_queue_mutation(&mutation)?;
 
-    let (launch_spec, session_file, session_id, pid, started_at) = {
+    let (launch_spec, daemon_socket, session_file, session_id, pid, started_at) = {
         let mut map = agents.0.lock();
         let agent = map
             .get_mut(&conversation_id)
@@ -2246,6 +2359,7 @@ fn mutate_agent_queue_blocking(
         })?;
         (
             agent.launch_spec.clone(),
+            agent.daemon_socket.clone(),
             session_file,
             agent.info.session_id.clone(),
             agent.info.pid,
@@ -2280,6 +2394,7 @@ fn mutate_agent_queue_blocking(
         .map_err(|error| format!("Impossible de préparer la mutation de file: {error}"))?;
     let arguments = [OsString::from("-e"), OsString::from(QUEUE_BRIDGE_SCRIPT)];
     let mut command = external_command(&node, &arguments);
+    configure_bridge_daemon_socket(&mut command, daemon_socket.as_deref());
     command
         .env("PRIME_ORBIT_CLI_PATH", cli)
         .stdin(Stdio::piped())
@@ -2409,7 +2524,7 @@ fn reload_agent_resources_blocking(
     conversation_id: String,
 ) -> Result<ReloadAgentResourcesResult, String> {
     let conversation_id = validated_identifier(conversation_id)?;
-    let (node, cli, session_file, session_id, pid, started_at, token) = {
+    let (node, cli, daemon_socket, session_file, session_id, pid, started_at, token) = {
         let mut map = agents.0.lock();
         let agent = map
             .get_mut(&conversation_id)
@@ -2458,6 +2573,7 @@ fn reload_agent_resources_blocking(
         (
             node,
             cli,
+            agent.daemon_socket.clone(),
             session_file,
             agent.info.session_id.clone(),
             agent.info.pid,
@@ -2478,6 +2594,7 @@ fn reload_agent_resources_blocking(
         OsString::from(SESSION_CONTROL_BRIDGE_SCRIPT),
     ];
     let mut command = external_command(&node, &arguments);
+    configure_bridge_daemon_socket(&mut command, daemon_socket.as_deref());
     command
         .env("PRIME_ORBIT_CLI_PATH", cli)
         .stdin(Stdio::piped())
@@ -2537,6 +2654,8 @@ struct RestartSnapshot {
     provider: Option<String>,
     model: Option<String>,
     thinking: Option<String>,
+    append_system_prompt: Option<String>,
+    daemon_socket: Option<PathBuf>,
     launch_spec: LaunchSpec,
     child: Arc<Mutex<Child>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
@@ -2592,6 +2711,8 @@ fn restart_agent_blocking(
             provider: agent.info.provider.clone(),
             model: agent.info.model.clone(),
             thinking: agent.info.thinking.clone(),
+            append_system_prompt: agent.append_system_prompt.clone(),
+            daemon_socket: agent.daemon_socket.clone(),
             launch_spec: agent.launch_spec.clone(),
             child: Arc::clone(&agent.child),
             stdin: Arc::clone(&agent.stdin),
@@ -2688,6 +2809,8 @@ fn restart_agent_blocking(
             snapshot.provider.clone(),
             snapshot.model.clone(),
             snapshot.thinking.clone(),
+            snapshot.append_system_prompt.clone(),
+            snapshot.daemon_socket.as_deref(),
             &snapshot.launch_spec,
         ) {
             Ok(spawned) => spawned,
@@ -2711,6 +2834,8 @@ fn restart_agent_blocking(
             conversation_id.clone(),
             RunningAgent {
                 info: info.clone(),
+                append_system_prompt: snapshot.append_system_prompt,
+                daemon_socket: snapshot.daemon_socket,
                 launch_spec: snapshot.launch_spec,
                 child: Arc::clone(&spawned.child),
                 stdin: Arc::clone(&spawned.stdin),
@@ -2871,6 +2996,7 @@ pub async fn start_agent(
     provider: Option<String>,
     model: Option<String>,
     thinking: Option<String>,
+    append_system_prompt: Option<String>,
 ) -> Result<RunningAgentInfo, String> {
     let agents = agents.inner().clone();
     let owner = window.label().to_string();
@@ -2885,6 +3011,7 @@ pub async fn start_agent(
             provider,
             model,
             thinking,
+            append_system_prompt,
         )
     })
     .await
@@ -3086,14 +3213,14 @@ mod tests {
         conflicting_session_conversation, direct_session_operation_runtime_event,
         ensure_update_installation_is_idle, finish_resource_reload, finish_runtime_write,
         is_extension_ui_request, is_reload_acknowledgement_timeout, lease_absence_attests_release,
-        mark_resource_reload_unknown, owner_may_send, public_runtime_line,
-        release_owner_lease_state, requested_launch_option_update, restart_slot_matches,
-        rpc_launch_arguments, rpc_starts_busy_operation, runtime_busy_state,
+        managed_generation_daemon_socket, mark_resource_reload_unknown, owner_may_send,
+        public_runtime_line, release_owner_lease_state, requested_launch_option_update,
+        restart_slot_matches, rpc_launch_arguments, rpc_starts_busy_operation, runtime_busy_state,
         runtime_launch_options, runtime_session_id, runtime_session_path,
         should_emit_resources_reloaded, validate_queue_lane, validate_queue_mutation,
         validate_reload_result, wait_for_child_until, waiter_may_remove_slot, AgentOperations,
         AgentResourcesReloadedEvent, AgentsState, DirectSessionOperationKind,
-        DirectSessionOperationRuntimeEvent, LaunchOptionUpdate, QueuedMessageMutation,
+        DirectSessionOperationRuntimeEvent, LaunchOptionUpdate, LaunchSpec, QueuedMessageMutation,
         ReloadAgentResourcesResult, ResourceReloadClaimError, ResourceReloadPhase,
         RestartAgentResult, RpcAdmissionError, RunningAgentInfo, MAX_EXIT_DIAGNOSTIC_BYTES,
     };
@@ -3102,7 +3229,7 @@ mod tests {
     use serde_json::{json, Value};
     use std::{
         collections::HashSet,
-        path::Path,
+        path::{Path, PathBuf},
         process::Stdio,
         sync::{Arc, Barrier},
         thread,
@@ -3823,11 +3950,16 @@ mod tests {
 
     #[test]
     fn restart_reuses_the_exact_resume_and_model_arguments() {
+        let daemon_socket = Path::new(
+            r"\\.\pipe\prime-orbit-daemon-prime-agent-v0.7.4-4a6f213a1ed44889a0f0b40ea4774f3d",
+        );
         let arguments = rpc_launch_arguments(
             Some(Path::new("C:\\sessions\\one.jsonl")),
             Some("openai"),
             Some("gpt-5.6-sol"),
             Some("xhigh"),
+            Some("Prefer rlm.run thinking high."),
+            Some(daemon_socket),
         )
         .into_iter()
         .map(|value| value.to_string_lossy().into_owned())
@@ -3845,8 +3977,92 @@ mod tests {
                 "gpt-5.6-sol",
                 "--thinking",
                 "xhigh",
+                "--append-system-prompt",
+                "Prefer rlm.run thinking high.",
+                "--daemon-socket",
+                r"\\.\pipe\prime-orbit-daemon-prime-agent-v0.7.4-4a6f213a1ed44889a0f0b40ea4774f3d",
             ]
         );
+    }
+
+    fn source_launch_spec(name: &str, managed: bool) -> LaunchSpec {
+        LaunchSpec::Source {
+            node: PathBuf::from("node"),
+            cli: PathBuf::from("cli.js"),
+            source_dir: PathBuf::from("runtime").join(name),
+            managed,
+        }
+    }
+
+    #[test]
+    fn versioned_managed_sources_get_a_stable_generation_daemon_socket() {
+        let generation = "prime-agent-v0.7.4-4a6f213a1ed44889a0f0b40ea4774f3d";
+        let first = managed_generation_daemon_socket(&source_launch_spec(generation, true))
+            .expect("valid managed generation")
+            .expect("generation socket");
+        let second = managed_generation_daemon_socket(&source_launch_spec(generation, true))
+            .expect("same valid managed generation")
+            .expect("same generation socket");
+        assert_eq!(first, second);
+
+        #[cfg(windows)]
+        assert_eq!(
+            first,
+            PathBuf::from(format!(r"\\.\pipe\prime-orbit-daemon-{generation}"))
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            first,
+            PathBuf::from(format!("/tmp/prime-orbit-daemon-{generation}.sock"))
+        );
+
+        let other = managed_generation_daemon_socket(&source_launch_spec(
+            "prime-agent-v0.7.4-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            true,
+        ))
+        .expect("other valid managed generation")
+        .expect("other generation socket");
+        assert_ne!(first, other);
+    }
+
+    #[test]
+    fn legacy_external_and_system_sources_keep_the_upstream_daemon_socket() {
+        assert_eq!(
+            managed_generation_daemon_socket(&source_launch_spec("prime-agent", true))
+                .expect("legacy managed runtime"),
+            None
+        );
+        assert_eq!(
+            managed_generation_daemon_socket(&source_launch_spec(
+                "prime-agent-v0.7.4-4a6f213a1ed44889a0f0b40ea4774f3d",
+                false,
+            ))
+            .expect("external source runtime"),
+            None
+        );
+        assert_eq!(
+            managed_generation_daemon_socket(&LaunchSpec::Executable {
+                executable: PathBuf::from("prime-agent"),
+                managed: false,
+            })
+            .expect("system executable runtime"),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_managed_generations_fail_closed_instead_of_sharing_the_default_socket() {
+        for name in [
+            "prime-agent-v0.7-4a6f213a1ed44889a0f0b40ea4774f3d",
+            "prime-agent-v0.7.4-4A6F213A1ED44889A0F0B40EA4774F3D",
+            "prime-agent-v0.7.4-../../prime-agent-daemon",
+            "prime-agent-v00000000000.7.4-4a6f213a1ed44889a0f0b40ea4774f3d",
+        ] {
+            assert!(
+                managed_generation_daemon_socket(&source_launch_spec(name, true)).is_err(),
+                "{name} must fail closed"
+            );
+        }
     }
 
     #[test]

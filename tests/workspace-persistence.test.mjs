@@ -23,6 +23,7 @@ const {
   createPreservedConversationReference,
   jsonValuesEqual,
   rebaseWorkspaceState,
+  resolveNewConversationModel,
   workspaceStatesEqual,
 } = compiledModule.exports;
 
@@ -140,6 +141,19 @@ test("runtime-only conversation patches do not advance the durable timestamp", (
     title: "Renamed",
   }, "2026-08-19T10:05:00.000Z");
   assert.equal(durableUpdate.updatedAt, "2026-08-19T10:05:00.000Z");
+});
+
+test("new conversations snapshot the most specific available default model", () => {
+  assert.equal(
+    resolveNewConversationModel("openai/conversation", "anthropic/project", "ollama/global"),
+    "openai/conversation",
+  );
+  assert.equal(
+    resolveNewConversationModel(undefined, "anthropic/project", "ollama/global"),
+    "anthropic/project",
+  );
+  assert.equal(resolveNewConversationModel(undefined, undefined, " ollama/global "), "ollama/global");
+  assert.equal(resolveNewConversationModel(undefined, undefined, undefined), undefined);
 });
 
 test("preserving a session for fork or clone keeps its durable source reference without copying runtime payloads", () => {

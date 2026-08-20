@@ -24,6 +24,10 @@ const MAX_ATTACHMENT_COUNT = 20;
 const MAX_DOCUMENT_BYTES = 20 * 1024 * 1024;
 const MAX_TOTAL_ATTACHMENT_BYTES = 40 * 1024 * 1024;
 const MAX_FRAGMENT_UTF16 = 16 * 1024 * 1024;
+const MAX_WINDOWS_DAEMON_SOCKET_BYTES = 240;
+const MAX_UNIX_DAEMON_SOCKET_BYTES = 100;
+const WINDOWS_GENERATION_SOCKET = /^\\\\\.\\pipe\\prime-orbit-daemon-prime-agent-v\d{1,10}\.\d{1,10}\.\d{1,10}-[0-9a-f]{32}$/u;
+const UNIX_GENERATION_SOCKET = /^\/tmp\/prime-orbit-daemon-prime-agent-v\d{1,10}\.\d{1,10}\.\d{1,10}-[0-9a-f]{32}\.sock$/u;
 
 function xmlEscape(value) {
   return value.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
@@ -155,6 +159,20 @@ function findDaemonModules(cliPath) {
   throw new Error("Les modules daemon de Prime Agent sont introuvables dans ce runtime.");
 }
 
+function resolveDaemonSocketPath(explicitSocketPath, defaultDaemonSocketPath, platform = process.platform) {
+  if (explicitSocketPath === undefined) return defaultDaemonSocketPath();
+  if (typeof explicitSocketPath !== "string" || explicitSocketPath.length === 0) {
+    throw new Error("Socket de daemon Prime Agent invalide.");
+  }
+  const isWindows = platform === "win32";
+  const maxBytes = isWindows ? MAX_WINDOWS_DAEMON_SOCKET_BYTES : MAX_UNIX_DAEMON_SOCKET_BYTES;
+  const pattern = isWindows ? WINDOWS_GENERATION_SOCKET : UNIX_GENERATION_SOCKET;
+  if (Buffer.byteLength(explicitSocketPath, "utf8") > maxBytes || !pattern.test(explicitSocketPath)) {
+    throw new Error("Socket de daemon Prime Agent géré invalide ou trop long.");
+  }
+  return explicitSocketPath;
+}
+
 async function main() {
   const cliPath = process.env.PRIME_ORBIT_CLI_PATH;
   const chunks = [];
@@ -173,7 +191,11 @@ async function main() {
     import(pathToFileURL(modules.daemonSocket).href),
   ]);
 
-  const client = new DaemonClient(defaultDaemonSocketPath());
+  const socketPath = resolveDaemonSocketPath(
+    process.env.PRIME_ORBIT_DAEMON_SOCKET,
+    defaultDaemonSocketPath,
+  );
+  const client = new DaemonClient(socketPath);
   try {
     await client.connect(3_000);
     await client.waitForHello(3_000);

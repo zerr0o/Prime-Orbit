@@ -101,6 +101,10 @@ export interface Conversation {
   sessionNameSyncPending?: boolean;
   model?: string;
   thinkingLevel: ThinkingLevel;
+  /** Immutable best-effort RLM model preference captured when this conversation is created. */
+  rlmPreferredModel?: string;
+  /** Immutable rlm.run thinking preference captured only when the runtime supports it. */
+  rlmThinkingLevel?: ThinkingLevel;
   /** Durable marker used to distinguish a never-submitted draft from a real session. */
   hasContent?: boolean;
   draft: string;
@@ -336,6 +340,26 @@ export interface McpServerSummary {
 export interface PrimeAgentConnections {
   providerIds: string[];
   mcpServers: McpServerSummary[];
+}
+
+/** Official global defaults read from ~/.prime/agent/settings.json. */
+export interface PrimeAgentDefaults {
+  defaultProvider?: string;
+  defaultModel?: string;
+  defaultThinkingLevel?: ThinkingLevel;
+}
+
+/** Null removes the corresponding official Prime Agent setting. */
+export interface SavePrimeAgentDefaultsInput {
+  defaultProvider: string | null;
+  defaultModel: string | null;
+  defaultThinkingLevel: ThinkingLevel | null;
+}
+
+export interface SavePrimeAgentDefaultsResult {
+  path: string;
+  backupPath: string | null;
+  defaults: PrimeAgentDefaults;
 }
 
 export interface OllamaHealth {

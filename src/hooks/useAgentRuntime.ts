@@ -19,6 +19,7 @@ import {
   type StartAgentOptions,
 } from "../lib/bridge";
 import { redactText, redactValue } from "../lib/redaction";
+import { buildRlmDelegationPrompt } from "../lib/rlm-preferences";
 import type { RuntimeNotice } from "../lib/runtime-notices";
 import type {
   ActivityItem,
@@ -1851,6 +1852,10 @@ export function useAgentRuntime(options: {
         provider: slash > 0 ? modelRef?.slice(0, slash) : undefined,
         model: slash > 0 ? modelRef?.slice(slash + 1) : modelRef,
         thinking: conversation.thinkingLevel,
+        appendSystemPrompt: buildRlmDelegationPrompt({
+          preferredModel: conversation.rlmPreferredModel,
+          thinkingLevel: conversation.rlmThinkingLevel,
+        }),
       };
       // A retry starts a new process attempt. Discard the previous terminal
       // diagnostic only here (not in ensureStarted, which can join an existing

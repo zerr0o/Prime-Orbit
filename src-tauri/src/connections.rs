@@ -1,5 +1,6 @@
 use crate::{
     paths::canonicalize,
+    session_lease::resolve_agent_dir,
     storage::{write_atomic, PersistenceLock},
 };
 use serde::{
@@ -9,12 +10,12 @@ use serde::{
 use serde_json::{Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fmt,
     fs::{self, OpenOptions},
     io::{Read, Write},
     net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -23,7 +24,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use url::{Host, Url};
 
 #[cfg(windows)]
@@ -85,6 +86,56 @@ pub struct PublicMcpServer {
 pub struct PrimeAgentConnections {
     pub provider_ids: Vec<String>,
     pub mcp_servers: Vec<PublicMcpServer>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrimeAgentThinkingLevel {
+    Off,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimeAgentDefaults {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_thinking_level: Option<PrimeAgentThinkingLevel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SavePrimeAgentDefaultsInput {
+    #[serde(deserialize_with = "deserialize_present_nullable")]
+    pub default_provider: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_nullable")]
+    pub default_model: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_nullable")]
+    pub default_thinking_level: Option<PrimeAgentThinkingLevel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavePrimeAgentDefaultsResult {
+    pub path: String,
+    pub backup_path: Option<String>,
+    pub defaults: PrimeAgentDefaults,
+}
+
+fn deserialize_present_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 /// A bounded, secret-free reachability snapshot for the Ollama endpoint used
@@ -285,6 +336,64 @@ fn validate_save_input(input: &SaveMcpServerInput) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_default_provider(provider: &str) -> Result<(), String> {
+    if provider.is_empty() || provider.len() > 128 || provider.trim() != provider {
+        return Err(
+            "defaultProvider doit contenir entre 1 et 128 caractères sans espace en bordure"
+                .to_string(),
+        );
+    }
+    let mut bytes = provider.bytes();
+    if !matches!(bytes.next(), Some(byte) if byte.is_ascii_alphanumeric())
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(
+            "defaultProvider doit être un identifiant de fournisseur exact (lettres ASCII, chiffres, -, _ et .)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_default_model(model: &str) -> Result<(), String> {
+    if model.is_empty() || model.len() > 512 || model.trim() != model {
+        return Err(
+            "defaultModel doit contenir entre 1 et 512 octets sans espace en bordure".to_string(),
+        );
+    }
+    if model.starts_with('/')
+        || model.ends_with('/')
+        || model.contains("//")
+        || model.contains('\\')
+        || model
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(
+            "defaultModel doit être un identifiant de modèle exact sans espace, antislash ni segment vide"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_prime_agent_defaults_input(input: &SavePrimeAgentDefaultsInput) -> Result<(), String> {
+    match (&input.default_provider, &input.default_model) {
+        (Some(provider), Some(model)) => {
+            validate_default_provider(provider)?;
+            validate_default_model(model)?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "defaultProvider et defaultModel doivent être définis ou retirés ensemble"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn existing_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err(format!("Le chemin {label} doit être absolu"));
@@ -323,6 +432,101 @@ fn project_directory(cwd: Option<String>) -> Result<PathBuf, String> {
         return Err("cwd ne peut pas être vide".to_string());
     }
     existing_directory(Path::new(&cwd), "du projet")
+}
+
+fn resolve_global_agent_directory(
+    home: &Path,
+    cwd: &Path,
+    prime_override: Option<&OsStr>,
+    legacy_override: Option<&OsStr>,
+) -> (PathBuf, bool) {
+    let configured = prime_override
+        .filter(|value| !value.is_empty())
+        .or_else(|| legacy_override.filter(|value| !value.is_empty()));
+    (
+        resolve_agent_dir(home, cwd, configured),
+        configured.is_some(),
+    )
+}
+
+fn validate_override_agent_directory(path: &Path, create: bool) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "Le dossier global Prime Agent résolu doit être absolu ({})",
+            path.display()
+        ));
+    }
+    if create {
+        fs::create_dir_all(path).map_err(|error| {
+            format!(
+                "Impossible de créer le dossier global Prime Agent {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => {
+            return Ok(path.to_path_buf());
+        }
+        Err(error) => {
+            return Err(format!(
+                "Impossible d’inspecter le dossier global Prime Agent {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "Le dossier global Prime Agent {} doit être un dossier régulier non symbolique",
+            path.display()
+        ));
+    }
+    canonicalize(path).map_err(|error| {
+        format!(
+            "Impossible de résoudre le dossier global Prime Agent {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn global_agent_directory(app: &AppHandle, create: bool) -> Result<PathBuf, String> {
+    let home = home_directory(app)?;
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("Impossible de localiser le dossier courant: {error}"))?;
+    let prime_override = std::env::var_os("PRIME_AGENT_CODING_AGENT_DIR");
+    let legacy_override = std::env::var_os("PI_CODING_AGENT_DIR");
+    let (directory, overridden) = resolve_global_agent_directory(
+        &home,
+        &cwd,
+        prime_override.as_deref(),
+        legacy_override.as_deref(),
+    );
+    if overridden {
+        validate_override_agent_directory(&directory, create)
+    } else {
+        agent_config_directory(&home, create)
+    }
+}
+
+fn global_agent_file_path(
+    app: &AppHandle,
+    create: bool,
+    file_name: &'static str,
+) -> Result<PathBuf, String> {
+    let mut components = Path::new(file_name).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err("Nom de fichier global Prime Agent invalide".to_string());
+    }
+    let directory = global_agent_directory(app, create)?;
+    let path = directory.join(file_name);
+    if path.parent() != Some(directory.as_path()) {
+        return Err(format!(
+            "Le fichier global Prime Agent sort du dossier autorisé {}",
+            directory.display()
+        ));
+    }
+    Ok(path)
 }
 
 fn agent_config_directory(root: &Path, create: bool) -> Result<PathBuf, String> {
@@ -392,15 +596,16 @@ fn settings_path(
     scope: McpScope,
     create: bool,
 ) -> Result<PathBuf, String> {
-    let root = match scope {
-        McpScope::Global => home_directory(app)?,
-        McpScope::Project => project_directory(cwd)?,
-    };
-    Ok(agent_config_directory(&root, create)?.join("settings.json"))
+    match scope {
+        McpScope::Global => global_agent_file_path(app, create, "settings.json"),
+        McpScope::Project => {
+            Ok(agent_config_directory(&project_directory(cwd)?, create)?.join("settings.json"))
+        }
+    }
 }
 
 fn auth_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(agent_config_directory(&home_directory(app)?, false)?.join("auth.json"))
+    global_agent_file_path(app, false, "auth.json")
 }
 
 fn read_regular_file_limited(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
@@ -826,6 +1031,83 @@ fn load_settings(path: &Path) -> Result<SettingsDocument, String> {
         value,
         raw: Some(raw),
     })
+}
+
+fn optional_settings_string(
+    root: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, String> {
+    match root.get(key) {
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(format!("{key} doit être une chaîne dans settings.json")),
+        None => Ok(None),
+    }
+}
+
+fn inspect_prime_agent_defaults_document(value: &Value) -> Result<PrimeAgentDefaults, String> {
+    let root = value
+        .as_object()
+        .ok_or_else(|| "settings.json doit contenir un objet JSON à la racine".to_string())?;
+    let default_provider = optional_settings_string(root, "defaultProvider")?;
+    let default_model = optional_settings_string(root, "defaultModel")?;
+    if let Some(provider) = default_provider.as_deref() {
+        validate_default_provider(provider)?;
+    }
+    if let Some(model) = default_model.as_deref() {
+        validate_default_model(model)?;
+    }
+    let default_thinking_level = match root.get("defaultThinkingLevel") {
+        Some(value) => Some(serde_json::from_value(value.clone()).map_err(|_| {
+            "defaultThinkingLevel doit valoir off, minimal, low, medium, high, xhigh ou max"
+                .to_string()
+        })?),
+        None => None,
+    };
+    Ok(PrimeAgentDefaults {
+        default_provider,
+        default_model,
+        default_thinking_level,
+    })
+}
+
+fn apply_prime_agent_defaults(
+    value: &mut Value,
+    input: &SavePrimeAgentDefaultsInput,
+) -> Result<PrimeAgentDefaults, String> {
+    validate_prime_agent_defaults_input(input)?;
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| "settings.json doit contenir un objet JSON à la racine".to_string())?;
+
+    match (&input.default_provider, &input.default_model) {
+        (Some(provider), Some(model)) => {
+            root.insert(
+                "defaultProvider".to_string(),
+                Value::String(provider.clone()),
+            );
+            root.insert("defaultModel".to_string(), Value::String(model.clone()));
+        }
+        (None, None) => {
+            root.remove("defaultProvider");
+            root.remove("defaultModel");
+        }
+        _ => unreachable!("provider/model pair validated before mutation"),
+    }
+
+    match input.default_thinking_level {
+        Some(level) => {
+            root.insert(
+                "defaultThinkingLevel".to_string(),
+                serde_json::to_value(level)
+                    .map_err(|error| format!("Impossible de sérialiser le niveau: {error}"))?,
+            );
+        }
+        None => {
+            root.remove("defaultThinkingLevel");
+        }
+    }
+
+    inspect_prime_agent_defaults_document(value)
 }
 
 fn server_enabled(config: &Map<String, Value>, name: &str) -> Result<bool, String> {
@@ -1573,6 +1855,45 @@ fn settings_servers_mut(value: &mut Value) -> Result<&mut Map<String, Value>, St
         .ok_or_else(|| "mcpServers doit être un objet".to_string())
 }
 
+fn inspect_prime_agent_defaults_blocking(
+    app: AppHandle,
+    persistence: PersistenceLock,
+) -> Result<PrimeAgentDefaults, String> {
+    let _guard = persistence.0.lock();
+    let path = settings_path(&app, None, McpScope::Global, false)?;
+    let document = load_settings(&path)?;
+    inspect_prime_agent_defaults_document(&document.value)
+}
+
+fn save_prime_agent_defaults_at_path(
+    path: &Path,
+    input: SavePrimeAgentDefaultsInput,
+) -> Result<SavePrimeAgentDefaultsResult, String> {
+    validate_prime_agent_defaults_input(&input)?;
+    let _file_lock = CompatibleSettingsLock::acquire(path)?;
+    let mut document = load_settings(path)?;
+    let defaults = apply_prime_agent_defaults(&mut document.value, &input)?;
+    let bytes = serialize_settings(&document.value)?;
+    let backup = write_backup(path, document.raw.as_deref())?;
+    write_atomic(path, &bytes)?;
+    Ok(SavePrimeAgentDefaultsResult {
+        path: path.to_string_lossy().into_owned(),
+        backup_path: backup.map(|value| value.to_string_lossy().into_owned()),
+        defaults,
+    })
+}
+
+fn save_prime_agent_defaults_blocking(
+    app: AppHandle,
+    input: SavePrimeAgentDefaultsInput,
+    persistence: PersistenceLock,
+) -> Result<SavePrimeAgentDefaultsResult, String> {
+    validate_prime_agent_defaults_input(&input)?;
+    let path = settings_path(&app, None, McpScope::Global, true)?;
+    let _guard = persistence.0.lock();
+    save_prime_agent_defaults_at_path(&path, input)
+}
+
 fn inspect_prime_agent_connections_blocking(
     app: AppHandle,
     cwd: Option<String>,
@@ -1727,6 +2048,33 @@ pub async fn inspect_prime_agent_connections(
     let persistence = PersistenceLock(std::sync::Arc::clone(&persistence.0));
     crate::run_blocking(move || inspect_prime_agent_connections_blocking(app, cwd, persistence))
         .await
+}
+
+#[tauri::command]
+pub async fn inspect_prime_agent_defaults(
+    app: AppHandle,
+    persistence: tauri::State<'_, PersistenceLock>,
+) -> Result<PrimeAgentDefaults, String> {
+    let persistence = PersistenceLock(std::sync::Arc::clone(&persistence.0));
+    crate::run_blocking(move || inspect_prime_agent_defaults_blocking(app, persistence)).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn save_prime_agent_defaults(
+    app: AppHandle,
+    input: SavePrimeAgentDefaultsInput,
+    persistence: tauri::State<'_, PersistenceLock>,
+) -> Result<SavePrimeAgentDefaultsResult, String> {
+    let persistence = PersistenceLock(std::sync::Arc::clone(&persistence.0));
+    let event_app = app.clone();
+    let result =
+        crate::run_blocking(move || save_prime_agent_defaults_blocking(app, input, persistence))
+            .await?;
+    let _ = event_app.emit(
+        "prime-orbit://prime-agent-defaults",
+        result.defaults.clone(),
+    );
+    Ok(result)
 }
 
 #[tauri::command]
@@ -2320,5 +2668,235 @@ mod tests {
             persisted["mcpServers"]["acme"]["url"],
             Value::String("https://new.example/mcp".to_string())
         );
+    }
+
+    #[test]
+    fn reads_official_prime_agent_defaults_without_exposing_other_settings() {
+        let settings = serde_json::json!({
+            "defaultProvider": "openrouter",
+            "defaultModel": "anthropic/claude-sonnet-4",
+            "defaultThinkingLevel": "xhigh",
+            "apiKey": "DO-NOT-RETURN",
+            "mcpServers": {
+                "private": {
+                    "type": "http",
+                    "url": "https://example.test/mcp",
+                    "headers": { "Authorization": "Bearer SECRET" }
+                }
+            }
+        });
+
+        let defaults = inspect_prime_agent_defaults_document(&settings).unwrap();
+        assert_eq!(
+            defaults,
+            PrimeAgentDefaults {
+                default_provider: Some("openrouter".to_string()),
+                default_model: Some("anthropic/claude-sonnet-4".to_string()),
+                default_thinking_level: Some(PrimeAgentThinkingLevel::Xhigh),
+            }
+        );
+        let public = serde_json::to_value(defaults).unwrap();
+        assert!(public.get("apiKey").is_none());
+        assert!(public.get("mcpServers").is_none());
+    }
+
+    #[test]
+    fn resolves_global_agent_directory_with_prime_then_legacy_then_fallback_priority() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let cwd = directory.path().join("project");
+        let prime = directory.path().join("prime-agent-dir");
+        let legacy = directory.path().join("legacy-agent-dir");
+
+        assert_eq!(
+            resolve_global_agent_directory(&home, &cwd, None, None),
+            (home.join(".prime").join("agent"), false)
+        );
+        assert_eq!(
+            resolve_global_agent_directory(
+                &home,
+                &cwd,
+                Some(prime.as_os_str()),
+                Some(legacy.as_os_str()),
+            ),
+            (prime.clone(), true),
+            "PRIME_AGENT_CODING_AGENT_DIR must win over the legacy override"
+        );
+        assert_eq!(
+            resolve_global_agent_directory(&home, &cwd, None, Some(legacy.as_os_str())),
+            (legacy.clone(), true)
+        );
+        assert_eq!(
+            resolve_global_agent_directory(
+                &home,
+                &cwd,
+                Some(OsStr::new("")),
+                Some(legacy.as_os_str()),
+            ),
+            (legacy, true),
+            "an empty primary override must not mask a usable legacy override"
+        );
+    }
+
+    #[test]
+    fn resolves_global_agent_override_as_the_agent_directory_itself() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let cwd = directory.path().join("project");
+
+        assert_eq!(
+            resolve_global_agent_directory(&home, &cwd, Some(OsStr::new("relative-agent")), None,),
+            (cwd.join("relative-agent"), true)
+        );
+        assert_eq!(
+            resolve_global_agent_directory(&home, &cwd, Some(OsStr::new("~/custom-agent")), None,),
+            (home.join("custom-agent"), true)
+        );
+    }
+
+    #[test]
+    fn override_agent_directory_is_created_and_must_be_a_regular_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let configured = directory.path().join("nested").join("agent");
+        let resolved = validate_override_agent_directory(&configured, true).unwrap();
+        assert!(resolved.is_dir());
+
+        let invalid = directory.path().join("not-a-directory");
+        fs::write(&invalid, b"file").unwrap();
+        assert!(validate_override_agent_directory(&invalid, false).is_err());
+    }
+
+    #[test]
+    fn saves_defaults_with_exact_backup_and_preserves_unknown_secrets_and_mcp() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let original = br#"{
+  "defaultProvider": "anthropic",
+  "defaultModel": "claude-old",
+  "defaultThinkingLevel": "low",
+  "opaqueSecret": { "token": "KEEP-ME" },
+  "futureSetting": [1, 2, 3],
+  "mcpServers": {
+    "acme": {
+      "type": "http",
+      "url": "https://example.test/mcp",
+      "headers": { "Authorization": "Bearer SECRET" }
+    }
+  }
+}"#;
+        write_atomic(&path, original).unwrap();
+
+        let result = save_prime_agent_defaults_at_path(
+            &path,
+            SavePrimeAgentDefaultsInput {
+                default_provider: Some("openrouter".to_string()),
+                default_model: Some("anthropic/claude-sonnet-4".to_string()),
+                default_thinking_level: Some(PrimeAgentThinkingLevel::Max),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(result.backup_path.unwrap()).unwrap(),
+            original,
+            "the backup must contain the exact pre-save document"
+        );
+        let persisted: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(persisted["defaultProvider"], "openrouter");
+        assert_eq!(persisted["defaultModel"], "anthropic/claude-sonnet-4");
+        assert_eq!(persisted["defaultThinkingLevel"], "max");
+        assert_eq!(persisted["opaqueSecret"]["token"], "KEEP-ME");
+        assert_eq!(persisted["futureSetting"], serde_json::json!([1, 2, 3]));
+        assert_eq!(
+            persisted["mcpServers"]["acme"]["headers"]["Authorization"],
+            "Bearer SECRET"
+        );
+    }
+
+    #[test]
+    fn null_defaults_remove_only_the_official_keys() {
+        let mut settings = serde_json::json!({
+            "defaultProvider": "ollama",
+            "defaultModel": "qwen:latest",
+            "defaultThinkingLevel": "medium",
+            "unknown": true,
+            "mcpServers": {}
+        });
+        let defaults = apply_prime_agent_defaults(
+            &mut settings,
+            &SavePrimeAgentDefaultsInput {
+                default_provider: None,
+                default_model: None,
+                default_thinking_level: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            defaults,
+            PrimeAgentDefaults {
+                default_provider: None,
+                default_model: None,
+                default_thinking_level: None,
+            }
+        );
+        assert!(settings.get("defaultProvider").is_none());
+        assert!(settings.get("defaultModel").is_none());
+        assert!(settings.get("defaultThinkingLevel").is_none());
+        assert_eq!(settings["unknown"], Value::Bool(true));
+        assert_eq!(settings["mcpServers"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_non_canonical_model_defaults_before_writing() {
+        let valid_thinking = Some(PrimeAgentThinkingLevel::High);
+        for input in [
+            SavePrimeAgentDefaultsInput {
+                default_provider: Some("anthropic".to_string()),
+                default_model: None,
+                default_thinking_level: valid_thinking,
+            },
+            SavePrimeAgentDefaultsInput {
+                default_provider: Some("openrouter/model".to_string()),
+                default_model: Some("anthropic/claude".to_string()),
+                default_thinking_level: valid_thinking,
+            },
+            SavePrimeAgentDefaultsInput {
+                default_provider: Some("ollama".to_string()),
+                default_model: Some(" qwen:latest".to_string()),
+                default_thinking_level: valid_thinking,
+            },
+            SavePrimeAgentDefaultsInput {
+                default_provider: Some("ollama".to_string()),
+                default_model: Some("qwen//latest".to_string()),
+                default_thinking_level: valid_thinking,
+            },
+        ] {
+            assert!(validate_prime_agent_defaults_input(&input).is_err());
+        }
+
+        let invalid_level =
+            serde_json::from_value::<SavePrimeAgentDefaultsInput>(serde_json::json!({
+                "defaultProvider": "ollama",
+                "defaultModel": "qwen:latest",
+                "defaultThinkingLevel": "ultra"
+            }));
+        assert!(invalid_level.is_err());
+
+        let unknown_field =
+            serde_json::from_value::<SavePrimeAgentDefaultsInput>(serde_json::json!({
+                "defaultProvider": null,
+                "defaultModel": null,
+                "defaultThinkingLevel": null,
+                "secret": "unexpected"
+            }));
+        assert!(unknown_field.is_err());
+
+        let missing_field =
+            serde_json::from_value::<SavePrimeAgentDefaultsInput>(serde_json::json!({
+                "defaultProvider": null,
+                "defaultModel": null
+            }));
+        assert!(missing_field.is_err());
     }
 }

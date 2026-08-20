@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
   Archive,
@@ -41,6 +41,8 @@ import {
   createWorkspaceWindow,
   checkOllamaHealth,
   detectPrimeAgent,
+  inspectPrimeAgentDefaults,
+  listenToPrimeAgentDefaults,
   listGitChanges,
   listPrimeAgentSessions,
   openPrimeAgentTerminal,
@@ -50,8 +52,9 @@ import {
   stopAgent,
 } from "./lib/bridge";
 import { redactText } from "./lib/redaction";
+import { loadRlmPreferences, snapshotRlmPreferences } from "./lib/rlm-preferences";
 import { runtimeNoticeToast, type RuntimeNoticeToast } from "./lib/runtime-notices";
-import type { AppView, ExtensionUiRequest, GitChange, OllamaHealth, PersistedAppState, Project, RuntimeDetection, SettingsSectionId } from "./types";
+import type { AppView, ExtensionUiRequest, GitChange, OllamaHealth, PersistedAppState, PrimeAgentDefaults, Project, RuntimeDetection, SettingsSectionId } from "./types";
 
 interface InstallState {
   running: boolean;
@@ -63,6 +66,12 @@ interface InstallState {
 interface OllamaHealthState {
   checking: boolean;
   result?: OllamaHealth;
+  error?: string;
+}
+
+interface PrimeAgentDefaultsState {
+  loading: boolean;
+  value?: PrimeAgentDefaults;
   error?: string;
 }
 
@@ -115,6 +124,8 @@ function App() {
     };
   }, [importPrimeAgentSessions, loaded, state.projects]);
   const [detection, setDetection] = useState<RuntimeDetection>();
+  const primeAgentDefaultsGeneration = useRef(0);
+  const [primeAgentDefaults, setPrimeAgentDefaults] = useState<PrimeAgentDefaultsState>({ loading: false });
   const [installState, setInstallState] = useState<InstallState>({ running: false, lines: [] });
   const [commandPalette, setCommandPalette] = useState(false);
   const [bottomDock, setBottomDock] = useState(false);
@@ -161,6 +172,61 @@ function App() {
   }, []);
 
   useEffect(() => refreshDetection(), [refreshDetection]);
+
+  const applyPrimeAgentDefaults = useCallback((defaults: PrimeAgentDefaults) => {
+    setPrimeAgentDefaults({ loading: false, value: defaults });
+    if (defaults.defaultThinkingLevel) {
+      updateState((current) => current.preferences.defaultThinking === defaults.defaultThinkingLevel
+        ? current
+        : { ...current, preferences: { ...current.preferences, defaultThinking: defaults.defaultThinkingLevel! } });
+    }
+  }, [updateState]);
+
+  useEffect(() => {
+    if (!detection?.installed) {
+      primeAgentDefaultsGeneration.current += 1;
+      setPrimeAgentDefaults({ loading: false });
+      return;
+    }
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      try {
+        const stop = await listenToPrimeAgentDefaults((defaults) => {
+          primeAgentDefaultsGeneration.current += 1;
+          applyPrimeAgentDefaults(defaults);
+        });
+        if (cancelled) {
+          stop();
+          return;
+        }
+        unlisten = stop;
+      } catch {
+        // The authoritative snapshot below still keeps this window usable.
+      }
+      if (cancelled) return;
+      const generation = ++primeAgentDefaultsGeneration.current;
+      setPrimeAgentDefaults((current) => ({ ...current, loading: true, error: undefined }));
+      try {
+        const defaults = await inspectPrimeAgentDefaults();
+        if (!cancelled && primeAgentDefaultsGeneration.current === generation) {
+          applyPrimeAgentDefaults(defaults);
+        }
+      } catch (error) {
+        if (!cancelled && primeAgentDefaultsGeneration.current === generation) {
+          setPrimeAgentDefaults((current) => ({
+            ...current,
+            loading: false,
+            error: error instanceof Error ? error.message : String(error),
+          }));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [applyPrimeAgentDefaults, detection?.installed, detection?.version]);
 
   const onInstallProgress = useCallback((phase: string, message: string) => {
     setInstallState((current) => ({ running: true, phase, lines: [...current.lines, message].slice(-250) }));
@@ -293,15 +359,21 @@ function App() {
   const activeRuns = state.conversations.filter(
     (conversation) => !conversation.archived && conversation.hasContent !== false && ["starting", "streaming", "tool", "queued"].includes(conversation.status),
   ).length;
+  const globalDefaultModel = primeAgentModelRef(primeAgentDefaults.value);
   const openProject = useCallback(async () => {
     const path = await pickProjectFolder();
-    if (path) addProject(path);
-  }, [addProject]);
+    if (path) addProject(path, globalDefaultModel, snapshotRlmPreferences(loadRlmPreferences(), detection?.version));
+  }, [addProject, detection?.version, globalDefaultModel]);
 
   const newConversation = useCallback(() => {
-    if (state.selectedProjectId) createConversation();
+    if (state.selectedProjectId) createConversation(
+      undefined,
+      undefined,
+      globalDefaultModel,
+      snapshotRlmPreferences(loadRlmPreferences(), detection?.version),
+    );
     else void openProject();
-  }, [createConversation, openProject, state.selectedProjectId]);
+  }, [createConversation, detection?.version, globalDefaultModel, openProject, state.selectedProjectId]);
 
   const archiveConversationAndStop = useCallback((conversationId: string) => {
     void stopAgent(conversationId)
@@ -481,7 +553,7 @@ function App() {
         {view === "projects" ? <ProjectsView projects={state.projects} conversations={state.conversations} onProject={selectProject} onOpenProject={() => void openProject()} onDeleteProject={(project) => setProjectToDelete(project)} /> : null}
         {view === "runs" ? <RunsView projects={state.projects} conversations={state.conversations} onConversation={selectConversation} /> : null}
         {view === "connections" ? <ConnectionsView models={agent.models} projectPath={terminalProjectPath} ollamaHealth={ollamaHealth?.result} ollamaHealthChecking={Boolean(ollamaHealth?.checking)} onCheckOllama={recheckOllama} onOpenSetup={openSetup} /> : null}
-        {view === "settings" ? <SettingsView section={settingsSection} onSectionChange={setSettingsSection} state={state} setState={updateState} detection={detection} installState={installState} appUpdate={appUpdater.state} onRefreshDetection={refreshDetection} onInstall={installPrimeAgent} onCheckAppUpdate={checkAppUpdate} onDownloadAppUpdate={downloadAvailableAppUpdate} onInstallAppUpdate={() => requestAppUpdateInstall(false)} /> : null}
+        {view === "settings" ? <SettingsView section={settingsSection} onSectionChange={setSettingsSection} state={state} setState={updateState} detection={detection} installState={installState} appUpdate={appUpdater.state} models={agent.models} primeAgentDefaults={primeAgentDefaults.value} primeAgentDefaultsLoading={primeAgentDefaults.loading} primeAgentDefaultsError={primeAgentDefaults.error} onPrimeAgentDefaultsChange={applyPrimeAgentDefaults} onRefreshDetection={refreshDetection} onInstall={installPrimeAgent} onCheckAppUpdate={checkAppUpdate} onDownloadAppUpdate={downloadAvailableAppUpdate} onInstallAppUpdate={() => requestAppUpdateInstall(false)} /> : null}
         {view === "chat" && selectedProject && selectedConversation ? (
           <ConversationView
             project={selectedProject}
@@ -614,6 +686,12 @@ function App() {
       ) : null}
     </div>
   );
+}
+
+function primeAgentModelRef(defaults?: PrimeAgentDefaults) {
+  const provider = defaults?.defaultProvider?.trim();
+  const model = defaults?.defaultModel?.trim();
+  return provider && model ? `${provider}/${model}` : undefined;
 }
 
 function RenameProjectModal({ project, onClose, onConfirm }: { project: Project; onClose: () => void; onConfirm: (project: Project, name: string) => void }) {

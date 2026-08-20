@@ -1,9 +1,10 @@
 use crate::{
     paths::canonicalize,
     runtime::{
-        capture_command_output, ensure_supported_node, external_command, find_program,
-        find_source_cli, managed_runtime_root, now_millis, persist_runtime_config, RuntimeConfig,
-        OFFICIAL_REPOSITORY_URL, SUPPORTED_PRIME_AGENT_COMMIT, SUPPORTED_PRIME_AGENT_TAG,
+        capture_command_output, capture_launch_version, ensure_supported_node, external_command,
+        find_program, find_source_cli, managed_runtime_root, now_millis, persist_runtime_config,
+        LaunchSpec, RuntimeConfig, OFFICIAL_REPOSITORY_URL, SUPPORTED_PRIME_AGENT_COMMIT,
+        SUPPORTED_PRIME_AGENT_TAG,
     },
     storage::{write_atomic, PersistenceLock},
 };
@@ -21,8 +22,10 @@ use std::{
     thread,
 };
 use tauri::{AppHandle, Emitter, Manager};
+use uuid::Uuid;
 
 const GENERATED_MODELS_PATH: &str = "packages/ai/src/models.generated.ts";
+const MAX_COMMAND_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 
 #[derive(Debug)]
 struct GeneratedModelsBaseline {
@@ -81,9 +84,36 @@ fn emit_progress(
     );
 }
 
-fn stream_command_output<R: Read>(reader: R, app: AppHandle, stage: String, stream: &'static str) {
+fn append_diagnostic_tail(tail: &mut Vec<u8>, record: &[u8]) {
+    let separator = usize::from(!tail.is_empty());
+    let required = record.len().saturating_add(separator);
+    if required >= MAX_COMMAND_DIAGNOSTIC_BYTES {
+        tail.clear();
+        tail.extend_from_slice(&record[record.len() - MAX_COMMAND_DIAGNOSTIC_BYTES..]);
+        return;
+    }
+    let overflow = tail
+        .len()
+        .saturating_add(required)
+        .saturating_sub(MAX_COMMAND_DIAGNOSTIC_BYTES);
+    if overflow > 0 {
+        tail.drain(..overflow);
+    }
+    if separator != 0 {
+        tail.push(b'\n');
+    }
+    tail.extend_from_slice(record);
+}
+
+fn stream_command_output<R: Read>(
+    reader: R,
+    app: AppHandle,
+    stage: String,
+    stream: &'static str,
+) -> String {
     let mut reader = BufReader::new(reader);
     let mut record = Vec::new();
+    let mut tail = Vec::new();
     loop {
         record.clear();
         match reader.read_until(b'\n', &mut record) {
@@ -97,6 +127,7 @@ fn stream_command_output<R: Read>(reader: R, app: AppHandle, stage: String, stre
                 }
                 let line = String::from_utf8_lossy(&record).trim().to_string();
                 if !line.is_empty() {
+                    append_diagnostic_tail(&mut tail, line.as_bytes());
                     emit_progress(&app, &stage, line, None, Some(stream));
                 }
             }
@@ -112,6 +143,7 @@ fn stream_command_output<R: Read>(reader: R, app: AppHandle, stage: String, stre
             }
         }
     }
+    String::from_utf8_lossy(&tail).into_owned()
 }
 
 fn run_streaming(
@@ -147,12 +179,23 @@ fn run_streaming(
     let status = child
         .wait()
         .map_err(|error| format!("Impossible d’attendre l’étape {stage}: {error}"))?;
-    let _ = stdout_thread.join();
-    let _ = stderr_thread.join();
+    let stdout_tail = stdout_thread.join().unwrap_or_default();
+    let stderr_tail = stderr_thread.join().unwrap_or_default();
     if status.success() {
         Ok(())
     } else {
-        Err(format!("L’étape {stage} a échoué avec le statut {status}"))
+        let diagnostic = if stderr_tail.trim().is_empty() {
+            stdout_tail.trim()
+        } else {
+            stderr_tail.trim()
+        };
+        if diagnostic.is_empty() {
+            Err(format!("L’étape {stage} a échoué avec le statut {status}"))
+        } else {
+            Err(format!(
+                "L’étape {stage} a échoué avec le statut {status}: {diagnostic}"
+            ))
+        }
     }
 }
 
@@ -180,7 +223,7 @@ fn prepare_managed_kernel(app: &AppHandle, node: &Path, source_dir: &Path) -> Re
     );
     let mut command = external_command(node, &[bootstrap.as_os_str().to_owned()]);
     #[cfg(windows)]
-    crate::node_compat::configure_source_rpc(app, &mut command)?;
+    crate::node_compat::configure_source_rpc(app, &mut command, Some(source_dir))?;
     command.env("PRIME_AGENT_INSTALL_UV", "1");
     command.env("PI_SKIP_VERSION_CHECK", "1");
     run_streaming(app, "kernel", command, source_dir)
@@ -430,7 +473,7 @@ fn fetch_and_checkout_supported_release(
     ensure_tracked_checkout_clean(git, source_dir)
 }
 
-fn validated_install_paths(app: &AppHandle) -> Result<(PathBuf, PathBuf), String> {
+fn validated_runtime_root(app: &AppHandle) -> Result<PathBuf, String> {
     let app_data = crate::storage::app_data_dir(app)?;
     let runtime_root = managed_runtime_root(app)?;
     if !runtime_root.exists() {
@@ -454,37 +497,40 @@ fn validated_install_paths(app: &AppHandle) -> Result<(PathBuf, PathBuf), String
             app_data.display()
         ));
     }
-    let source_dir = runtime_root.join("prime-agent");
+    Ok(runtime_root)
+}
+
+fn new_managed_source_dir(runtime_root: &Path) -> Result<PathBuf, String> {
+    let version = SUPPORTED_PRIME_AGENT_TAG
+        .strip_prefix('v')
+        .unwrap_or(SUPPORTED_PRIME_AGENT_TAG);
+    let source_dir = runtime_root.join(format!(
+        "prime-agent-v{version}-{}",
+        Uuid::new_v4().simple()
+    ));
     if source_dir.exists() {
-        let link_metadata = fs::symlink_metadata(&source_dir).map_err(|error| {
-            format!(
-                "Impossible d’inspecter le runtime {}: {error}",
-                source_dir.display()
-            )
-        })?;
-        if link_metadata.file_type().is_symlink() || !link_metadata.is_dir() {
-            return Err(format!(
-                "Le runtime géré {} doit être un dossier réel non symbolique",
-                source_dir.display()
-            ));
-        }
-        let canonical = canonicalize(&source_dir).map_err(|error| {
-            format!(
-                "Impossible de résoudre le runtime {}: {error}",
-                source_dir.display()
-            )
-        })?;
-        if !canonical.starts_with(&runtime_root)
-            || canonical.parent() != Some(runtime_root.as_path())
-        {
-            return Err(format!(
-                "La cible runtime {} ne correspond pas exactement au dossier géré attendu",
-                canonical.display()
-            ));
-        }
-        return Ok((runtime_root, canonical));
+        return Err(format!(
+            "La cible candidate {} existe déjà; relancez l’installation.",
+            source_dir.display()
+        ));
     }
-    Ok((runtime_root, source_dir))
+    Ok(source_dir)
+}
+
+fn verify_built_runtime_version(version: &str) -> Result<(), String> {
+    let expected = SUPPORTED_PRIME_AGENT_TAG
+        .strip_prefix('v')
+        .unwrap_or(SUPPORTED_PRIME_AGENT_TAG);
+    let matches = version
+        .split_whitespace()
+        .any(|token| token.trim_start_matches('v') == expected);
+    if matches {
+        Ok(())
+    } else {
+        Err(format!(
+            "Le candidat compilé annonce Prime Agent {version}, mais la version attendue est {SUPPORTED_PRIME_AGENT_TAG}. L’ancien runtime reste sélectionné."
+        ))
+    }
 }
 
 fn perform_install(app: &AppHandle, source_dir: &Path) -> Result<PathBuf, String> {
@@ -633,6 +679,25 @@ fn perform_install(app: &AppHandle, source_dir: &Path) -> Result<PathBuf, String
         )
     })?;
     let node = canonicalize(&node).unwrap_or(node);
+    let launch_spec = LaunchSpec::Source {
+        node: node.clone(),
+        cli: cli.clone(),
+        source_dir: source_dir.clone(),
+        managed: true,
+    };
+    let version = capture_launch_version(&launch_spec).map_err(|error| {
+        format!(
+            "Le candidat Prime Agent compilé n’a pas passé la vérification --version; l’ancien runtime reste sélectionné: {error}"
+        )
+    })?;
+    verify_built_runtime_version(&version)?;
+    emit_progress(
+        app,
+        "verify",
+        format!("Prime Agent {version} validé avant activation"),
+        Some(96),
+        None,
+    );
     let config = RuntimeConfig {
         executable_path: None,
         source_dir: Some(source_dir.to_string_lossy().into_owned()),
@@ -665,8 +730,15 @@ fn quick_install_prime_agent_blocking(
         .map_err(|_| "Une installation de Prime Agent est déjà en cours".to_string())?;
 
     let flag = Arc::clone(&install_flag);
-    let (_, source_dir) = match validated_install_paths(&app) {
-        Ok(paths) => paths,
+    let runtime_root = match validated_runtime_root(&app) {
+        Ok(path) => path,
+        Err(error) => {
+            flag.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
+    let source_dir = match new_managed_source_dir(&runtime_root) {
+        Ok(path) => path,
         Err(error) => {
             flag.store(false, Ordering::SeqCst);
             return Err(error);
@@ -726,9 +798,10 @@ pub fn is_prime_agent_installing(install_state: tauri::State<'_, InstallState>) 
 #[cfg(test)]
 mod tests {
     use super::{
-        generated_models_baseline, normalized_repository_url,
-        repair_previous_generated_models_change, restore_generated_models, tracked_changes,
-        GENERATED_MODELS_PATH,
+        append_diagnostic_tail, generated_models_baseline, new_managed_source_dir,
+        normalized_repository_url, repair_previous_generated_models_change,
+        restore_generated_models, tracked_changes, verify_built_runtime_version,
+        GENERATED_MODELS_PATH, MAX_COMMAND_DIAGNOSTIC_BYTES,
     };
     use crate::runtime::find_program;
     use std::{fs, path::PathBuf};
@@ -769,6 +842,40 @@ mod tests {
             normalized_repository_url("https://github.com/PrimeIntellect-ai/prime-agent.git"),
             normalized_repository_url("git@github.com:PrimeIntellect-ai/prime-agent.git")
         );
+    }
+
+    #[test]
+    fn allocates_a_fresh_versioned_runtime_candidate() {
+        let directory = tempfile::tempdir().expect("runtime root");
+        let first = new_managed_source_dir(directory.path()).expect("first candidate");
+        let second = new_managed_source_dir(directory.path()).expect("second candidate");
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), Some(directory.path()));
+        assert!(first
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("prime-agent-v0.7.4-")));
+        assert!(!first.exists());
+    }
+
+    #[test]
+    fn command_diagnostic_tail_is_bounded_and_keeps_the_latest_error() {
+        let mut tail = Vec::new();
+        append_diagnostic_tail(&mut tail, &vec![b'a'; MAX_COMMAND_DIAGNOSTIC_BYTES]);
+        append_diagnostic_tail(&mut tail, b"EPERM locked native module");
+
+        assert!(tail.len() <= MAX_COMMAND_DIAGNOSTIC_BYTES);
+        assert!(String::from_utf8_lossy(&tail).ends_with("EPERM locked native module"));
+    }
+
+    #[test]
+    fn accepts_only_the_pinned_built_runtime_version() {
+        assert!(verify_built_runtime_version("0.7.4").is_ok());
+        assert!(verify_built_runtime_version("prime-agent v0.7.4").is_ok());
+        let error = verify_built_runtime_version("0.7.3").expect_err("wrong version");
+        assert!(error.contains("v0.7.4"));
+        assert!(error.contains("ancien runtime reste sélectionné"));
     }
 
     #[test]

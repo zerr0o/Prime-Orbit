@@ -18,7 +18,10 @@ import type {
   OllamaHealth,
   PersistedAppState,
   PrimeAgentConnections,
+  PrimeAgentDefaults,
   RuntimeDetection,
+  SavePrimeAgentDefaultsInput,
+  SavePrimeAgentDefaultsResult,
   SessionHistoryResult,
   ThinkingLevel,
 } from "../types";
@@ -245,6 +248,8 @@ export interface StartAgentOptions {
   provider?: string;
   model?: string;
   thinking?: ThinkingLevel;
+  /** Bounded advisory captured with the conversation for future RLM delegations. */
+  appendSystemPrompt?: string;
 }
 
 export async function startAgent(options: StartAgentOptions): Promise<RunningAgentInfo | undefined> {
@@ -498,6 +503,40 @@ export async function inspectPrimeAgentConnections(cwd?: string): Promise<PrimeA
     };
   }
   return invoke<PrimeAgentConnections>("inspect_prime_agent_connections", { cwd: cwd ?? null });
+}
+
+export async function inspectPrimeAgentDefaults(): Promise<PrimeAgentDefaults> {
+  if (!isNative()) {
+    return {};
+  }
+  return invoke<PrimeAgentDefaults>("inspect_prime_agent_defaults");
+}
+
+export async function listenToPrimeAgentDefaults(
+  handler: (defaults: PrimeAgentDefaults) => void,
+): Promise<UnlistenFn> {
+  if (!isNative()) return () => undefined;
+  return listen<PrimeAgentDefaults>("prime-orbit://prime-agent-defaults", (event) => handler(event.payload));
+}
+
+export async function savePrimeAgentDefaults(
+  input: SavePrimeAgentDefaultsInput,
+): Promise<SavePrimeAgentDefaultsResult> {
+  if (!isNative()) {
+    if ((input.defaultProvider === null) !== (input.defaultModel === null)) {
+      throw new Error("defaultProvider and defaultModel must be set or removed together");
+    }
+    const defaults: PrimeAgentDefaults = {};
+    if (input.defaultProvider !== null && input.defaultModel !== null) {
+      defaults.defaultProvider = input.defaultProvider;
+      defaults.defaultModel = input.defaultModel;
+    }
+    if (input.defaultThinkingLevel !== null) {
+      defaults.defaultThinkingLevel = input.defaultThinkingLevel;
+    }
+    return { path: "~/.prime/agent/settings.json", backupPath: null, defaults };
+  }
+  return invoke<SavePrimeAgentDefaultsResult>("save_prime_agent_defaults", { input });
 }
 
 /**
