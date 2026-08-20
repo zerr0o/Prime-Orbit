@@ -35,6 +35,7 @@ Prime Orbit turns [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent
 - **Long-running work** — agents can continue in the background, multiple windows share the same native runtime, and active sessions are released safely when no longer needed.
 - **One session catalog** — top-level sessions created from the classic Prime Agent terminal appear lazily beside Orbit conversations when their project is linked.
 - **Providers and MCP** — inspect configured providers, manage HTTP MCP servers globally or per project, and use OAuth or bearer-token environment variables without exposing secret values to the renderer.
+- **Signed in-app updates** — check from **Settings → About**, download in the background, review release notes, and install only after explicit confirmation.
 - **Desktop polish** — native file dialogs, custom context menus, keyboard navigation, light/dark/system themes, and complete English/French interface support.
 
 ## The workspace
@@ -63,10 +64,10 @@ Prime Agent's interactive `/login`, `/logout`, and OAuth MCP flows still run in 
 4. Let the onboarding flow detect Prime Agent, or use **Quick install** to install it from the official repository.
 5. Configure a provider, create a conversation, and start working.
 
-The 0.1.13 desktop build is validated on Windows 10/11 x64. Microsoft Edge WebView2 is normally already present on supported Windows installations.
+The 0.1.14 desktop build is validated on Windows 10/11 x64. Microsoft Edge WebView2 is normally already present on supported Windows installations.
 
 > [!IMPORTANT]
-> The 0.1.13 installers are not code-signed yet. Windows SmartScreen may display an unknown-publisher warning. Verify the SHA-256 values in the release notes before running a downloaded installer.
+> Prime Orbit 0.1.14 is the first updater-enabled release, so upgrades from 0.1.13 or earlier must be installed manually. Its updater payloads carry mandatory Tauri signatures, but the installers are not Authenticode-signed; Windows SmartScreen may still display an unknown-publisher warning. Verify the release SHA-256 manifest before running a manually downloaded installer.
 
 ### Prime Agent requirements
 
@@ -87,7 +88,7 @@ Prime Orbit's development and Vite 8 build toolchain has a separate Node.js 22.1
 | --- | --- |
 | Projects | Multiple local workspaces, stable manual order, typed deletion confirmation, archive/pin/search, direct Explorer access |
 | Conversations | Persistent Prime Agent sessions, lazy loading, streaming, real steering/follow-up queues, models, reasoning, session naming and branches |
-| Attachments | Native image thumbnails, validated local file references, native drag and drop, bounded file handling |
+| Attachments | Native image thumbnails, opaque native file handles, drag and drop, bounded file handling without exposing source paths to the renderer |
 | Tools | Tool cards, Python grouping, sub-agent activity, command palette, execution inspector |
 | Git | Real per-file statistics, bounded diff previews, and protected Prime Agent prompts for commit/push and release workflows |
 | Runtime | One native RPC process per conversation, terminal-session discovery, multi-window leases, background work, graceful stop and recovery |
@@ -95,6 +96,7 @@ Prime Orbit's development and Vite 8 build toolchain has a separate Node.js 22.1
 | Models | Provider catalogs, scoped model selection, validated `models.json`, atomic save and backup |
 | MCP | Built-in and custom HTTP servers, global/project scope, OAuth or bearer environment variable configuration |
 | Reliability | Revisioned state, three-way multi-window merge, atomic persistence, runtime health checks, session fallback |
+| Updates | Manual or startup checks, signed background downloads, multi-window progress, release notes, and guarded restart/install |
 | Interface | English/French, light/dark/system themes, accessible dismissible menus, custom context menu |
 
 ## Data, privacy, and safety
@@ -178,9 +180,11 @@ npm run desktop:build
 
 Tauri writes platform bundles under `src-tauri/target/release/bundle/`.
 
+Signed in-app updates use a separate release-only build and a draft-first GitHub workflow. See [docs/UPDATER.md](docs/UPDATER.md) for the trust model, one-time key setup, bootstrap limitation, key rotation, and rollback policy.
+
 ## Release status
 
-Prime Orbit is an early desktop release. Version 0.1.13 ships Windows x64 NSIS and MSI installers. macOS and Linux code paths exist, but official binaries have not yet been validated or published.
+Prime Orbit is an early desktop release. Version 0.1.14 ships Windows x64 NSIS and MSI installers and establishes the signed stable channel used by future in-app updates. macOS and Linux code paths exist, but official binaries have not yet been validated or published.
 
 See [CHANGELOG.md](CHANGELOG.md) for release details.
 

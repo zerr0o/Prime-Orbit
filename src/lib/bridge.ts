@@ -4,6 +4,8 @@ import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { open } from "@tauri-apps/plugin-dialog";
 import type {
   AgentExitPayload,
+  AppUpdateInstallResult,
+  AppUpdateState,
   AttachmentReadResult,
   PrimeAgentSessionSummary,
   GitChange,
@@ -21,6 +23,7 @@ import type {
   ThinkingLevel,
 } from "../types";
 import { defaultAppState, demoAppState, demoDetection } from "./demo";
+import packageMetadata from "../../package.json";
 
 export const isNative = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -208,6 +211,31 @@ export async function listenToStateChanges(handler: (snapshot: AppStateSnapshot)
     if (!event.payload.state) return;
     handler(normalizeAppStateSnapshot(event.payload));
   });
+}
+
+export async function getAppUpdateState(): Promise<AppUpdateState> {
+  if (!isNative()) return { revision: 0, phase: "idle", currentVersion: packageMetadata.version };
+  return invoke<AppUpdateState>("get_app_update_state");
+}
+
+export async function checkForAppUpdates(trigger: "automatic" | "manual"): Promise<AppUpdateState> {
+  if (!isNative()) return { revision: 1, phase: "upToDate", currentVersion: packageMetadata.version, lastCheckedAt: new Date().toISOString(), trigger };
+  return invoke<AppUpdateState>("check_for_app_updates", { trigger });
+}
+
+export async function downloadAppUpdate(): Promise<AppUpdateState> {
+  if (!isNative()) return { revision: 0, phase: "idle", currentVersion: packageMetadata.version };
+  return invoke<AppUpdateState>("download_app_update");
+}
+
+export async function installAppUpdate(force: boolean): Promise<AppUpdateInstallResult> {
+  if (!isNative()) return { status: "installing" };
+  return invoke<AppUpdateInstallResult>("install_app_update", { force });
+}
+
+export async function listenToAppUpdateState(handler: (snapshot: AppUpdateState) => void): Promise<UnlistenFn> {
+  if (!isNative()) return () => undefined;
+  return listen<AppUpdateState>("prime-orbit://update-state", (event) => handler(event.payload));
 }
 
 export interface StartAgentOptions {

@@ -1,4 +1,5 @@
 export type AppView = "home" | "projects" | "runs" | "connections" | "settings" | "chat";
+export type SettingsSectionId = "general" | "appearance" | "agent" | "models" | "security" | "about";
 export type ThemeMode = "dark" | "light" | "system";
 export type PermissionPreset = "guarded" | "standard" | "autonomous";
 export type ConversationStatus = "idle" | "starting" | "streaming" | "tool" | "queued" | "error" | "offline";
@@ -248,6 +249,7 @@ export interface Preferences {
   theme: ThemeMode;
   language: "fr" | "en";
   restoreLastWorkspace: boolean;
+  automaticUpdateChecks: boolean;
   compactSidebar: boolean;
   inspectorOpen: boolean;
   bottomDockOpen: boolean;
@@ -256,6 +258,41 @@ export interface Preferences {
   defaultPermissionPreset: PermissionPreset;
   reduceMotion: boolean;
 }
+
+export interface AppUpdateRelease {
+  version: string;
+  notes?: string;
+  publishedAt?: string;
+}
+
+export type AppUpdatePhase =
+  | "idle"
+  | "checking"
+  | "upToDate"
+  | "available"
+  | "downloading"
+  | "ready"
+  | "installing"
+  | "error";
+
+/** Process-wide updater snapshot broadcast to every Prime Orbit window. */
+export interface AppUpdateState {
+  /** Monotone process-wide sequence used to discard stale IPC snapshots. */
+  revision: number;
+  phase: AppUpdatePhase;
+  currentVersion: string;
+  update?: AppUpdateRelease;
+  downloadedBytes?: number;
+  totalBytes?: number;
+  lastCheckedAt?: string;
+  error?: string;
+  operation?: "check" | "download" | "install";
+  trigger?: "automatic" | "manual";
+}
+
+export type AppUpdateInstallResult =
+  | { status: "installing" }
+  | { status: "busy"; activeAgents: number };
 
 export interface PersistedAppState {
   version: number;

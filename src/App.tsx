@@ -7,11 +7,13 @@ import {
   Check,
   ChevronRight,
   CircleAlert,
+  Download,
   FileText,
   FolderOpen,
   Keyboard,
   Maximize2,
   MessageSquarePlus,
+  PackageCheck,
   PanelBottomClose,
   PanelBottomOpen,
   Search,
@@ -32,6 +34,7 @@ import { ConnectionsView, HomeView, Onboarding, ProjectsView, RunsView, Settings
 import { GlobalRail, ProjectSidebar } from "./components/Navigation";
 import { Button, IconButton, Modal, Skeleton } from "./components/Ui";
 import { useAgentRuntime } from "./hooks/useAgentRuntime";
+import { useAppUpdater } from "./hooks/useAppUpdater";
 import { useWorkspace } from "./hooks/useWorkspace";
 import { getAppLanguage, setAppLanguage, useI18n } from "./i18n";
 import {
@@ -48,7 +51,7 @@ import {
 } from "./lib/bridge";
 import { redactText } from "./lib/redaction";
 import { runtimeNoticeToast, type RuntimeNoticeToast } from "./lib/runtime-notices";
-import type { AppView, ExtensionUiRequest, GitChange, OllamaHealth, PersistedAppState, Project, RuntimeDetection } from "./types";
+import type { AppView, ExtensionUiRequest, GitChange, OllamaHealth, PersistedAppState, Project, RuntimeDetection, SettingsSectionId } from "./types";
 
 interface InstallState {
   running: boolean;
@@ -124,6 +127,12 @@ function App() {
   const [projectToRename, setProjectToRename] = useState<Project>();
   const [projectToArchive, setProjectToArchive] = useState<Project>();
   const [ollamaHealth, setOllamaHealth] = useState<OllamaHealthState>();
+  const [updateBlockingAgents, setUpdateBlockingAgents] = useState<number>();
+  const [settingsSection, setSettingsSection] = useState<SettingsSectionId>("general");
+  const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string>();
+  const appUpdater = useAppUpdater({
+    automaticChecks: loaded && state.preferences.automaticUpdateChecks,
+  });
 
   useEffect(() => {
     const releaseDraftAttachments = () => {
@@ -243,6 +252,19 @@ function App() {
   const recheckOllama = useCallback(() => {
     setOllamaHealthGeneration((current) => current + 1);
   }, []);
+
+  const checkAppUpdate = useCallback(async () => {
+    await appUpdater.check("manual");
+  }, [appUpdater.check]);
+
+  const downloadAvailableAppUpdate = useCallback(async () => {
+    await appUpdater.download();
+  }, [appUpdater.download]);
+
+  const requestAppUpdateInstall = useCallback(async (force = false) => {
+    const result = await appUpdater.install(force);
+    if (result?.status === "busy") setUpdateBlockingAgents(result.activeAgents);
+  }, [appUpdater.install]);
 
   useEffect(() => {
     if (!selectedProject) {
@@ -459,7 +481,7 @@ function App() {
         {view === "projects" ? <ProjectsView projects={state.projects} conversations={state.conversations} onProject={selectProject} onOpenProject={() => void openProject()} onDeleteProject={(project) => setProjectToDelete(project)} /> : null}
         {view === "runs" ? <RunsView projects={state.projects} conversations={state.conversations} onConversation={selectConversation} /> : null}
         {view === "connections" ? <ConnectionsView models={agent.models} projectPath={terminalProjectPath} ollamaHealth={ollamaHealth?.result} ollamaHealthChecking={Boolean(ollamaHealth?.checking)} onCheckOllama={recheckOllama} onOpenSetup={openSetup} /> : null}
-        {view === "settings" ? <SettingsView state={state} setState={updateState} detection={detection} installState={installState} onRefreshDetection={refreshDetection} onInstall={installPrimeAgent} /> : null}
+        {view === "settings" ? <SettingsView section={settingsSection} onSectionChange={setSettingsSection} state={state} setState={updateState} detection={detection} installState={installState} appUpdate={appUpdater.state} onRefreshDetection={refreshDetection} onInstall={installPrimeAgent} onCheckAppUpdate={checkAppUpdate} onDownloadAppUpdate={downloadAvailableAppUpdate} onInstallAppUpdate={() => requestAppUpdateInstall(false)} /> : null}
         {view === "chat" && selectedProject && selectedConversation ? (
           <ConversationView
             project={selectedProject}
@@ -551,6 +573,24 @@ function App() {
       {projectToRename ? <RenameProjectModal project={projectToRename} onClose={() => setProjectToRename(undefined)} onConfirm={renameProject} /> : null}
       {projectToArchive ? <ArchiveProjectModal project={projectToArchive} conversationCount={state.conversations.filter((conversation) => conversation.projectId === projectToArchive.id && !conversation.archived).length} onClose={() => setProjectToArchive(undefined)} onConfirm={archiveProjectConversations} /> : null}
       {projectToDelete ? <DeleteProjectModal project={projectToDelete} conversationCount={state.conversations.filter((conversation) => conversation.projectId === projectToDelete.id).length} onClose={() => setProjectToDelete(undefined)} onConfirm={removeProject} /> : null}
+      {updateBlockingAgents !== undefined ? (
+        <Modal
+          title={t("settings.updateBusyTitle")}
+          description={t("settings.updateBusyDescription")}
+          onClose={() => setUpdateBlockingAgents(undefined)}
+          footer={<><Button variant="secondary" onClick={() => setUpdateBlockingAgents(undefined)}>{t("settings.installLater")}</Button><Button variant="danger" onClick={() => { setUpdateBlockingAgents(undefined); void requestAppUpdateInstall(true); }}>{t("settings.installAnyway")}</Button></>}
+        >
+          <div className="update-restart-warning" role="alert"><CircleAlert size={19} /><div><strong>{t(updateBlockingAgents === 1 ? "settings.updateBusyRuns.one" : "settings.updateBusyRuns.other", { count: updateBlockingAgents })}</strong><p>{t("settings.updateBusyWarning")}</p></div></div>
+        </Modal>
+      ) : null}
+      {(appUpdater.state.phase === "available" || appUpdater.state.phase === "ready") && appUpdater.state.update && dismissedUpdateVersion !== appUpdater.state.update.version ? (
+        <aside className={`update-discovery is-${appUpdater.state.phase}`} role="status" aria-live="polite" aria-atomic="true">
+          <span className="update-discovery-icon">{appUpdater.state.phase === "ready" ? <PackageCheck size={18} /> : <Download size={18} />}</span>
+          <div><strong>{t(appUpdater.state.phase === "ready" ? "settings.updateReady" : "settings.updateAvailable", { version: appUpdater.state.update.version })}</strong><small>{t(appUpdater.state.phase === "ready" ? "settings.updateReadyNotice" : "settings.updateAvailableNotice")}</small></div>
+          <Button variant="ghost" onClick={() => { setDismissedUpdateVersion(appUpdater.state.update?.version); setSettingsSection("about"); setView("settings"); }}>{t("settings.viewUpdate")}</Button>
+          <IconButton label={t("settings.dismissUpdateNotice")} onClick={() => setDismissedUpdateVersion(appUpdater.state.update?.version)}><X size={14} /></IconButton>
+        </aside>
+      ) : null}
       {toast ? <div className={`toast toast-${toast.tone}`} role={toast.tone === "error" ? "alert" : "status"} aria-live={toast.tone === "error" ? "assertive" : "polite"}>{toast.tone === "success" ? <Check size={16} /> : toast.tone === "error" ? <CircleAlert size={16} /> : <Sparkles size={16} />}<span>{toast.message}</span><IconButton label={t("common.close")} onClick={() => setToast(undefined)}><X size={14} /></IconButton></div> : null}
       {workspaceSaveError ? (
         <div className="toast toast-error" role="alert" title={workspaceSaveError} style={{ bottom: toast ? 94 : 42 }}>

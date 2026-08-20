@@ -4,6 +4,28 @@ All notable changes to Prime Orbit are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-08-20
+
+### Signed in-app updates
+
+- Added a native Tauri updater with an explicit **Check**, **Download**, and **Restart and update** flow in **Settings > About**, including release notes, published dates, bounded progress, retryable errors, and accessible discovery notifications.
+- Added optional startup checks that never download or install automatically, with process-wide 24-hour coalescing, failure backoff, bounded check and download timeouts, and monotonic multi-window state revisions.
+- Kept downloaded updater bytes in native memory and made installation process-wide so concurrent windows cannot start a new Prime Agent process while the application is preparing to restart.
+- Warned before stopping open Prime Agent sessions and required an explicit second confirmation before interrupting active work for installation.
+
+### Release integrity and migration
+
+- Embedded the stable updater public key and GitHub `latest.json` endpoint while keeping updater signatures distinct from Windows Authenticode signing and SmartScreen reputation.
+- Added a draft-first Windows release workflow with strict cross-manifest version checks, versioned release notes, pinned GitHub Actions, signed NSIS/MSI updater artifacts, SHA-256 checksums, and final signature verification against the key embedded in Prime Orbit.
+- Made 0.1.14 the manual trust bootstrap: 0.1.13 and earlier cannot discover this update, but installations starting with 0.1.14 can use the signed stable channel for later releases.
+- Refused published-tag or stale-draft reuse so a failed release cannot silently replace immutable or partial assets.
+
+### Validation
+
+- 74 frontend unit tests and TypeScript production build.
+- Complete Rust test suite, formatting, strict Clippy, and Rust 1.88 MSRV check.
+- Release gates validate the EXE/MSI, their updater signatures, `latest.json`, versioned notes, and `SHA256SUMS-v0.1.14.txt` before leaving a draft for manual review.
+
 ## [0.1.13] - 2026-08-20
 
 ### Native Prime Agent maintenance
@@ -142,6 +164,7 @@ All notable changes to Prime Orbit are documented in this file.
 - TypeScript build and checks.
 - Strict Rust Clippy validation with warnings denied.
 
+[0.1.14]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.14
 [0.1.13]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.13
 [0.1.12]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.12
 [0.1.11]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.11

@@ -44,12 +44,44 @@ const SESSION_CONTROL_BRIDGE_SCRIPT: &str =
 const MAX_QUEUED_MESSAGE_TEXT: usize = 128 * 1024;
 
 #[derive(Clone)]
-pub struct AgentsState(Arc<Mutex<HashMap<String, RunningAgent>>>);
+pub struct AgentsState(Arc<Mutex<HashMap<String, RunningAgent>>>, Arc<AtomicBool>);
 
 impl Default for AgentsState {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(HashMap::new())))
+        Self(
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(AtomicBool::new(false)),
+        )
     }
+}
+
+/// Process-wide maintenance fence held from the final pre-install agent count
+/// until the updater either fails or terminates the application. New agent
+/// launches and emergency restarts fail closed while the fence is held.
+pub struct UpdateInstallationGuard(AgentsState);
+
+impl Drop for UpdateInstallationGuard {
+    fn drop(&mut self) {
+        self.0 .1.store(false, Ordering::SeqCst);
+    }
+}
+
+pub fn begin_update_installation(agents: &AgentsState) -> Result<UpdateInstallationGuard, String> {
+    agents
+        .1
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .map_err(|_| "Une installation de mise à jour est déjà en cours.".to_string())?;
+    Ok(UpdateInstallationGuard(agents.clone()))
+}
+
+fn ensure_update_installation_is_idle(agents: &AgentsState) -> Result<(), String> {
+    if agents.1.load(Ordering::SeqCst) {
+        return Err(
+            "Prime Orbit prépare une mise à jour. Attendez la fin de l’installation avant de démarrer ou redémarrer une session."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1629,6 +1661,7 @@ fn start_agent_blocking(
     model: Option<String>,
     thinking: Option<String>,
 ) -> Result<RunningAgentInfo, String> {
+    ensure_update_installation_is_idle(&agents)?;
     let conversation_id = validated_identifier(conversation_id)?;
     if let Some(existing) = agents.0.lock().get_mut(&conversation_id) {
         if existing.restarting {
@@ -1680,6 +1713,7 @@ fn start_agent_blocking(
     })?;
 
     let mut map = agents.0.lock();
+    ensure_update_installation_is_idle(&agents)?;
     if let Some(existing) = map.get_mut(&conversation_id) {
         if existing.restarting {
             return Err("Le redémarrage de cette conversation est déjà en cours.".to_string());
@@ -2321,6 +2355,7 @@ fn restart_agent_blocking(
     owner: String,
     conversation_id: String,
 ) -> Result<RestartAgentResult, String> {
+    ensure_update_installation_is_idle(&agents)?;
     let conversation_id = validated_identifier(conversation_id)?;
     let snapshot = {
         let mut map = agents.0.lock();
@@ -2414,6 +2449,25 @@ fn restart_agent_blocking(
     // this section observes and stops the installed replacement.
     let (spawned, install_result) = {
         let mut map = agents.0.lock();
+        if let Err(error) = ensure_update_installation_is_idle(&agents) {
+            let removed = map.remove(&conversation_id);
+            drop(map);
+            if removed.is_some() {
+                let _ = app.emit(
+                    "prime-agent://exit",
+                    AgentExitEvent {
+                        conversation_id: conversation_id.clone(),
+                        code: None,
+                        success: false,
+                        error: Some(
+                            "Le redémarrage de Prime Agent a été annulé pour installer une mise à jour."
+                                .to_string(),
+                        ),
+                    },
+                );
+            }
+            return Err(error);
+        }
         let Some(previous) = map.get(&conversation_id) else {
             return Err(
                 "Le redémarrage a été annulé car la conversation a été arrêtée entre-temps."
@@ -2624,7 +2678,7 @@ pub async fn start_agent(
     model: Option<String>,
     thinking: Option<String>,
 ) -> Result<RunningAgentInfo, String> {
-    let agents = AgentsState(Arc::clone(&agents.0));
+    let agents = agents.inner().clone();
     let owner = window.label().to_string();
     crate::run_blocking(move || {
         start_agent_blocking(
@@ -2648,7 +2702,7 @@ pub async fn release_agent(
     agents: tauri::State<'_, AgentsState>,
     conversation_id: String,
 ) -> Result<bool, String> {
-    let agents = AgentsState(Arc::clone(&agents.0));
+    let agents = agents.inner().clone();
     let owner = window.label().to_string();
     crate::run_blocking(move || release_agent_blocking(agents, owner, conversation_id)).await
 }
@@ -2662,7 +2716,7 @@ pub async fn send_rpc(
     conversation_id: String,
     payload: Value,
 ) -> Result<(), String> {
-    let agents = AgentsState(Arc::clone(&agents.0));
+    let agents = agents.inner().clone();
     let attachments = attachments.inner().clone();
     let owner = window.label().to_string();
     let app_data_dir = window
@@ -2699,7 +2753,7 @@ pub async fn mutate_agent_queue(
     expected_text: String,
     mutation: QueuedMessageMutation,
 ) -> Result<QueueMutationResult, String> {
-    let agents = AgentsState(Arc::clone(&agents.0));
+    let agents = agents.inner().clone();
     let owner = window.label().to_string();
     let app_data_dir = window
         .app_handle()
@@ -2731,7 +2785,7 @@ pub async fn reload_agent_resources(
     agents: tauri::State<'_, AgentsState>,
     conversation_id: String,
 ) -> Result<ReloadAgentResourcesResult, String> {
-    let agents = AgentsState(Arc::clone(&agents.0));
+    let agents = agents.inner().clone();
     let owner = window.label().to_string();
     let app = window.app_handle().clone();
     crate::run_blocking(move || {
@@ -2746,7 +2800,7 @@ pub async fn stop_agent(
     agents: tauri::State<'_, AgentsState>,
     conversation_id: String,
 ) -> Result<bool, String> {
-    let agents = AgentsState(Arc::clone(&agents.0));
+    let agents = agents.inner().clone();
     crate::run_blocking(move || stop_agent_blocking(app, agents, conversation_id)).await
 }
 
@@ -2761,7 +2815,7 @@ pub async fn restart_agent(
     agents: tauri::State<'_, AgentsState>,
     conversation_id: String,
 ) -> Result<RestartAgentResult, String> {
-    let agents = AgentsState(Arc::clone(&agents.0));
+    let agents = agents.inner().clone();
     let owner = window.label().to_string();
     crate::run_blocking(move || restart_agent_blocking(app, agents, owner, conversation_id)).await
 }
@@ -2770,8 +2824,12 @@ pub async fn restart_agent(
 pub async fn list_running_agents(
     agents: tauri::State<'_, AgentsState>,
 ) -> Result<Vec<RunningAgentInfo>, String> {
-    let agents = AgentsState(Arc::clone(&agents.0));
+    let agents = agents.inner().clone();
     crate::run_blocking(move || list_running_agents_blocking(agents)).await
+}
+
+pub fn running_agent_count(agents: &AgentsState) -> usize {
+    agents.0.lock().len()
 }
 
 pub fn shutdown_all_agents(app: &AppHandle, agents: &AgentsState) {
@@ -2782,6 +2840,45 @@ pub fn shutdown_all_agents(app: &AppHandle, agents: &AgentsState) {
     }
 }
 
+/// Stops every Prime Agent before installing an application update and fails
+/// closed when a child process cannot be confirmed stopped. Failed entries are
+/// restored to the registry so the UI can retry or stop them explicitly after
+/// the installation fence is released.
+pub fn shutdown_all_agents_for_update(app: &AppHandle, agents: &AgentsState) -> Result<(), String> {
+    let running: Vec<_> = agents.0.lock().drain().collect();
+    let mut failed = Vec::new();
+
+    for (conversation_id, agent) in running {
+        let status = {
+            let mut child = agent.child.lock();
+            terminate_child(&mut child)
+        };
+        match status {
+            Ok(status) => {
+                emit_exit_once(app, &conversation_id, &agent.exit_emitted, Ok(status), None)
+            }
+            Err(error) => failed.push((conversation_id, agent, error)),
+        }
+    }
+
+    if failed.is_empty() {
+        return Ok(());
+    }
+
+    let mut failures = Vec::with_capacity(failed.len());
+    let mut map = agents.0.lock();
+    for (conversation_id, agent, error) in failed {
+        failures.push(format!("{conversation_id}: {error}"));
+        map.entry(conversation_id).or_insert(agent);
+    }
+    drop(map);
+
+    Err(format!(
+        "La mise à jour a été annulée car Prime Orbit n’a pas pu confirmer l’arrêt de toutes les sessions Prime Agent: {}",
+        failures.join("; ")
+    ))
+}
+
 pub fn release_window_agents(agents: AgentsState, owner: String) {
     release_owner_blocking(agents, &owner);
 }
@@ -2790,8 +2887,9 @@ pub fn release_window_agents(agents: AgentsState, owner: String) {
 mod tests {
     use super::{
         acquire_owner_lease, append_diagnostic_tail, apply_launch_option_update,
-        begin_owned_resource_reload, begin_runtime_write, close_rpc_stdin_for_restart,
-        conflicting_session_conversation, finish_resource_reload, finish_runtime_write,
+        begin_owned_resource_reload, begin_runtime_write, begin_update_installation,
+        close_rpc_stdin_for_restart, conflicting_session_conversation,
+        ensure_update_installation_is_idle, finish_resource_reload, finish_runtime_write,
         is_extension_ui_request, is_reload_acknowledgement_timeout, lease_absence_attests_release,
         mark_resource_reload_unknown, owner_may_send, public_runtime_line,
         release_owner_lease_state, requested_launch_option_update, restart_slot_matches,
@@ -2799,7 +2897,7 @@ mod tests {
         runtime_launch_options, runtime_session_id, runtime_session_path,
         should_emit_resources_reloaded, validate_queue_lane, validate_queue_mutation,
         validate_reload_result, wait_for_child_until, waiter_may_remove_slot, AgentOperations,
-        AgentResourcesReloadedEvent, LaunchOptionUpdate, QueuedMessageMutation,
+        AgentResourcesReloadedEvent, AgentsState, LaunchOptionUpdate, QueuedMessageMutation,
         ReloadAgentResourcesResult, ResourceReloadClaimError, ResourceReloadPhase,
         RestartAgentResult, RunningAgentInfo, MAX_EXIT_DIAGNOSTIC_BYTES,
     };
@@ -3403,6 +3501,20 @@ mod tests {
         assert!(!waiter_may_remove_slot(42, true, 42));
         assert!(waiter_may_remove_slot(42, false, 42));
         assert!(!waiter_may_remove_slot(41, false, 42));
+    }
+
+    #[test]
+    fn update_installation_fence_is_exclusive_and_blocks_agent_launches() {
+        let agents = AgentsState::default();
+        assert!(ensure_update_installation_is_idle(&agents).is_ok());
+
+        let guard = begin_update_installation(&agents).expect("first updater claim");
+        assert!(ensure_update_installation_is_idle(&agents).is_err());
+        assert!(begin_update_installation(&agents).is_err());
+
+        drop(guard);
+        assert!(ensure_update_installation_is_idle(&agents).is_ok());
+        assert!(begin_update_installation(&agents).is_ok());
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod runtime;
 mod session_history;
 mod session_lease;
 mod storage;
+mod updater;
 
 use agents::AgentsState;
 use exports::HtmlExportState;
@@ -18,6 +19,7 @@ use install::InstallState;
 use serde::Serialize;
 use storage::PersistenceLock;
 use tauri::{Emitter, Manager};
+use updater::UpdateManager;
 
 pub(crate) const MAX_RPC_BYTES: usize = 16 * 1024 * 1024;
 
@@ -58,6 +60,7 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AgentsState::default())
@@ -65,6 +68,7 @@ pub fn run() {
         .manage(HtmlExportState::default())
         .manage(InstallState::default())
         .manage(PersistenceLock::default())
+        .manage(UpdateManager::default())
         .invoke_handler(tauri::generate_handler![
             runtime::detect_prime_agent,
             runtime::diagnose_prerequisites,
@@ -101,6 +105,10 @@ pub fn run() {
             connections::check_ollama_health,
             connections::save_mcp_server,
             connections::delete_mcp_server,
+            updater::get_app_update_state,
+            updater::check_for_app_updates,
+            updater::download_app_update,
+            updater::install_app_update,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Prime Orbit");

@@ -1563,6 +1563,38 @@ kbd { padding: 2px 5px; border: 1px solid var(--border); border-radius: 5px; col
 .security-principles article > span { display: grid; width: 32px; height: 32px; place-items: center; border-radius: 9px; color: var(--signal); background: var(--signal-soft); }
 .security-principles strong { display: block; margin-top: 10px; font-size: 9.5px; }
 .security-principles p { margin: 5px 0 0; color: var(--text-tertiary); font-size: 8px; line-height: 1.45; }
+.update-panel { border-bottom: 1px solid var(--border-soft); background: var(--surface-0); }
+.update-panel-main { display: flex; min-width: 0; align-items: center; gap: 12px; padding: 15px; }
+.update-status-icon { display: grid; width: 38px; height: 38px; flex: 0 0 auto; place-items: center; border-radius: 10px; color: var(--text-secondary); background: var(--surface-2); }
+.update-panel.is-upToDate .update-status-icon, .update-panel.is-ready .update-status-icon { color: var(--success); background: rgba(46, 207, 143, .1); }
+.update-panel.is-available .update-status-icon, .update-panel.is-downloading .update-status-icon { color: var(--accent); background: var(--accent-soft); }
+.update-panel.is-error .update-status-icon { color: var(--danger); background: rgba(246, 95, 116, .09); }
+.update-panel-copy { min-width: 180px; flex: 1; overflow: hidden; }
+.update-panel-copy strong, .update-panel-copy p, .update-panel-copy small { display: block; overflow-wrap: anywhere; }
+.update-panel-copy strong { font-size: 13px; }
+.update-panel-copy p { max-width: 58ch; margin: 4px 0 0; color: var(--text-tertiary); font-size: 12px; line-height: 1.45; }
+.update-panel-copy small { margin-top: 4px; color: var(--text-faint); font-size: 12px; font-variant-numeric: tabular-nums; }
+.update-panel-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
+.update-progress { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 0 15px 14px 65px; }
+.update-progress progress { width: 100%; height: 6px; overflow: hidden; border: 0; border-radius: 999px; color: var(--accent); background: var(--surface-2); accent-color: var(--accent); }
+.update-progress progress::-webkit-progress-bar { border-radius: 999px; background: var(--surface-2); }
+.update-progress progress::-webkit-progress-value { border-radius: 999px; background: var(--accent); }
+.update-progress-copy { color: var(--text-tertiary); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.update-error-details { display: flex; align-items: flex-start; gap: 7px; margin: 0 15px 14px 65px; padding: 9px 10px; border-radius: 8px; color: var(--danger); background: rgba(246, 95, 116, .07); font-size: 12px; line-height: 1.45; }
+.update-error-details svg { flex: 0 0 auto; margin-top: 1px; }
+.update-error-details span { min-width: 0; overflow-wrap: anywhere; }
+.update-release-notes { padding: 0 15px 14px 65px; color: var(--text-secondary); font-size: 12px; }
+.update-release-notes summary { width: fit-content; cursor: pointer; color: var(--text-secondary); font-weight: 650; }
+.update-release-notes summary:hover { color: var(--text); }
+.update-release-notes p { max-height: 150px; overflow: auto; margin: 9px 0; padding-inline-end: 8px; color: var(--text-tertiary); line-height: 1.55; overflow-wrap: anywhere; white-space: pre-wrap; }
+.update-release-notes a { display: inline-flex; align-items: center; gap: 5px; color: var(--accent); text-decoration: none; }
+.update-release-notes a:hover { color: var(--text); }
+.update-release-notes summary:focus-visible, .update-release-notes a:focus-visible { border-radius: 4px; outline: 2px solid var(--accent); outline-offset: 3px; }
+.update-restart-warning { display: flex; align-items: flex-start; gap: 11px; padding: 13px; border-radius: 11px; color: var(--danger); background: rgba(246, 95, 116, .07); }
+.update-restart-warning > svg { flex: 0 0 auto; margin-top: 1px; }
+.update-restart-warning > div { min-width: 0; }
+.update-restart-warning strong { display: block; font-size: 13px; }
+.update-restart-warning p { margin: 5px 0 0; color: var(--text-tertiary); font-size: 12px; line-height: 1.55; overflow-wrap: anywhere; }
 .about-card { display: flex; min-height: 380px; flex-direction: column; align-items: center; justify-content: center; padding: 30px; border: 1px solid var(--border-soft); border-radius: 16px; background: radial-gradient(circle at 50% 30%, rgba(124, 108, 255, 0.1), transparent 38%), var(--surface-0); text-align: center; }
 .about-orbit { position: relative; width: 62px; height: 62px; border: 3px solid var(--accent); border-radius: 50%; }
 .about-orbit::after { position: absolute; top: 23px; left: -12px; width: 80px; height: 20px; border: 2px solid var(--signal); border-top-color: transparent; border-radius: 50%; content: ""; }
@@ -1750,6 +1782,20 @@ kbd { padding: 2px 5px; border: 1px solid var(--border); border-radius: 5px; col
 .toast > span { min-width: 0; overflow-wrap: anywhere; }
 .toast .icon-button { width: 27px; height: 27px; margin-left: auto; }
 @keyframes toast-in { from { opacity: 0; transform: translateY(8px) scale(.98); } }
+.update-discovery { z-index: 900; position: fixed; top: 18px; right: 18px; display: flex; width: min(420px, calc(100vw - 36px)); min-height: 54px; align-items: center; gap: 9px; padding: 8px; border-radius: 12px; color: var(--text-secondary); background: var(--surface-2); box-shadow: 0 12px 34px rgba(0, 0, 0, .28); animation: toast-in 180ms ease-out; }
+.update-discovery-icon { display: grid; width: 36px; height: 36px; flex: 0 0 auto; place-items: center; border-radius: 9px; color: var(--accent); background: var(--accent-soft); }
+.update-discovery.is-ready .update-discovery-icon { color: var(--success); background: rgba(46, 207, 143, .1); }
+.update-discovery > div { min-width: 0; flex: 1; }
+.update-discovery strong, .update-discovery small { display: block; overflow-wrap: anywhere; }
+.update-discovery strong { color: var(--text); font-size: 13px; }
+.update-discovery small { margin-top: 3px; color: var(--text-tertiary); font-size: 12px; }
+.update-discovery > .button { flex: 0 0 auto; }
+.update-discovery > .icon-button { width: 28px; height: 28px; flex: 0 0 auto; }
+
+@media (forced-colors: active) {
+  .update-status-icon, .update-discovery-icon { border: 1px solid ButtonText; }
+  .update-progress progress { forced-color-adjust: auto; }
+}
 
 @media (max-width: 1260px) {
   :root { --sidebar-width: 260px; --inspector-width: 320px; }

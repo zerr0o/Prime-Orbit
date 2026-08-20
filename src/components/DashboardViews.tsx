@@ -41,9 +41,10 @@ import {
   Zap,
 } from "lucide-react";
 import { deleteMcpServer, inspectPrimeAgentConnections, openPrimeAgentTerminal, readModelsJson, saveMcpServer, saveModelsJson } from "../lib/bridge";
+import { appUpdateProgressPercent } from "../lib/app-updater";
 import { useI18n } from "../i18n";
 import packageMetadata from "../../package.json";
-import type { AppView, Conversation, McpAuthKind, McpScope, McpServerSummary, ModelInfo, OllamaHealth, PersistedAppState, PrimeAgentConnections, Project, RuntimeDetection } from "../types";
+import type { AppUpdateState, AppView, Conversation, McpAuthKind, McpScope, McpServerSummary, ModelInfo, OllamaHealth, PersistedAppState, PrimeAgentConnections, Project, RuntimeDetection, SettingsSectionId } from "../types";
 import { Badge, Button, EmptyState, Modal, Switch } from "./Ui";
 
 interface HomeViewProps {
@@ -359,16 +360,21 @@ function Capability({ icon, title, description, status }: { icon: React.ReactNod
   return <article><span>{icon}</span><div><strong>{title}</strong><small>{description}</small></div><Badge tone="success">{status}</Badge></article>;
 }
 
-export function SettingsView({ state, setState, detection, installState, onRefreshDetection, onInstall }: {
+export function SettingsView({ section, onSectionChange, state, setState, detection, installState, appUpdate, onRefreshDetection, onInstall, onCheckAppUpdate, onDownloadAppUpdate, onInstallAppUpdate }: {
+  section: SettingsSectionId;
+  onSectionChange: (section: SettingsSectionId) => void;
   state: PersistedAppState;
   setState: (updater: (current: PersistedAppState) => PersistedAppState) => void;
   detection?: RuntimeDetection;
   installState: { running: boolean; outcome?: "success" | "error"; phase?: string; lines: string[] };
+  appUpdate: AppUpdateState;
   onRefreshDetection: () => void;
   onInstall: () => Promise<void>;
+  onCheckAppUpdate: () => Promise<void>;
+  onDownloadAppUpdate: () => Promise<void>;
+  onInstallAppUpdate: () => Promise<void>;
 }) {
   const { t } = useI18n();
-  const [section, setSection] = useState<"general" | "appearance" | "agent" | "models" | "security" | "about">("general");
   const [modelsEditor, setModelsEditor] = useState<{ path: string; content: string }>();
   const [modelSaveState, setModelSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const settingsSections = [
@@ -404,7 +410,7 @@ export function SettingsView({ state, setState, detection, installState, onRefre
   };
   return (
     <div className="settings-layout">
-      <aside className="settings-nav"><div><p className="eyebrow">{t("settings.eyebrow")}</p><h1>{t("settings.title")}</h1></div><nav>{settingsSections.map((item) => { const ItemIcon = item.icon; return <button key={item.id} type="button" className={section === item.id ? "is-active" : ""} onClick={() => setSection(item.id)}><ItemIcon size={16} />{item.label}</button>; })}</nav><footer><span className="mini-orbit"><span /></span><div><strong>Prime Orbit</strong><small>Version {packageMetadata.version}</small></div></footer></aside>
+      <aside className="settings-nav"><div><p className="eyebrow">{t("settings.eyebrow")}</p><h1>{t("settings.title")}</h1></div><nav>{settingsSections.map((item) => { const ItemIcon = item.icon; return <button key={item.id} type="button" className={section === item.id ? "is-active" : ""} aria-current={section === item.id ? "page" : undefined} onClick={() => onSectionChange(item.id)}><ItemIcon size={16} />{item.label}</button>; })}</nav><footer><span className="mini-orbit"><span /></span><div><strong>Prime Orbit</strong><small>Version {packageMetadata.version}</small></div></footer></aside>
       <main className="settings-content">
         {section === "general" ? <SettingsSection title={t("settings.general")} description={t("settings.generalDescription")}><SettingsGroup title={t("settings.startup")}><SettingRow title={t("settings.restore")} description={t("settings.restoreText")}><Switch checked={prefs.restoreLastWorkspace} onChange={(restoreLastWorkspace) => patchPreferences({ restoreLastWorkspace })} label={t("settings.restore")} /></SettingRow><SettingRow title={t("settings.language")} description={t("settings.languageText")}><select value={prefs.language} onChange={(event) => patchPreferences({ language: event.target.value as "fr" | "en" })}><option value="fr">Français</option><option value="en">English</option></select></SettingRow></SettingsGroup><SettingsGroup title={t("settings.newConversations")}><SettingRow title={t("settings.defaultReasoning")} description={t("settings.defaultReasoningText")}><select value={prefs.defaultThinking} onChange={(event) => patchPreferences({ defaultThinking: event.target.value as typeof prefs.defaultThinking })}><option value="low">{t("settings.light")}</option><option value="medium">{t("settings.balanced")}</option><option value="high">{t("settings.deep")}</option><option value="xhigh">{t("settings.veryDeep")}</option></select></SettingRow></SettingsGroup></SettingsSection> : null}
         {section === "appearance" ? <SettingsSection title={t("settings.appearance")} description={t("settings.appearanceDescription")}><SettingsGroup title={t("settings.theme")}><div className="theme-picker">{(["dark", "light", "system"] as const).map((theme) => <button key={theme} type="button" className={prefs.theme === theme ? "is-active" : ""} onClick={() => patchPreferences({ theme })}><span className={`theme-preview theme-${theme}`}><i /><i /><i /></span><strong>{theme === "dark" ? t("settings.dark") : theme === "light" ? t("settings.lightTheme") : t("settings.system")}</strong>{prefs.theme === theme ? <Check size={15} /> : null}</button>)}</div></SettingsGroup><SettingsGroup title={t("settings.interface")}><SettingRow title={t("settings.compactSidebar")} description={t("settings.compactSidebarText")}><Switch checked={prefs.compactSidebar} onChange={(compactSidebar) => patchPreferences({ compactSidebar })} label={t("settings.compactSidebar")} /></SettingRow><SettingRow title={t("settings.reduceMotion")} description={t("settings.reduceMotionText")}><Switch checked={prefs.reduceMotion} onChange={(reduceMotion) => patchPreferences({ reduceMotion })} label={t("settings.reduceMotion")} /></SettingRow></SettingsGroup></SettingsSection> : null}
@@ -428,7 +434,7 @@ export function SettingsView({ state, setState, detection, installState, onRefre
         </SettingsSection> : null}
         {section === "models" ? <SettingsSection title={t("settings.models")} description={t("settings.modelsDescription")}><div className="settings-callout"><FileJson2 size={22} /><div><h3>{t("settings.customCatalog")}</h3><p>{t("settings.customCatalogText")}</p></div><Button variant="secondary" onClick={() => void openModels()}><FileJson2 size={15} />{t("settings.openEditor")}</Button></div></SettingsSection> : null}
         {section === "security" ? <SettingsSection title={t("settings.security")} description={t("settings.securityDescription")}><div className="security-principles"><SecurityPrinciple icon={<Folder size={18} />} title={t("settings.visibleFolder")} text={t("settings.visibleFolderText")} /><SecurityPrinciple icon={<Terminal size={18} />} title={t("settings.inspectableCommands")} text={t("settings.inspectableCommandsText")} /><SecurityPrinciple icon={<ShieldAlert size={18} />} title={t("settings.noImplicitIsolation")} text={t("settings.noImplicitIsolationText")} /></div><div className="warning-card"><Info size={19} /><div><strong>{t("settings.realIsolation")}</strong><p>{t("settings.realIsolationText")}</p></div></div></SettingsSection> : null}
-        {section === "about" ? <SettingsSection title={t("settings.about")} description={t("settings.aboutDescription")}><div className="about-card"><span className="about-orbit"><span /></span><h2>Prime Orbit</h2><p>{t("settings.aboutText")}</p><Badge tone="accent">Version {packageMetadata.version} · Preview</Badge><div><a href="https://github.com/PrimeIntellect-ai/prime-agent" target="_blank" rel="noreferrer"><Code2 size={15} />Prime Agent<ExternalLink size={12} /></a><a href="https://github.com/PrimeIntellect-ai/prime-agent/blob/main/LICENSE" target="_blank" rel="noreferrer"><Globe2 size={15} />{t("settings.licenses")}<ExternalLink size={12} /></a></div></div></SettingsSection> : null}
+        {section === "about" ? <SettingsSection title={t("settings.about")} description={t("settings.aboutDescription")}><SettingsGroup title={t("settings.updates")}><AppUpdatePanel state={appUpdate} onCheck={onCheckAppUpdate} onDownload={onDownloadAppUpdate} onInstall={onInstallAppUpdate} /><SettingRow title={t("settings.autoUpdateChecks")} description={t("settings.autoUpdateChecksText")}><Switch checked={prefs.automaticUpdateChecks} onChange={(automaticUpdateChecks) => patchPreferences({ automaticUpdateChecks })} label={t("settings.autoUpdateChecks")} /></SettingRow></SettingsGroup><div className="about-card"><span className="about-orbit"><span /></span><h2>Prime Orbit</h2><p>{t("settings.aboutText")}</p><Badge tone="accent">Version {packageMetadata.version} · Preview</Badge><div><a href="https://github.com/PrimeIntellect-ai/prime-agent" target="_blank" rel="noreferrer"><Code2 size={15} />Prime Agent<ExternalLink size={12} /></a><a href="https://github.com/PrimeIntellect-ai/prime-agent/blob/main/LICENSE" target="_blank" rel="noreferrer"><Globe2 size={15} />{t("settings.licenses")}<ExternalLink size={12} /></a></div></div></SettingsSection> : null}
       </main>
       {modelsEditor ? <Modal title={t("settings.modelCatalog")} description={modelsEditor.path} width="820px" onClose={() => setModelsEditor(undefined)} footer={<><span className={`editor-status is-${modelSaveState}`}>{modelSaveState === "error" ? t("settings.invalidJson") : modelSaveState === "saved" ? t("settings.saved") : t("settings.backupNotice")}</span><Button variant="secondary" onClick={() => setModelsEditor(undefined)}>{t("common.cancel")}</Button><Button variant="primary" loading={modelSaveState === "saving"} onClick={() => void saveModels()}>{t("settings.validateSave")}</Button></>}><textarea className="json-editor" value={modelsEditor.content} spellCheck={false} onChange={(event) => { setModelsEditor({ ...modelsEditor, content: event.target.value }); setModelSaveState("idle"); }} /></Modal> : null}
     </div>
@@ -440,6 +446,104 @@ export function Onboarding({ detection, installState, onInstall, onUseExisting, 
   const runtimeBroken = Boolean(detection && !detection.installed && detection.error);
   return (
     <div className="onboarding-page"><div className="onboarding-ambient ambient-one" /><div className="onboarding-ambient ambient-two" /><header><span className="brand-mark"><span className="orbit-ring"><span /></span></span><strong>Prime Orbit</strong><Badge>{t("onboarding.preview")}</Badge></header><main><div className="onboarding-copy"><p className="eyebrow">{t("onboarding.welcome")}</p><h1>{t("onboarding.title")}<br /><span>{t("onboarding.forAgent")}</span></h1><p>{t("onboarding.description")}</p><ul><li><span><Folder size={17} /></span><div><strong>{t("onboarding.projectTitle")}</strong><small>{t("onboarding.projectText")}</small></div></li><li><span><Activity size={17} /></span><div><strong>{t("onboarding.activityTitle")}</strong><small>{t("onboarding.activityText")}</small></div></li><li><span><Maximize2 size={17} /></span><div><strong>{t("onboarding.windowsTitle")}</strong><small>{t("onboarding.windowsText")}</small></div></li></ul></div><section className={`onboarding-card ${runtimeBroken ? "has-runtime-error" : ""}`}><div className="setup-progress"><span className="is-done"><Check size={13} /></span><i /><span className={detection ? "is-current" : ""}>2</span><i /><span>3</span></div><div className="setup-icon">{detection?.installed ? <PackageCheck size={28} /> : runtimeBroken ? <ShieldAlert size={28} /> : <Download size={28} />}</div><Badge tone={detection?.installed ? "success" : runtimeBroken ? "danger" : "accent"}>{detection?.installed ? t("onboarding.installDetected") : runtimeBroken ? t("onboarding.installBroken") : t("onboarding.initialSetup")}</Badge><h2>{detection?.installed ? t("onboarding.agentReady", { version: detection.version ?? "" }) : runtimeBroken ? t("onboarding.repairTitle") : t("onboarding.chooseInstall")}</h2><p>{detection?.installed ? t("onboarding.existingText") : runtimeBroken ? t("onboarding.repairText") : t("onboarding.managedText")}</p>{runtimeBroken ? <pre className="onboarding-runtime-error" role="alert">{detection?.error}</pre> : null}{installState.lines.length ? <pre className="onboarding-logs">{installState.lines.slice(-10).join("\n")}</pre> : null}<div className="onboarding-actions">{detection?.installed ? <Button variant="primary" onClick={onContinue}>{t("onboarding.continue")} <ArrowRight size={15} /></Button> : <><Button variant="primary" loading={installState.running} onClick={onInstall}><Download size={15} />{t("onboarding.autoInstall")}</Button><Button variant="secondary" onClick={onUseExisting}><FolderOpen size={15} />{t("onboarding.useExisting")}</Button></>}</div><small className="setup-note"><ShieldCheck size={13} />{t("onboarding.noApiKey")}</small></section></main></div>
+  );
+}
+
+function formatUpdateBytes(bytes: number | undefined, locale: string) {
+  if (bytes === undefined || !Number.isFinite(bytes)) return undefined;
+  const units = ["B", "KB", "MB", "GB"];
+  let value = Math.max(0, bytes);
+  let unit = 0;
+  while (value >= 1_024 && unit < units.length - 1) {
+    value /= 1_024;
+    unit += 1;
+  }
+  return `${new Intl.NumberFormat(locale, { maximumFractionDigits: unit === 0 ? 0 : 1 }).format(value)} ${units[unit]}`;
+}
+
+function formatUpdateDate(value: string | undefined, locale: string) {
+  if (!value) return undefined;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return undefined;
+  return new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(date);
+}
+
+function updateReleaseUrl(version: string) {
+  const tag = version.startsWith("v") ? version : `v${version}`;
+  return `https://github.com/zerr0o/Prime-Orbit/releases/tag/${encodeURIComponent(tag)}`;
+}
+
+function AppUpdatePanel({ state, onCheck, onDownload, onInstall }: {
+  state: AppUpdateState;
+  onCheck: () => Promise<void>;
+  onDownload: () => Promise<void>;
+  onInstall: () => Promise<void>;
+}) {
+  const { t, locale } = useI18n();
+  const progress = appUpdateProgressPercent(state);
+  const downloaded = formatUpdateBytes(state.downloadedBytes, locale);
+  const total = formatUpdateBytes(state.totalBytes, locale);
+  const lastChecked = formatUpdateDate(state.lastCheckedAt, locale);
+  const publishedAt = formatUpdateDate(state.update?.publishedAt, locale);
+  const busy = state.phase === "checking" || state.phase === "downloading" || state.phase === "installing";
+
+  let title = t("settings.currentVersion", { version: state.currentVersion });
+  let description = t("settings.updateIdleText");
+  let icon: React.ReactNode = <Info size={19} />;
+  if (state.phase === "checking") {
+    title = t("settings.checkingForUpdates");
+    description = t("settings.updateCheckingText");
+    icon = <LoaderCircle size={19} className="spin" />;
+  } else if (state.phase === "upToDate") {
+    title = t("settings.upToDate");
+    description = t("settings.upToDateText", { version: state.currentVersion });
+    icon = <Check size={19} />;
+  } else if (state.phase === "available") {
+    title = t("settings.updateAvailable", { version: state.update?.version ?? "" });
+    description = t("settings.updateAvailableText");
+    icon = <Download size={19} />;
+  } else if (state.phase === "downloading") {
+    title = t("settings.downloadingUpdate", { version: state.update?.version ?? "" });
+    description = t("settings.updateDownloadText");
+    icon = <LoaderCircle size={19} className="spin" />;
+  } else if (state.phase === "ready") {
+    title = t("settings.updateReady");
+    description = t("settings.updateReadyText", { version: state.update?.version ?? "" });
+    icon = <PackageCheck size={19} />;
+  } else if (state.phase === "installing") {
+    title = t("settings.installingUpdate");
+    description = t("settings.installingUpdateText");
+    icon = <LoaderCircle size={19} className="spin" />;
+  } else if (state.phase === "error") {
+    title = t("settings.updateFailed");
+    description = t("settings.updateFailedText");
+    icon = <ShieldAlert size={19} />;
+  }
+
+  const retryCheck = state.phase === "idle" || state.phase === "upToDate" || (state.phase === "error" && state.operation !== "download" && state.operation !== "install");
+  const retryDownload = state.phase === "available" || (state.phase === "error" && state.operation === "download" && Boolean(state.update));
+  const retryInstall = state.phase === "ready" || (state.phase === "error" && state.operation === "install" && Boolean(state.update));
+
+  return (
+    <section className={`update-panel is-${state.phase}`} aria-busy={busy} aria-labelledby="app-update-status-title">
+      <div className="update-panel-main">
+        <span className="update-status-icon" aria-hidden="true">{icon}</span>
+        <div className="update-panel-copy" role="status" aria-live="polite" aria-atomic="true">
+          <strong id="app-update-status-title">{title}</strong>
+          <p>{description}</p>
+          {lastChecked ? <small>{t("settings.lastChecked", { date: lastChecked })}</small> : null}
+          {publishedAt && state.update ? <small>{t("settings.updatePublished", { date: publishedAt })}</small> : null}
+        </div>
+        <div className="update-panel-actions">
+          {retryCheck ? <Button variant="secondary" onClick={() => void onCheck()}><RefreshCw size={15} />{state.phase === "error" ? t("settings.retryUpdate") : t("settings.checkForUpdates")}</Button> : null}
+          {retryDownload ? <Button variant="primary" onClick={() => void onDownload()}><Download size={15} />{state.phase === "error" ? t("settings.retryUpdate") : t("settings.downloadUpdate")}</Button> : null}
+          {retryInstall ? <Button variant="primary" onClick={() => void onInstall()}><PackageCheck size={15} />{state.phase === "error" ? t("settings.retryUpdate") : t("settings.restartAndUpdate")}</Button> : null}
+        </div>
+      </div>
+      {state.phase === "downloading" ? <div className="update-progress"><progress max={state.totalBytes} value={state.totalBytes ? state.downloadedBytes ?? 0 : undefined} aria-label={t("settings.downloadingUpdate", { version: state.update?.version ?? "" })} aria-valuetext={progress !== undefined && downloaded && total ? t("settings.downloadProgress", { percent: progress, received: downloaded, total }) : downloaded ? t("settings.downloadProgressUnknown", { received: downloaded }) : t("settings.downloadStarting")} /><span className="update-progress-copy" aria-live="polite">{progress !== undefined && downloaded && total ? t("settings.downloadProgress", { percent: progress, received: downloaded, total }) : downloaded ? t("settings.downloadProgressUnknown", { received: downloaded }) : t("settings.downloadStarting")}</span></div> : null}
+      {state.phase === "error" ? <div className="update-error-details" role="alert"><ShieldAlert size={15} /><span>{state.error ?? t("settings.updateUnknownError")}</span></div> : null}
+      {state.update?.notes ? <details className="update-release-notes"><summary>{t("settings.releaseNotes")}</summary><p>{state.update.notes}</p><a href={updateReleaseUrl(state.update.version)} target="_blank" rel="noreferrer">{t("settings.openReleasePage")}<ExternalLink size={12} /></a></details> : null}
+    </section>
   );
 }
 
