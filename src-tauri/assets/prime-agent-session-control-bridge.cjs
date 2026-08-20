@@ -8,6 +8,10 @@ const MAX_REQUEST_BYTES = 64 * 1024;
 const SUPPORTED_PROTOCOL_VERSION = 7;
 const RELOAD_REQUEST_TIMEOUT_MS = 120_000;
 const HARD_TIMEOUT_MS = RELOAD_REQUEST_TIMEOUT_MS + 15_000;
+const MAX_WINDOWS_DAEMON_SOCKET_BYTES = 240;
+const MAX_UNIX_DAEMON_SOCKET_BYTES = 100;
+const WINDOWS_GENERATION_SOCKET = /^\\\\\.\\pipe\\prime-orbit-daemon-prime-agent-v\d{1,10}\.\d{1,10}\.\d{1,10}-[0-9a-f]{32}$/u;
+const UNIX_GENERATION_SOCKET = /^\/tmp\/prime-orbit-daemon-prime-agent-v\d{1,10}\.\d{1,10}\.\d{1,10}-[0-9a-f]{32}\.sock$/u;
 
 function fail(message) {
   process.stderr.write(`${message}\n`);
@@ -33,6 +37,20 @@ function findDaemonModules(cliPath) {
     cursor = parent;
   }
   throw new Error("Les modules daemon de Prime Agent sont introuvables dans ce runtime.");
+}
+
+function resolveDaemonSocketPath(explicitSocketPath, defaultDaemonSocketPath, platform = process.platform) {
+  if (explicitSocketPath === undefined) return defaultDaemonSocketPath();
+  if (typeof explicitSocketPath !== "string" || explicitSocketPath.length === 0) {
+    throw new Error("Socket de daemon Prime Agent invalide.");
+  }
+  const isWindows = platform === "win32";
+  const maxBytes = isWindows ? MAX_WINDOWS_DAEMON_SOCKET_BYTES : MAX_UNIX_DAEMON_SOCKET_BYTES;
+  const pattern = isWindows ? WINDOWS_GENERATION_SOCKET : UNIX_GENERATION_SOCKET;
+  if (Buffer.byteLength(explicitSocketPath, "utf8") > maxBytes || !pattern.test(explicitSocketPath)) {
+    throw new Error("Socket de daemon Prime Agent géré invalide ou trop long.");
+  }
+  return explicitSocketPath;
 }
 
 function validRequest(request) {
@@ -151,7 +169,11 @@ async function main() {
     import(pathToFileURL(modules.daemonSocket).href),
   ]);
 
-  const client = new DaemonClient(defaultDaemonSocketPath());
+  const socketPath = resolveDaemonSocketPath(
+    process.env.PRIME_ORBIT_DAEMON_SOCKET,
+    defaultDaemonSocketPath,
+  );
+  const client = new DaemonClient(socketPath);
   try {
     await client.connect(3_000);
     const hello = await client.waitForHello(3_000);
@@ -168,6 +190,7 @@ module.exports = {
   busyReason,
   isReloadResponseTimeout,
   reloadAgentResources,
+  resolveDaemonSocketPath,
   selectSession,
   validRequest,
 };

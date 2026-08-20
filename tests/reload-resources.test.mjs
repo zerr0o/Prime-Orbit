@@ -9,6 +9,7 @@ const {
   SUPPORTED_PROTOCOL_VERSION,
   busyReason,
   reloadAgentResources,
+  resolveDaemonSocketPath,
   selectSession,
   validRequest,
 } = require("../src-tauri/assets/prime-agent-session-control-bridge.cjs");
@@ -20,6 +21,28 @@ const request = {
   sessionId: "session-active",
 };
 const hello = { protocol: { version: SUPPORTED_PROTOCOL_VERSION } };
+
+test("uses only a strictly bounded generation socket and otherwise keeps the upstream default", () => {
+  const fallback = () => "/upstream/default.sock";
+  const windows = "\\\\.\\pipe\\prime-orbit-daemon-prime-agent-v0.7.4-4a6f213a1ed44889a0f0b40ea4774f3d";
+  const unix = "/tmp/prime-orbit-daemon-prime-agent-v0.7.4-4a6f213a1ed44889a0f0b40ea4774f3d.sock";
+
+  assert.equal(resolveDaemonSocketPath(undefined, fallback, "win32"), fallback());
+  assert.equal(resolveDaemonSocketPath(windows, fallback, "win32"), windows);
+  assert.equal(resolveDaemonSocketPath(unix, fallback, "linux"), unix);
+  assert.throws(
+    () => resolveDaemonSocketPath("\\\\.\\pipe\\prime-agent-daemon", fallback, "win32"),
+    /invalide ou trop long/u,
+  );
+  assert.throws(
+    () => resolveDaemonSocketPath("/tmp/prime-orbit-daemon-prime-agent-v0.7.4-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.sock", fallback, "linux"),
+    /invalide ou trop long/u,
+  );
+  assert.throws(
+    () => resolveDaemonSocketPath(`${unix}${"x".repeat(101)}`, fallback, "linux"),
+    /invalide ou trop long/u,
+  );
+});
 
 test("accepts only the bounded native reload action", () => {
   assert.equal(validRequest(request), true);

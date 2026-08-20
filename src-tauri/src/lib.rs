@@ -102,6 +102,8 @@ pub fn run() {
             files::open_project_folder,
             files::open_git_file_folder,
             connections::inspect_prime_agent_connections,
+            connections::inspect_prime_agent_defaults,
+            connections::save_prime_agent_defaults,
             connections::check_ollama_health,
             connections::save_mcp_server,
             connections::delete_mcp_server,

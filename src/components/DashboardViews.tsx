@@ -40,11 +40,12 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { deleteMcpServer, inspectPrimeAgentConnections, openPrimeAgentTerminal, readModelsJson, saveMcpServer, saveModelsJson } from "../lib/bridge";
+import { deleteMcpServer, inspectPrimeAgentConnections, openPrimeAgentTerminal, readModelsJson, saveMcpServer, saveModelsJson, savePrimeAgentDefaults } from "../lib/bridge";
 import { appUpdateProgressPercent } from "../lib/app-updater";
+import { isCompleteModelReference, loadRlmPreferences, patchRlmPreferences, RLM_PREFERENCES_STORAGE_KEY, supportsRlmThinking, type RlmPreferences, type RlmThinkingPreference } from "../lib/rlm-preferences";
 import { useI18n } from "../i18n";
 import packageMetadata from "../../package.json";
-import type { AppUpdateState, AppView, Conversation, McpAuthKind, McpScope, McpServerSummary, ModelInfo, OllamaHealth, PersistedAppState, PrimeAgentConnections, Project, RuntimeDetection, SettingsSectionId } from "../types";
+import type { AppUpdateState, AppView, Conversation, McpAuthKind, McpScope, McpServerSummary, ModelInfo, OllamaHealth, PersistedAppState, PrimeAgentConnections, PrimeAgentDefaults, Project, RuntimeDetection, SettingsSectionId, ThinkingLevel } from "../types";
 import { Badge, Button, EmptyState, Modal, Switch } from "./Ui";
 
 interface HomeViewProps {
@@ -360,7 +361,7 @@ function Capability({ icon, title, description, status }: { icon: React.ReactNod
   return <article><span>{icon}</span><div><strong>{title}</strong><small>{description}</small></div><Badge tone="success">{status}</Badge></article>;
 }
 
-export function SettingsView({ section, onSectionChange, state, setState, detection, installState, appUpdate, onRefreshDetection, onInstall, onCheckAppUpdate, onDownloadAppUpdate, onInstallAppUpdate }: {
+export function SettingsView({ section, onSectionChange, state, setState, detection, installState, appUpdate, models, primeAgentDefaults, primeAgentDefaultsLoading, primeAgentDefaultsError, onPrimeAgentDefaultsChange, onRefreshDetection, onInstall, onCheckAppUpdate, onDownloadAppUpdate, onInstallAppUpdate }: {
   section: SettingsSectionId;
   onSectionChange: (section: SettingsSectionId) => void;
   state: PersistedAppState;
@@ -368,6 +369,11 @@ export function SettingsView({ section, onSectionChange, state, setState, detect
   detection?: RuntimeDetection;
   installState: { running: boolean; outcome?: "success" | "error"; phase?: string; lines: string[] };
   appUpdate: AppUpdateState;
+  models: ModelInfo[];
+  primeAgentDefaults?: PrimeAgentDefaults;
+  primeAgentDefaultsLoading: boolean;
+  primeAgentDefaultsError?: string;
+  onPrimeAgentDefaultsChange: (defaults: PrimeAgentDefaults) => void;
   onRefreshDetection: () => void;
   onInstall: () => Promise<void>;
   onCheckAppUpdate: () => Promise<void>;
@@ -412,7 +418,7 @@ export function SettingsView({ section, onSectionChange, state, setState, detect
     <div className="settings-layout">
       <aside className="settings-nav"><div><p className="eyebrow">{t("settings.eyebrow")}</p><h1>{t("settings.title")}</h1></div><nav>{settingsSections.map((item) => { const ItemIcon = item.icon; return <button key={item.id} type="button" className={section === item.id ? "is-active" : ""} aria-current={section === item.id ? "page" : undefined} onClick={() => onSectionChange(item.id)}><ItemIcon size={16} />{item.label}</button>; })}</nav><footer><span className="mini-orbit"><span /></span><div><strong>Prime Orbit</strong><small>Version {packageMetadata.version}</small></div></footer></aside>
       <main className="settings-content">
-        {section === "general" ? <SettingsSection title={t("settings.general")} description={t("settings.generalDescription")}><SettingsGroup title={t("settings.startup")}><SettingRow title={t("settings.restore")} description={t("settings.restoreText")}><Switch checked={prefs.restoreLastWorkspace} onChange={(restoreLastWorkspace) => patchPreferences({ restoreLastWorkspace })} label={t("settings.restore")} /></SettingRow><SettingRow title={t("settings.language")} description={t("settings.languageText")}><select value={prefs.language} onChange={(event) => patchPreferences({ language: event.target.value as "fr" | "en" })}><option value="fr">Français</option><option value="en">English</option></select></SettingRow></SettingsGroup><SettingsGroup title={t("settings.newConversations")}><SettingRow title={t("settings.defaultReasoning")} description={t("settings.defaultReasoningText")}><select value={prefs.defaultThinking} onChange={(event) => patchPreferences({ defaultThinking: event.target.value as typeof prefs.defaultThinking })}><option value="low">{t("settings.light")}</option><option value="medium">{t("settings.balanced")}</option><option value="high">{t("settings.deep")}</option><option value="xhigh">{t("settings.veryDeep")}</option></select></SettingRow></SettingsGroup></SettingsSection> : null}
+        {section === "general" ? <SettingsSection title={t("settings.general")} description={t("settings.generalDescription")}><SettingsGroup title={t("settings.startup")}><SettingRow title={t("settings.restore")} description={t("settings.restoreText")}><Switch checked={prefs.restoreLastWorkspace} onChange={(restoreLastWorkspace) => patchPreferences({ restoreLastWorkspace })} label={t("settings.restore")} /></SettingRow><SettingRow title={t("settings.language")} description={t("settings.languageText")}><select value={prefs.language} onChange={(event) => patchPreferences({ language: event.target.value as "fr" | "en" })}><option value="fr">Français</option><option value="en">English</option></select></SettingRow></SettingsGroup><AgentDefaultsSettings models={models} defaults={primeAgentDefaults} loading={primeAgentDefaultsLoading} loadError={primeAgentDefaultsError} runtimeVersion={detection?.version} runtimeInstalled={Boolean(detection?.installed)} localThinking={prefs.defaultThinking} onLocalThinkingChange={(defaultThinking) => patchPreferences({ defaultThinking })} onDefaultsChange={onPrimeAgentDefaultsChange} onUpdatePrimeAgent={onInstall} /></SettingsSection> : null}
         {section === "appearance" ? <SettingsSection title={t("settings.appearance")} description={t("settings.appearanceDescription")}><SettingsGroup title={t("settings.theme")}><div className="theme-picker">{(["dark", "light", "system"] as const).map((theme) => <button key={theme} type="button" className={prefs.theme === theme ? "is-active" : ""} onClick={() => patchPreferences({ theme })}><span className={`theme-preview theme-${theme}`}><i /><i /><i /></span><strong>{theme === "dark" ? t("settings.dark") : theme === "light" ? t("settings.lightTheme") : t("settings.system")}</strong>{prefs.theme === theme ? <Check size={15} /> : null}</button>)}</div></SettingsGroup><SettingsGroup title={t("settings.interface")}><SettingRow title={t("settings.compactSidebar")} description={t("settings.compactSidebarText")}><Switch checked={prefs.compactSidebar} onChange={(compactSidebar) => patchPreferences({ compactSidebar })} label={t("settings.compactSidebar")} /></SettingRow><SettingRow title={t("settings.reduceMotion")} description={t("settings.reduceMotionText")}><Switch checked={prefs.reduceMotion} onChange={(reduceMotion) => patchPreferences({ reduceMotion })} label={t("settings.reduceMotion")} /></SettingRow></SettingsGroup></SettingsSection> : null}
         {section === "agent" ? <SettingsSection title="Prime Agent" description={t("settings.agentDescription")}>
           <div className={`runtime-hero ${detection?.installed ? "is-ready" : runtimeBroken ? "is-broken" : "is-missing"}`}>
@@ -439,6 +445,184 @@ export function SettingsView({ section, onSectionChange, state, setState, detect
       {modelsEditor ? <Modal title={t("settings.modelCatalog")} description={modelsEditor.path} width="820px" onClose={() => setModelsEditor(undefined)} footer={<><span className={`editor-status is-${modelSaveState}`}>{modelSaveState === "error" ? t("settings.invalidJson") : modelSaveState === "saved" ? t("settings.saved") : t("settings.backupNotice")}</span><Button variant="secondary" onClick={() => setModelsEditor(undefined)}>{t("common.cancel")}</Button><Button variant="primary" loading={modelSaveState === "saving"} onClick={() => void saveModels()}>{t("settings.validateSave")}</Button></>}><textarea className="json-editor" value={modelsEditor.content} spellCheck={false} onChange={(event) => { setModelsEditor({ ...modelsEditor, content: event.target.value }); setModelSaveState("idle"); }} /></Modal> : null}
     </div>
   );
+}
+
+const THINKING_LEVELS: Array<{ value: ThinkingLevel; label: "settings.thinkingOff" | "settings.thinkingMinimal" | "settings.thinkingLow" | "settings.thinkingMedium" | "settings.thinkingHigh" | "settings.thinkingXhigh" | "settings.thinkingMax" }> = [
+  { value: "off", label: "settings.thinkingOff" },
+  { value: "minimal", label: "settings.thinkingMinimal" },
+  { value: "low", label: "settings.thinkingLow" },
+  { value: "medium", label: "settings.thinkingMedium" },
+  { value: "high", label: "settings.thinkingHigh" },
+  { value: "xhigh", label: "settings.thinkingXhigh" },
+  { value: "max", label: "settings.thinkingMax" },
+];
+
+function AgentDefaultsSettings({ models, defaults, loading, loadError, runtimeVersion, runtimeInstalled, localThinking, onLocalThinkingChange, onDefaultsChange, onUpdatePrimeAgent }: {
+  models: ModelInfo[];
+  defaults?: PrimeAgentDefaults;
+  loading: boolean;
+  loadError?: string;
+  runtimeVersion?: string;
+  runtimeInstalled: boolean;
+  localThinking: ThinkingLevel;
+  onLocalThinkingChange: (thinking: ThinkingLevel) => void;
+  onDefaultsChange: (defaults: PrimeAgentDefaults) => void;
+  onUpdatePrimeAgent: () => Promise<void>;
+}) {
+  const { t } = useI18n();
+  const [mainModel, setMainModel] = useState(() => modelRef(defaults));
+  const [mainThinking, setMainThinking] = useState<ThinkingLevel>(defaults?.defaultThinkingLevel ?? localThinking);
+  const [mainDirty, setMainDirty] = useState(false);
+  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [saveError, setSaveError] = useState<string>();
+  const [rlmPreferences, setRlmPreferences] = useState<RlmPreferences>(() => loadRlmPreferences());
+  const [updatingRuntime, setUpdatingRuntime] = useState(false);
+  const rlmThinkingAvailable = supportsRlmThinking(runtimeVersion);
+  const rlmModelInvalid = Boolean(rlmPreferences.preferredModel && !isCompleteModelReference(rlmPreferences.preferredModel));
+
+  useEffect(() => {
+    if (mainDirty) return;
+    setMainModel(modelRef(defaults));
+    setMainThinking(defaults?.defaultThinkingLevel ?? localThinking);
+  }, [defaults, localThinking, mainDirty]);
+
+  useEffect(() => {
+    const synchronizeRlmPreferences = (event: StorageEvent) => {
+      if (event.storageArea === window.localStorage && event.key === RLM_PREFERENCES_STORAGE_KEY) {
+        setRlmPreferences(loadRlmPreferences());
+      }
+    };
+    window.addEventListener("storage", synchronizeRlmPreferences);
+    return () => window.removeEventListener("storage", synchronizeRlmPreferences);
+  }, []);
+
+  const modelGroups = useMemo(() => {
+    const groups = new Map<string, Array<ModelInfo & { ref: string }>>();
+    const seen = new Set<string>();
+    for (const model of models) {
+      const ref = `${model.provider}/${model.id}`;
+      if (seen.has(ref)) continue;
+      seen.add(ref);
+      groups.set(model.provider, [...(groups.get(model.provider) ?? []), { ...model, ref }]);
+    }
+    return [...groups.entries()].map(([provider, entries]) => [
+      provider,
+      entries.sort((left, right) => (left.name ?? left.id).localeCompare(right.name ?? right.id)),
+    ] as const).sort(([left], [right]) => left.localeCompare(right));
+  }, [models]);
+  const knownModelRefs = useMemo(() => new Set(modelGroups.flatMap(([, entries]) => entries.map((model) => model.ref))), [modelGroups]);
+
+  const changeMainModel = (value: string) => {
+    setMainModel(value || undefined);
+    setMainDirty(true);
+    setSaveState("idle");
+  };
+  const changeMainThinking = (value: ThinkingLevel) => {
+    setMainThinking(value);
+    setMainDirty(true);
+    setSaveState("idle");
+  };
+  const saveDefaults = async () => {
+    if (saveState === "saving" || !runtimeInstalled) return;
+    if (mainModel && !isCompleteModelReference(mainModel)) {
+      setSaveError(t("settings.modelReferenceInvalid"));
+      setSaveState("error");
+      return;
+    }
+    const parsed = splitModelRef(mainModel);
+    setSaveState("saving");
+    setSaveError(undefined);
+    try {
+      const result = await savePrimeAgentDefaults({
+        defaultProvider: parsed?.provider ?? null,
+        defaultModel: parsed?.model ?? null,
+        defaultThinkingLevel: mainThinking,
+      });
+      onDefaultsChange(result.defaults);
+      onLocalThinkingChange(result.defaults.defaultThinkingLevel ?? mainThinking);
+      setMainDirty(false);
+      setSaveState("saved");
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : String(error));
+      setSaveState("error");
+    }
+  };
+  const changeRlmPreferences = (patch: Partial<RlmPreferences>) => {
+    // Read the authoritative localStorage value again before merging so a
+    // near-simultaneous edit from another Orbit window cannot be clobbered by
+    // this component's stale React snapshot.
+    setRlmPreferences(patchRlmPreferences(patch));
+  };
+  const updateRuntime = async () => {
+    if (updatingRuntime) return;
+    setUpdatingRuntime(true);
+    try {
+      await onUpdatePrimeAgent();
+    } finally {
+      setUpdatingRuntime(false);
+    }
+  };
+
+  return (
+    <>
+      <SettingsGroup title={t("settings.mainAgent")}>
+        <div className="settings-group-intro"><Bot size={16} /><span>{t("settings.mainAgentText")}</span></div>
+        <SettingRow title={t("settings.defaultModel")} description={t("settings.defaultModelText")}>
+          {modelGroups.length > 0 ? <select aria-label={t("settings.defaultModel")} value={mainModel ?? ""} disabled={loading || saveState === "saving" || !runtimeInstalled} onChange={(event) => changeMainModel(event.target.value)}>
+              <option value="">{t("settings.inheritPrimeAgent")}</option>
+              {mainModel && !knownModelRefs.has(mainModel) ? <option value={mainModel}>{mainModel}</option> : null}
+              {modelGroups.map(([provider, entries]) => <optgroup key={provider} label={provider}>{entries.map((model) => <option key={model.ref} value={model.ref}>{model.name ?? model.id}</option>)}</optgroup>)}
+            </select>
+            : <input aria-label={t("settings.defaultModel")} value={mainModel ?? ""} placeholder={t("settings.modelReferencePlaceholder")} disabled={loading || saveState === "saving" || !runtimeInstalled} spellCheck={false} onChange={(event) => changeMainModel(event.target.value)} />}
+        </SettingRow>
+        <SettingRow title={t("settings.defaultReasoning")} description={t("settings.defaultReasoningText")}>
+          <select aria-label={t("settings.defaultReasoning")} value={mainThinking} disabled={loading || saveState === "saving" || !runtimeInstalled} onChange={(event) => changeMainThinking(event.target.value as ThinkingLevel)}>
+            {THINKING_LEVELS.map((level) => <option key={level.value} value={level.value}>{t(level.label)}</option>)}
+          </select>
+        </SettingRow>
+        {modelGroups.length === 0 ? <div className="settings-inline-notice"><Info size={15} /><span>{t("settings.modelCatalogUnavailable")}</span></div> : null}
+        {loading ? <div className="settings-inline-notice" role="status"><LoaderCircle size={15} className="spin" /><span>{t("settings.defaultsLoading")}</span></div> : null}
+        {loadError ? <div className="settings-inline-notice is-error" role="alert"><ShieldAlert size={15} /><span>{t("settings.defaultsReadError", { error: loadError })}</span></div> : null}
+        {saveError ? <div className="settings-inline-notice is-error" role="alert"><ShieldAlert size={15} /><span>{t("settings.defaultsSaveError", { error: saveError })}</span></div> : null}
+        <div className="settings-group-actions"><span className={`settings-save-status is-${saveState}`} aria-live="polite">{saveState === "saved" ? <><Check size={14} />{t("settings.defaultsSaved")}</> : null}</span><Button variant="primary" loading={saveState === "saving"} disabled={!runtimeInstalled || loading || !mainDirty} onClick={() => void saveDefaults()}>{t("settings.saveDefaults")}</Button></div>
+      </SettingsGroup>
+
+      <SettingsGroup title={t("settings.subagents")}>
+        <div className="settings-group-intro"><Blocks size={16} /><span>{t("settings.subagentsText")}</span></div>
+        <SettingRow title={t("settings.subagentModel")} description={t("settings.subagentModelText")}>
+          {modelGroups.length > 0 ? <select aria-label={t("settings.subagentModel")} value={rlmPreferences.preferredModel ?? ""} onChange={(event) => changeRlmPreferences({ preferredModel: event.target.value || undefined })}>
+              <option value="">{t("settings.inheritMainAgent")}</option>
+              {rlmPreferences.preferredModel && !knownModelRefs.has(rlmPreferences.preferredModel) ? <option value={rlmPreferences.preferredModel}>{rlmPreferences.preferredModel}</option> : null}
+              {modelGroups.map(([provider, entries]) => <optgroup key={provider} label={provider}>{entries.map((model) => <option key={model.ref} value={model.ref}>{model.name ?? model.id}</option>)}</optgroup>)}
+            </select>
+            : <input aria-label={t("settings.subagentModel")} value={rlmPreferences.preferredModel ?? ""} placeholder={t("settings.modelReferencePlaceholder")} spellCheck={false} onChange={(event) => changeRlmPreferences({ preferredModel: event.target.value || undefined })} />}
+        </SettingRow>
+        <SettingRow title={t("settings.subagentThinking")} description={t("settings.subagentThinkingText")}>
+          <select aria-label={t("settings.subagentThinking")} value={rlmPreferences.thinking} disabled={!rlmThinkingAvailable} onChange={(event) => changeRlmPreferences({ thinking: event.target.value as RlmThinkingPreference })}>
+            <option value="inherit">{t("settings.inheritMainAgent")}</option>
+            {THINKING_LEVELS.map((level) => <option key={level.value} value={level.value}>{t(level.label)}</option>)}
+          </select>
+        </SettingRow>
+        {rlmModelInvalid ? <div className="settings-inline-notice is-error" role="alert"><ShieldAlert size={15} /><span>{t("settings.modelReferenceInvalid")}</span></div> : null}
+        <div className="settings-inline-notice"><Info size={15} /><span>{t("settings.rlmStoredLocally")}</span></div>
+        {!rlmThinkingAvailable ? <div className="settings-compatibility" role="status"><ShieldAlert size={18} /><div><strong>{t("settings.rlmUpdateRequired")}</strong><p>{t("settings.rlmUpdateRequiredText", { version: runtimeVersion ?? "?" })}</p></div><Button variant="secondary" loading={updatingRuntime} onClick={() => void updateRuntime()}>{t("settings.updatePrimeAgent")}</Button></div> : null}
+      </SettingsGroup>
+    </>
+  );
+}
+
+function modelRef(defaults?: PrimeAgentDefaults) {
+  const provider = defaults?.defaultProvider?.trim();
+  const model = defaults?.defaultModel?.trim();
+  return provider && model ? `${provider}/${model}` : undefined;
+}
+
+function splitModelRef(ref?: string) {
+  if (!ref) return undefined;
+  const value = ref.trim();
+  const separator = value.indexOf("/");
+  if (separator <= 0 || separator === value.length - 1) return undefined;
+  return { provider: value.slice(0, separator), model: value.slice(separator + 1) };
 }
 
 export function Onboarding({ detection, installState, onInstall, onUseExisting, onContinue }: { detection?: RuntimeDetection; installState: { running: boolean; outcome?: "success" | "error"; phase?: string; lines: string[] }; onInstall: () => void; onUseExisting: () => void; onContinue: () => void }) {

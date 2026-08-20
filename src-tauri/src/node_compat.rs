@@ -10,7 +10,11 @@ use tauri::AppHandle;
 const PRELOAD_FILE_NAME: &str = "prime-agent-node-compat.cjs";
 const PRELOAD_BYTES: &[u8] = include_bytes!("../assets/prime-agent-node-compat.cjs");
 
-pub(crate) fn configure_source_rpc(app: &AppHandle, command: &mut Command) -> Result<(), String> {
+pub(crate) fn configure_source_rpc(
+    app: &AppHandle,
+    command: &mut Command,
+    source_dir: Option<&Path>,
+) -> Result<(), String> {
     let runtime_root = app_data_dir(app)?.join("runtime");
     fs::create_dir_all(&runtime_root).map_err(|error| {
         format!(
@@ -22,6 +26,17 @@ pub(crate) fn configure_source_rpc(app: &AppHandle, command: &mut Command) -> Re
     let options = merged_node_options(std::env::var_os("NODE_OPTIONS").as_deref(), &preload)?;
     command.env("NODE_OPTIONS", options);
     command.env("PI_SKIP_VERSION_CHECK", "1");
+    if let Some(source_dir) =
+        source_dir.filter(|source_dir| crate::runtime::is_managed_source_dir(app, source_dir))
+    {
+        // Each immutable runtime generation owns its kernel environment. A
+        // managed upgrade can therefore prepare Python while sessions from the
+        // previous generation keep their loaded python.exe/pythonw.exe files.
+        command.env(
+            "PRIME_AGENT_KERNEL_VENV",
+            source_dir.join(".prime-orbit").join("kernel-venv"),
+        );
+    }
     Ok(())
 }
 

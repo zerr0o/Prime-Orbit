@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type SetStateAction } from "react";
 import { defaultAppState } from "../lib/demo";
+import type { RlmDelegationSnapshot } from "../lib/rlm-preferences";
 import {
   durableState,
   listenToStateChanges,
@@ -292,7 +293,7 @@ export function useWorkspace() {
   }, []);
 
   const addProject = useCallback(
-    (path: string) => {
+    (path: string, globalDefaultModel?: string, rlmSnapshot?: RlmDelegationSnapshot) => {
       const existing = state.projects.find((project) => project.path.toLowerCase() === path.toLowerCase());
       if (existing) {
         setState((current) => ({
@@ -314,7 +315,14 @@ export function useWorkspace() {
         pinned: false,
         permissionPreset: state.preferences.defaultPermissionPreset,
       };
-      const conversation = createConversationRecord(project.id, state.preferences.defaultThinking, undefined, 0);
+      const conversation = createConversationRecord(
+        project.id,
+        state.preferences.defaultThinking,
+        undefined,
+        0,
+        resolveNewConversationModel(undefined, project.defaultModel, globalDefaultModel),
+        rlmSnapshot,
+      );
       setState((current) => ({
         ...current,
         projects: [{ ...project, manualOrder: nextHeadOrder(current.projects) }, ...current.projects],
@@ -346,7 +354,7 @@ export function useWorkspace() {
   }, []);
 
   const createConversation = useCallback(
-    (projectId = state.selectedProjectId, title?: string) => {
+    (projectId = state.selectedProjectId, title?: string, globalDefaultModel?: string, rlmSnapshot?: RlmDelegationSnapshot) => {
       if (!projectId) return undefined;
       setState((current) => {
         const canReuseDraft = !title?.trim() || title.trim() === "Nouvelle conversation";
@@ -356,15 +364,34 @@ export function useWorkspace() {
               .sort(compareManualOrder)[0]
           : undefined;
         const conversation = existingDraft
-          ?? createConversationRecord(
+          ? {
+              ...existingDraft,
+              model: resolveNewConversationModel(
+                undefined,
+                current.projects.find((project) => project.id === projectId)?.defaultModel,
+                globalDefaultModel,
+              ),
+              thinkingLevel: current.preferences.defaultThinking,
+              rlmPreferredModel: rlmSnapshot?.preferredModel,
+              rlmThinkingLevel: rlmSnapshot?.thinkingLevel,
+            }
+          : createConversationRecord(
             projectId,
             current.preferences.defaultThinking,
             title,
             nextHeadOrder(current.conversations.filter((item) => item.projectId === projectId)),
+            resolveNewConversationModel(
+              undefined,
+              current.projects.find((project) => project.id === projectId)?.defaultModel,
+              globalDefaultModel,
+            ),
+            rlmSnapshot,
           );
         return {
           ...current,
-          conversations: existingDraft ? current.conversations : [conversation, ...current.conversations],
+          conversations: existingDraft
+            ? current.conversations.map((item) => item.id === existingDraft.id ? conversation : item)
+            : [conversation, ...current.conversations],
           selectedProjectId: projectId,
           selectedConversationId: conversation.id,
         };
@@ -855,6 +882,8 @@ function createConversationRecord(
   thinkingLevel: Conversation["thinkingLevel"],
   title = "Nouvelle conversation",
   manualOrder = 0,
+  model?: string,
+  rlmSnapshot?: RlmDelegationSnapshot,
 ): Conversation {
   const timestamp = new Date().toISOString();
   return {
@@ -867,12 +896,26 @@ function createConversationRecord(
     pinned: false,
     archived: false,
     status: "offline",
+    model,
     thinkingLevel,
+    rlmPreferredModel: rlmSnapshot?.preferredModel,
+    rlmThinkingLevel: rlmSnapshot?.thinkingLevel,
     hasContent: false,
     draft: "",
     messages: [],
     activities: [],
   };
+}
+
+/** Resolves the immutable model snapshot for a newly-created conversation. */
+export function resolveNewConversationModel(
+  conversationModel?: string,
+  projectDefaultModel?: string,
+  globalDefaultModel?: string,
+) {
+  return [conversationModel, projectDefaultModel, globalDefaultModel]
+    .map((value) => value?.trim())
+    .find((value): value is string => Boolean(value));
 }
 
 type ReorderPlacement = "before" | "after";
