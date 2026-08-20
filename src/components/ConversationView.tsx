@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -19,7 +19,9 @@ import {
   Code2,
   Copy,
   File,
+  FileArchive,
   FileCode2,
+  FileText,
   FolderOpen,
   GitBranch,
   GitCommitHorizontal,
@@ -53,7 +55,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { getGitFileDiff, openGitFileFolder, pickAttachments, releaseAttachmentHandles } from "../lib/bridge";
+import { admitDroppedAttachment, getGitFileDiff, openGitFileFolder, pickAttachments, releaseAttachmentHandles } from "../lib/bridge";
 import { useDismissableLayer } from "../hooks/useDismissableLayer";
 import { useI18n, type AppLanguage } from "../i18n";
 import type {
@@ -94,6 +96,7 @@ interface ConversationViewProps {
   observedSubagent?: { activeSessionId: string; messages: ChatMessage[]; closed?: boolean; error?: string };
   inspectorOpen: boolean;
   changes: GitChange[];
+  resourceReloadSupported: boolean;
   onToggleInspector: () => void;
   onDraftChange: (draft: string) => void;
   onSend: (message: string, attachments: Attachment[], delivery?: "steer" | "follow_up") => Promise<void>;
@@ -110,17 +113,180 @@ interface ConversationViewProps {
   onOpenTerminal: () => void;
 }
 
+export interface ComposerSlashCommand {
+  name: string;
+  label: string;
+  description: string;
+  source: "prime" | "session" | "orbit";
+  behavior: "prompt" | "action";
+  action?: "compact" | "refine" | "reload_resources";
+  requiresArgument?: boolean;
+  disabledReason?: string;
+}
+
+export interface ActiveComposerSlashCommand {
+  command: ComposerSlashCommand;
+  argument: string;
+}
+
+const DRAFT_PERSIST_DEBOUNCE_MS = 180;
+
+/**
+ * Prime Agent remains authoritative for extensible slash commands. The
+ * session commands below are also parsed by Prime Agent, but are not included
+ * in its dynamic get_commands catalog.
+ */
+export function buildComposerSlashCommands(
+  commands: SlashCommand[],
+  language: AppLanguage,
+  resourceReloadSupported = true,
+): ComposerSlashCommand[] {
+  const entries: ComposerSlashCommand[] = [
+    {
+      name: "goal",
+      label: bi(language, "Objectif", "Goal"),
+      description: bi(language, "Définir un objectif persistant à poursuivre", "Set a persistent objective to pursue"),
+      source: "session",
+      behavior: "prompt",
+      requiresArgument: true,
+    },
+    {
+      name: "compact",
+      label: bi(language, "Compacter", "Compact"),
+      description: bi(language, "Résumer la session pour libérer du contexte", "Summarize the session to free context"),
+      source: "session",
+      behavior: "prompt",
+    },
+    {
+      name: "refine",
+      label: bi(language, "Raffiner", "Refine"),
+      description: bi(language, "Capitaliser les apprentissages de la session", "Capture what the session learned"),
+      source: "session",
+      behavior: "prompt",
+    },
+    {
+      name: "autonomous",
+      label: bi(language, "Mode autonome", "Autonomous mode"),
+      description: bi(language, "Afficher ou régler le mode autonome Prime Agent (status, on, off) — distinct des autorisations Orbit", "Show or set Prime Agent autonomous mode (status, on, off) — separate from Orbit permissions"),
+      source: "session",
+      behavior: "prompt",
+    },
+    {
+      name: "reload",
+      label: bi(language, "Recharger les ressources", "Reload resources"),
+      description: bi(language, "Recharger les réglages, skills, extensions, prompts et intégrations MCP", "Reload settings, skills, extensions, prompts, and MCP integrations"),
+      source: "session",
+      behavior: "action",
+      action: "reload_resources",
+      ...(resourceReloadSupported ? {} : {
+        disabledReason: bi(language, "Indisponible : l’intégration desktop /reload requiert une installation source ou gérée.", "Unavailable: desktop /reload requires a source or managed installation."),
+      }),
+    },
+  ];
+  const known = new Set(entries.map((entry) => entry.name));
+  for (const command of commands) {
+    const name = command.name.trim().replace(/^\/+/, "");
+    if (!name || /\s/.test(name) || known.has(name.toLowerCase())) continue;
+    known.add(name.toLowerCase());
+    entries.push({
+      name,
+      label: name.replace(/[-_]+/g, " "),
+      description: command.description?.trim() || command.source,
+      source: "prime",
+      behavior: "prompt",
+    });
+  }
+  return entries;
+}
+
+export function filterComposerSlashCommands(commands: ComposerSlashCommand[], query: string) {
+  const normalized = query.trim().toLocaleLowerCase();
+  if (!normalized) return commands;
+  return commands.filter((command) => (
+    `${command.name} ${command.label} ${command.description}`.toLocaleLowerCase().includes(normalized)
+  ));
+}
+
+export function resolveComposerActionSubmission(draft: string, commands: ComposerSlashCommand[]) {
+  const match = /^\/([^\s]+)(?:\s+([\s\S]*))?$/.exec(draft.trim());
+  if (!match) return undefined;
+  const command = commands.find((entry) => entry.name.toLocaleLowerCase() === match[1].toLocaleLowerCase());
+  if (!command || command.behavior !== "action" || !command.action) return undefined;
+  const argument = (match[2] ?? "").trim();
+  return {
+    command,
+    error: argument ? `/${command.name} n’accepte aucun argument.` : command.disabledReason,
+  };
+}
+
+export function parseActiveComposerSlashCommand(
+  draft: string,
+  commands: ComposerSlashCommand[],
+): ActiveComposerSlashCommand | undefined {
+  const match = draft.match(/^\/([^\s]+)\s([\s\S]*)$/);
+  if (!match) return undefined;
+  const command = commands.find((entry) => entry.behavior === "prompt" && entry.name.toLowerCase() === match[1]?.toLowerCase());
+  return command ? { command, argument: match[2] ?? "" } : undefined;
+}
+
+export function scheduleComposerDraftReport(
+  report: (value: string) => void,
+  value: string,
+  schedule: (callback: () => void, delay: number) => number,
+) {
+  return schedule(() => report(value), DRAFT_PERSIST_DEBOUNCE_MS);
+}
+
+export function moveSlashCommandSelection(current: number, count: number, direction: -1 | 1) {
+  if (count <= 0) return 0;
+  return (current + direction + count) % count;
+}
+
+export function resolveComposerDraftAfterSelection(
+  currentConversationId: string,
+  nextConversationId: string,
+  currentDraft: string,
+  reportedDraft: string,
+  nextPersistedDraft: string,
+) {
+  if (currentConversationId !== nextConversationId) return nextPersistedDraft;
+  return nextPersistedDraft === reportedDraft ? currentDraft : nextPersistedDraft;
+}
+
 export function ConversationView(props: ConversationViewProps) {
-  const { project, conversation, models, commands, stats, sessionState, schedules = [], heartbeat, heartbeats = [], subagents = [], observedSubagent, inspectorOpen, changes, onToggleInspector, onDraftChange, onSend, onMutateQueuedMessage, onRetryMessage, onAbort, onModel, onThinking, onRunCommand, onObserveSubagent, onForkMessage, onCloneSession, onNewWindow, onOpenTerminal } = props;
+  const { project, conversation, models, commands, stats, sessionState, schedules = [], heartbeat, heartbeats = [], subagents = [], observedSubagent, inspectorOpen, changes, resourceReloadSupported, onToggleInspector, onDraftChange, onSend, onMutateQueuedMessage, onRetryMessage, onAbort, onModel, onThinking, onRunCommand, onObserveSubagent, onForkMessage, onCloneSession, onNewWindow, onOpenTerminal } = props;
+  const { language } = useI18n();
   const isRunning = ["starting", "streaming", "tool", "queued"].includes(conversation.status);
   const [inspectorTab, setInspectorTab] = useState<"activity" | "session" | "changes" | "details">("changes");
   const [openPopover, setOpenPopover] = useState<ConversationPopover>(null);
+  const [restartDialogOpen, setRestartDialogOpen] = useState(false);
+  const [restartBusy, setRestartBusy] = useState(false);
+  const [restartError, setRestartError] = useState<string>();
   const closePopover = useCallback(() => setOpenPopover(null), []);
   const togglePopover = useCallback((popover: Exclude<ConversationPopover, null>) => {
     setOpenPopover((current) => current === popover ? null : popover);
   }, []);
   useDismissableLayer(openPopover, closePopover);
   useEffect(closePopover, [conversation.id, closePopover]);
+  useEffect(() => {
+    setRestartDialogOpen(false);
+    setRestartBusy(false);
+    setRestartError(undefined);
+  }, [conversation.id]);
+
+  const confirmEmergencyRestart = useCallback(async () => {
+    if (restartBusy) return;
+    setRestartBusy(true);
+    setRestartError(undefined);
+    try {
+      await onRunCommand("restart_agent");
+      setRestartDialogOpen(false);
+    } catch (error) {
+      setRestartError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRestartBusy(false);
+    }
+  }, [onRunCommand, restartBusy]);
 
   return (
     <div className="conversation-workspace">
@@ -130,6 +296,7 @@ export function ConversationView(props: ConversationViewProps) {
           conversation={conversation}
           models={models}
           sessionState={sessionState}
+          resourceReloadSupported={resourceReloadSupported}
           inspectorOpen={inspectorOpen}
           onModel={onModel}
           onToggleInspector={onToggleInspector}
@@ -137,6 +304,11 @@ export function ConversationView(props: ConversationViewProps) {
           onOpenTerminal={onOpenTerminal}
           onRunCommand={onRunCommand}
           onCloneSession={onCloneSession}
+          onEmergencyRestart={() => {
+            closePopover();
+            setRestartError(undefined);
+            setRestartDialogOpen(true);
+          }}
           openPopover={openPopover}
           onTogglePopover={togglePopover}
           onClosePopover={closePopover}
@@ -151,6 +323,7 @@ export function ConversationView(props: ConversationViewProps) {
           commands={commands}
           stats={stats}
           sessionState={sessionState}
+          resourceReloadSupported={resourceReloadSupported}
           isRunning={isRunning}
           onDraftChange={onDraftChange}
           onSend={onSend}
@@ -185,17 +358,30 @@ export function ConversationView(props: ConversationViewProps) {
           onDraftChange={onDraftChange}
         />
       ) : null}
+      {restartDialogOpen ? (
+        <Modal
+          title={bi(language, "Redémarrer la connexion Prime Agent ?", "Restart the Prime Agent connection?")}
+          description={bi(language, "Cette action force le remplacement du processus associé à cette conversation.", "This force-replaces the process associated with this conversation.")}
+          width="500px"
+          onClose={() => { if (!restartBusy) setRestartDialogOpen(false); }}
+          footer={<><Button variant="secondary" autoFocus disabled={restartBusy} onClick={() => setRestartDialogOpen(false)}>{bi(language, "Annuler", "Cancel")}</Button><Button variant="danger" loading={restartBusy} onClick={() => void confirmEmergencyRestart()}><RefreshCw size={15} />{bi(language, "Redémarrer maintenant", "Restart now")}</Button></>}
+        >
+          <div className="draft-replace-warning"><CircleAlert size={20} /><div><strong>{bi(language, "Le travail en cours et les messages non livrés seront annulés.", "Current work and undelivered messages will be cancelled.")}</strong><p>{bi(language, "L’historique persistant est conservé et seule cette conversation est concernée. Si son processus est déjà arrêté, Prime Orbit rouvrira sa connexion.", "Persistent history is preserved and only this conversation is affected. If its process has already stopped, Prime Orbit will reopen its connection.")}</p></div></div>
+          {restartError ? <p className="inline-error" role="alert"><CircleAlert size={16} />{restartError}</p> : null}
+        </Modal>
+      ) : null}
     </div>
   );
 }
 
 type ConversationPopover = "header-model" | "header-actions" | "composer-tools" | "composer-queue" | "composer-model" | "composer-thinking" | null;
 
-function ConversationHeader({ project, conversation, models, sessionState, inspectorOpen, onModel, onToggleInspector, onNewWindow, onOpenTerminal, onRunCommand, onCloneSession, openPopover, onTogglePopover, onClosePopover }: {
+function ConversationHeader({ project, conversation, models, sessionState, resourceReloadSupported, inspectorOpen, onModel, onToggleInspector, onNewWindow, onOpenTerminal, onRunCommand, onCloneSession, onEmergencyRestart, openPopover, onTogglePopover, onClosePopover }: {
   project: Project;
   conversation: Conversation;
   models: ModelInfo[];
   sessionState?: AgentSessionState;
+  resourceReloadSupported: boolean;
   inspectorOpen: boolean;
   onModel: (model: ModelInfo) => Promise<void>;
   onToggleInspector: () => void;
@@ -203,6 +389,7 @@ function ConversationHeader({ project, conversation, models, sessionState, inspe
   onOpenTerminal: () => void;
   onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>;
   onCloneSession: () => Promise<void>;
+  onEmergencyRestart: () => void;
   openPopover: ConversationPopover;
   onTogglePopover: (popover: Exclude<ConversationPopover, null>) => void;
   onClosePopover: () => void;
@@ -231,32 +418,53 @@ function ConversationHeader({ project, conversation, models, sessionState, inspe
         </IconButton>
         <div className="header-model-wrap" data-dismissable-layer="header-actions">
           <IconButton label={bi(language, "Plus d’actions", "More actions")} className={openPopover === "header-actions" ? "is-active" : ""} onClick={() => onTogglePopover("header-actions")}><MoreHorizontal size={18} /></IconButton>
-          {openPopover === "header-actions" ? <SessionActionsPopover sessionState={sessionState} onClone={() => { void onCloneSession(); onClosePopover(); }} onChoose={(type, fields, keepOpen) => { void onRunCommand(type, fields); if (!keepOpen) onClosePopover(); }} /> : null}
+          {openPopover === "header-actions" ? <SessionActionsPopover sessionState={sessionState} resourceReloadSupported={resourceReloadSupported} onClone={() => { void onCloneSession(); onClosePopover(); }} onEmergencyRestart={onEmergencyRestart} onChoose={async (type, fields, keepOpen) => { await onRunCommand(type, fields); if (!keepOpen) onClosePopover(); }} /> : null}
         </div>
       </div>
     </header>
   );
 }
 
-function SessionActionsPopover({ sessionState, onChoose, onClone }: {
+function SessionActionsPopover({ sessionState, resourceReloadSupported, onChoose, onClone, onEmergencyRestart }: {
   sessionState?: AgentSessionState;
-  onChoose: (type: string, fields?: Record<string, unknown>, keepOpen?: boolean) => void;
+  resourceReloadSupported: boolean;
+  onChoose: (type: string, fields?: Record<string, unknown>, keepOpen?: boolean) => Promise<void>;
   onClone: () => void;
+  onEmergencyRestart: () => void;
 }) {
   const { language } = useI18n();
+  const [busyAction, setBusyAction] = useState<string>();
+  const [actionError, setActionError] = useState<string>();
   const steeringMode = sessionState?.steeringMode ?? "one-at-a-time";
   const followUpMode = sessionState?.followUpMode ?? "one-at-a-time";
+  const runAction = async (type: string, fields?: Record<string, unknown>, keepOpen?: boolean) => {
+    if (busyAction) return;
+    setBusyAction(type);
+    setActionError(undefined);
+    try {
+      await onChoose(type, fields, keepOpen);
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusyAction(undefined);
+    }
+  };
   return (
     <div className="popover session-actions-popover">
       <div className="popover-label">{bi(language, "Session", "Session")}</div>
       <button type="button" onClick={onClone}><Copy size={15} /><span><strong>{bi(language, "Dupliquer la session", "Duplicate session")}</strong><small>{bi(language, "Conserver l’origine et ouvrir une copie", "Keep the source and open a copy")}</small></span></button>
-      <button type="button" onClick={() => onChoose("export_html")}><ArrowDown size={15} /><span><strong>{bi(language, "Exporter en HTML", "Export as HTML")}</strong><small>{bi(language, "Créer une copie lisible de la session", "Create a readable copy of the session")}</small></span></button>
+      <button type="button" disabled={Boolean(busyAction)} onClick={() => void runAction("export_html")}><ArrowDown size={15} /><span><strong>{bi(language, "Exporter en HTML", "Export as HTML")}</strong><small>{bi(language, "Choisir le dossier et le nom du fichier", "Choose the folder and file name")}</small></span>{busyAction === "export_html" ? <LoaderCircle size={14} className="spin" /> : null}</button>
       <div className="popover-separator" />
       <div className="popover-label">{bi(language, "Comportement", "Behavior")}</div>
-      <button type="button" onClick={() => onChoose("set_auto_compaction", { enabled: !sessionState?.autoCompactionEnabled })}><ArchiveRestore size={15} /><span><strong>{bi(language, "Compactage automatique", "Automatic compaction")}</strong><small>{sessionState?.autoCompactionEnabled ? bi(language, "Activé · cliquer pour désactiver", "Enabled · click to disable") : bi(language, "Désactivé · cliquer pour activer", "Disabled · click to enable")}</small></span><Badge tone={sessionState?.autoCompactionEnabled ? "success" : "neutral"}>{sessionState?.autoCompactionEnabled ? "On" : "Off"}</Badge></button>
-      <QueueModeRow icon={<Layers3 size={15} />} title={bi(language, "Orienter le travail en cours", "Steer current work")} detail={bi(language, "Livré après les outils du tour actuel, avant le prochain appel au modèle.", "Delivered after the current turn's tools, before the next model call.")} mode={steeringMode} language={language} onMode={(mode) => onChoose("set_steering_mode", { mode }, true)} />
-      <QueueModeRow icon={<Clock3 size={15} />} title={bi(language, "Démarrer un nouveau tour ensuite", "Start a follow-up turn")} detail={bi(language, "Attend la fin complète de l’exécution, puis démarre un nouveau tour utilisateur.", "Waits for the run to finish, then starts a new user turn.")} mode={followUpMode} language={language} onMode={(mode) => onChoose("set_follow_up_mode", { mode }, true)} />
-      <button type="button" onClick={() => onChoose("get_state")}><RefreshCw size={15} /><span><strong>{bi(language, "Resynchroniser", "Resync")}</strong><small>{bi(language, "Recharger l’état de Prime Agent", "Reload Prime Agent state")}</small></span></button>
+      <button type="button" disabled={Boolean(busyAction)} onClick={() => void runAction("set_auto_compaction", { enabled: !sessionState?.autoCompactionEnabled })}><ArchiveRestore size={15} /><span><strong>{bi(language, "Compactage automatique", "Automatic compaction")}</strong><small>{sessionState?.autoCompactionEnabled ? bi(language, "Activé · cliquer pour désactiver", "Enabled · click to disable") : bi(language, "Désactivé · cliquer pour activer", "Disabled · click to enable")}</small></span><Badge tone={sessionState?.autoCompactionEnabled ? "success" : "neutral"}>{sessionState?.autoCompactionEnabled ? "On" : "Off"}</Badge></button>
+      <QueueModeRow icon={<Layers3 size={15} />} title={bi(language, "Orienter le travail en cours", "Steer current work")} detail={bi(language, "Livré après les outils du tour actuel, avant le prochain appel au modèle.", "Delivered after the current turn's tools, before the next model call.")} mode={steeringMode} language={language} onMode={(mode) => void runAction("set_steering_mode", { mode }, true)} />
+      <QueueModeRow icon={<Clock3 size={15} />} title={bi(language, "Démarrer un nouveau tour ensuite", "Start a follow-up turn")} detail={bi(language, "Attend la fin complète de l’exécution, puis démarre un nouveau tour utilisateur.", "Waits for the run to finish, then starts a new user turn.")} mode={followUpMode} language={language} onMode={(mode) => void runAction("set_follow_up_mode", { mode }, true)} />
+      <div className="popover-separator" />
+      <div className="popover-label">{bi(language, "Diagnostic", "Diagnostics")}</div>
+      <button type="button" disabled={Boolean(busyAction)} onClick={() => void runAction("get_state")}><RefreshCw size={15} /><span><strong>{bi(language, "Actualiser l’état", "Refresh state")}</strong><small>{bi(language, "Relire l’état sans interrompre Prime Agent", "Read state again without interrupting Prime Agent")}</small></span>{busyAction === "get_state" ? <LoaderCircle size={14} className="spin" /> : null}</button>
+      <button type="button" className={!resourceReloadSupported ? "is-capability-unavailable" : undefined} disabled={Boolean(busyAction) || !resourceReloadSupported} onClick={() => void runAction("reload_resources")}><RefreshCw size={15} /><span><strong>{bi(language, "Recharger les ressources", "Reload resources")}</strong><small>{resourceReloadSupported ? bi(language, "Réappliquer réglages, skills, extensions, prompts et MCP", "Reapply settings, skills, extensions, prompts, and MCP") : bi(language, "Indisponible avec l’exécutable système", "Unavailable with the system executable")}</small></span>{busyAction === "reload_resources" ? <LoaderCircle size={14} className="spin" /> : null}</button>
+      <button type="button" disabled={Boolean(busyAction)} className="session-danger-action" onClick={onEmergencyRestart}><CircleAlert size={15} /><span><strong>{bi(language, "Redémarrage d’urgence", "Emergency restart")}</strong><small>{bi(language, "Relancer uniquement cette connexion et annuler son travail en cours", "Restart only this connection and cancel its current work")}</small></span></button>
+      {actionError ? <div className="popover-inline-error" role="alert"><CircleAlert size={14} /><span>{actionError}</span></div> : null}
     </div>
   );
 }
@@ -511,10 +719,42 @@ function AttachmentStrip({ attachments }: { attachments: Attachment[] }) {
       {attachments.map((attachment) => (
         attachment.isImage && attachment.previewDataUrl
           ? <figure key={attachment.id}><img src={attachment.previewDataUrl} alt={attachment.name} /><figcaption>{attachment.name} · {formatBytes(attachment.size, language, locale)}</figcaption></figure>
-          : <div key={attachment.id} className="file-attachment">{attachment.isImage ? <Image size={17} /> : <File size={17} />}<span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size, language, locale)}</small></span></div>
+          : <div key={attachment.id} className="file-attachment"><AttachmentGlyph attachment={attachment} size={17} /><span><strong>{attachment.name}</strong><small>{attachmentMetaLabel(attachment, language, locale)}</small></span></div>
       ))}
     </div>
   );
+}
+
+function attachmentExtension(attachment: Pick<Attachment, "name" | "mimeType" | "isImage">) {
+  const extension = attachment.name.match(/\.([a-z0-9]{1,10})$/i)?.[1];
+  if (extension) return extension.toUpperCase();
+  if (attachment.isImage) return "IMAGE";
+  const subtype = attachment.mimeType.split("/", 2)[1]?.split(/[;+]/, 1)[0];
+  return subtype && subtype.length <= 12 ? subtype.toUpperCase() : "FILE";
+}
+
+function attachmentVisualKind(attachment: Pick<Attachment, "name" | "mimeType" | "isImage">) {
+  if (attachment.isImage) return "image";
+  const extension = attachmentExtension(attachment).toLowerCase();
+  const mimeType = attachment.mimeType.toLowerCase();
+  if (["zip", "7z", "rar", "tar", "gz", "bz2", "xz"].includes(extension)) return "archive";
+  if (/^(?:text\/|application\/(?:json|javascript|typescript|xml|toml|yaml))/.test(mimeType)
+    || ["js", "jsx", "ts", "tsx", "py", "rs", "go", "java", "c", "cpp", "h", "cs", "vue", "svelte", "json", "toml", "yaml", "yml", "xml", "html", "css", "md"].includes(extension)) return "code";
+  if (["pdf", "doc", "docx", "odt", "rtf", "txt"].includes(extension)) return "document";
+  return "file";
+}
+
+function AttachmentGlyph({ attachment, size }: { attachment: Attachment; size: number }) {
+  const kind = attachmentVisualKind(attachment);
+  if (kind === "image") return <Image size={size} />;
+  if (kind === "archive") return <FileArchive size={size} />;
+  if (kind === "code") return <FileCode2 size={size} />;
+  if (kind === "document") return <FileText size={size} />;
+  return <File size={size} />;
+}
+
+function attachmentMetaLabel(attachment: Attachment, language: AppLanguage, locale: string) {
+  return `${attachmentExtension(attachment)} · ${formatBytes(attachment.size, language, locale)}`;
 }
 
 function PythonExecutionGroup({ tools }: { tools: ToolActivity[] }) {
@@ -636,13 +876,56 @@ function ActiveRunBar({ conversation, onAbort, onActivity }: { conversation: Con
   );
 }
 
-function Composer({ project, conversation, models, commands, stats, sessionState, isRunning, onDraftChange, onSend, onMutateQueuedMessage, onAbort, onModel, onThinking, onRunCommand, openPopover, onTogglePopover, onClosePopover }: {
+/** Attachment handles are ephemeral native capabilities, so they are kept in
+ * this renderer window only. This preserves an unsent composer when navigating
+ * between conversations without ever serializing the handles to app state. */
+const conversationAttachmentDrafts = new Map<string, Attachment[]>();
+const discardedConversationAttachmentDrafts = new Set<string>();
+
+export function getConversationAttachmentDraft(conversationId: string): Attachment[] {
+  return [...(conversationAttachmentDrafts.get(conversationId) ?? [])];
+}
+
+export function rememberConversationAttachmentDraft(conversationId: string, attachments: Attachment[]) {
+  if (discardedConversationAttachmentDrafts.has(conversationId)) {
+    conversationAttachmentDrafts.delete(conversationId);
+    const handles = attachmentHandles(attachments);
+    if (handles.length) void releaseAttachmentHandles(handles).catch(() => undefined);
+    return;
+  }
+  if (attachments.length) conversationAttachmentDrafts.set(conversationId, [...attachments]);
+  else conversationAttachmentDrafts.delete(conversationId);
+}
+
+function activateConversationAttachmentDraft(conversationId: string): Attachment[] {
+  discardedConversationAttachmentDrafts.delete(conversationId);
+  return getConversationAttachmentDraft(conversationId);
+}
+
+export async function releaseConversationAttachmentDrafts(conversationIds: string | string[]) {
+  const ids = Array.isArray(conversationIds) ? conversationIds : [conversationIds];
+  const handles = new Set<string>();
+  ids.forEach((conversationId) => {
+    discardedConversationAttachmentDrafts.add(conversationId);
+    const cached = conversationAttachmentDrafts.get(conversationId) ?? [];
+    attachmentHandles(cached).forEach((handle) => handles.add(handle));
+    conversationAttachmentDrafts.delete(conversationId);
+  });
+  if (handles.size) await releaseAttachmentHandles([...handles]);
+}
+
+export async function releaseAllConversationAttachmentDrafts() {
+  await releaseConversationAttachmentDrafts([...conversationAttachmentDrafts.keys()]);
+}
+
+function Composer({ project, conversation, models, commands, stats, sessionState, resourceReloadSupported, isRunning, onDraftChange, onSend, onMutateQueuedMessage, onAbort, onModel, onThinking, onRunCommand, openPopover, onTogglePopover, onClosePopover }: {
   project: Project;
   conversation: Conversation;
   models: ModelInfo[];
   commands: SlashCommand[];
   stats?: SessionStats;
   sessionState?: AgentSessionState;
+  resourceReloadSupported: boolean;
   isRunning: boolean;
   onDraftChange: (draft: string) => void;
   onSend: (message: string, attachments: Attachment[], delivery?: "steer" | "follow_up") => Promise<void>;
@@ -658,62 +941,235 @@ function Composer({ project, conversation, models, commands, stats, sessionState
   const { language, locale } = useI18n();
   const [draft, setDraft] = useState(conversation.draft);
   const draftRef = useRef(conversation.draft);
-  const [attachments, setAttachments] = useState<Attachment[]>([]);
-  const attachmentsRef = useRef<Attachment[]>([]);
+  const reportedDraftRef = useRef(conversation.draft);
+  const draftChangeRef = useRef(onDraftChange);
+  const conversationIdRef = useRef(conversation.id);
+  const pendingDraftReports = useRef(new Map<string, { timer: number; report: (value: string) => void; value: string }>());
+  const [attachments, setAttachments] = useState<Attachment[]>(() => (
+    activateConversationAttachmentDraft(conversation.id)
+  ));
+  const attachmentsRef = useRef<Attachment[]>(attachments);
   const submittingRef = useRef(false);
   const [adding, setAdding] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const dragDepthRef = useRef(0);
+  const dropAdmissionBusyRef = useRef(false);
+  const dropAdmissionGenerationRef = useRef(0);
   const [attachmentError, setAttachmentError] = useState<string>();
   const [queueEditor, setQueueEditor] = useState<{ id: string; text: string }>();
   const [queueBusyId, setQueueBusyId] = useState<string>();
   const [queueError, setQueueError] = useState<string>();
+  const [slashSelection, setSlashSelection] = useState(0);
+  const [slashDismissed, setSlashDismissed] = useState(false);
+  const [composerFocused, setComposerFocused] = useState(false);
+  const [commandError, setCommandError] = useState<string>();
   const textarea = useRef<HTMLTextAreaElement>(null);
+  const slashList = useRef<HTMLDivElement>(null);
   const activeModel = models.find((model) => `${model.provider}/${model.id}` === conversation.model);
+  const slashCommands = useMemo(
+    () => buildComposerSlashCommands(commands, language, resourceReloadSupported),
+    [commands, language, resourceReloadSupported],
+  );
+  const activeSlashCommand = parseActiveComposerSlashCommand(draft, slashCommands);
+  const editorValue = activeSlashCommand?.argument ?? draft;
+  const slashQuery = !activeSlashCommand && editorValue.startsWith("/") && !/\s/.test(editorValue)
+    ? editorValue.slice(1)
+    : undefined;
+  const filteredSlashCommands = useMemo(() => slashQuery === undefined
+    ? []
+    : filterComposerSlashCommands(slashCommands, slashQuery), [slashCommands, slashQuery]);
+  const slashPaletteOpen = composerFocused && !slashDismissed && filteredSlashCommands.length > 0;
+  const hasDraftContent = !slashDismissed && slashQuery !== undefined && filteredSlashCommands.length > 0
+    ? false
+    : activeSlashCommand?.command.requiresArgument
+      ? activeSlashCommand.argument.trim().length > 0
+      : draft.trim().length > 0;
+  const hasComposerContent = activeSlashCommand?.command.requiresArgument
+    ? hasDraftContent
+    : hasDraftContent || attachments.length > 0;
 
+  const cancelDraftReport = useCallback((conversationId: string) => {
+    const pending = pendingDraftReports.current.get(conversationId);
+    if (!pending) return;
+    window.clearTimeout(pending.timer);
+    pendingDraftReports.current.delete(conversationId);
+  }, []);
+  const reportDraftNow = useCallback((value: string) => {
+    const conversationId = conversationIdRef.current;
+    cancelDraftReport(conversationId);
+    reportedDraftRef.current = value;
+    draftChangeRef.current(value);
+  }, [cancelDraftReport]);
+  const scheduleDraftReport = useCallback((value: string) => {
+    const conversationId = conversationIdRef.current;
+    cancelDraftReport(conversationId);
+    // Capture the conversation-scoped callback. Even if the parent swaps its
+    // selection before the timeout fires, draft A can never be written to B.
+    const report = draftChangeRef.current;
+    const pending = { timer: 0, report, value };
+    pending.timer = scheduleComposerDraftReport((scheduledValue) => {
+      if (pendingDraftReports.current.get(conversationId) === pending) {
+        pendingDraftReports.current.delete(conversationId);
+      }
+      if (conversationIdRef.current === conversationId) reportedDraftRef.current = scheduledValue;
+      report(scheduledValue);
+    }, value, (callback, delay) => window.setTimeout(callback, delay));
+    pendingDraftReports.current.set(conversationId, pending);
+  }, [cancelDraftReport]);
+
+  useEffect(() => { draftChangeRef.current = onDraftChange; }, [onDraftChange]);
   useEffect(() => {
-    setDraft(conversation.draft);
-    draftRef.current = conversation.draft;
-  }, [conversation.draft]);
+    const previousConversationId = conversationIdRef.current;
+    const nextDraft = resolveComposerDraftAfterSelection(
+      previousConversationId,
+      conversation.id,
+      draftRef.current,
+      reportedDraftRef.current,
+      conversation.draft,
+    );
+    conversationIdRef.current = conversation.id;
+    if (previousConversationId === conversation.id && nextDraft === draftRef.current) return;
+    if (previousConversationId === conversation.id) cancelDraftReport(conversation.id);
+    else {
+      setSlashDismissed(false);
+      setCommandError(undefined);
+    }
+    reportedDraftRef.current = conversation.draft;
+    setDraft(nextDraft);
+    draftRef.current = nextDraft;
+  }, [cancelDraftReport, conversation.draft, conversation.id]);
   useEffect(() => {
-    const abandonedHandles = attachmentHandles(attachmentsRef.current);
-    attachmentsRef.current = [];
-    setAttachments([]);
+    dropAdmissionGenerationRef.current += 1;
+    dropAdmissionBusyRef.current = false;
+    dragDepthRef.current = 0;
+    setAdding(false);
+    setDragging(false);
     setAttachmentError(undefined);
     setQueueEditor(undefined);
     setQueueBusyId(undefined);
     setQueueError(undefined);
-    void releaseAttachmentHandles(abandonedHandles).catch(() => undefined);
+    return () => {
+      rememberConversationAttachmentDraft(conversation.id, attachmentsRef.current);
+      // Invalidate every raw attachment admission still awaiting native
+      // validation. Its eventual handle is released by the guarded drop flow.
+      dropAdmissionGenerationRef.current += 1;
+      dropAdmissionBusyRef.current = false;
+    };
   }, [conversation.id]);
+  useEffect(() => {
+    rememberConversationAttachmentDraft(conversation.id, attachments);
+  }, [attachments, conversation.id]);
   useEffect(() => () => {
-    void releaseAttachmentHandles(attachmentHandles(attachmentsRef.current)).catch(() => undefined);
+    for (const [conversationId, pending] of pendingDraftReports.current) {
+      window.clearTimeout(pending.timer);
+      pending.report(pending.value);
+      if (conversationId === conversationIdRef.current) reportedDraftRef.current = pending.value;
+    }
+    pendingDraftReports.current.clear();
+    if (draftRef.current !== reportedDraftRef.current) {
+      reportedDraftRef.current = draftRef.current;
+      draftChangeRef.current(draftRef.current);
+    }
   }, []);
   useEffect(() => {
     const node = textarea.current;
     if (!node) return;
     node.style.height = "auto";
     node.style.height = `${Math.min(node.scrollHeight, 210)}px`;
-  }, [draft]);
+  }, [editorValue]);
+  useEffect(() => {
+    setSlashSelection(0);
+  }, [slashQuery, filteredSlashCommands.length]);
+  useEffect(() => {
+    if (!slashPaletteOpen) return;
+    slashList.current?.querySelector<HTMLElement>(".is-selected")?.scrollIntoView({ block: "nearest" });
+  }, [slashPaletteOpen, slashSelection]);
 
   const updateDraft = (value: string) => {
     setDraft(value);
     draftRef.current = value;
-    onDraftChange(value);
+    setSlashDismissed(false);
+    setCommandError(undefined);
+    scheduleDraftReport(value);
+  };
+
+  const updateEditorValue = (value: string) => {
+    updateDraft(activeSlashCommand ? `/${activeSlashCommand.command.name} ${value}` : value);
+  };
+
+  const clearActiveSlashCommand = () => {
+    if (!activeSlashCommand) return;
+    updateDraft(activeSlashCommand.argument);
+    requestAnimationFrame(() => textarea.current?.focus());
+  };
+
+  const chooseSlashCommand = async (command: ComposerSlashCommand) => {
+    setSlashDismissed(true);
+    setCommandError(undefined);
+    if (command.disabledReason) {
+      setCommandError(command.disabledReason);
+      return;
+    }
+    if (command.behavior === "action" && command.action) {
+      updateDraft("");
+      reportDraftNow("");
+      try {
+        await onRunCommand(command.action);
+      } catch (error) {
+        setCommandError(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+    updateDraft(`/${command.name} `);
+    requestAnimationFrame(() => textarea.current?.focus());
   };
 
   const submit = async (delivery?: "steer" | "follow_up") => {
-    if ((!draft.trim() && attachments.length === 0) || adding || submittingRef.current) return;
+    const actionSubmission = resolveComposerActionSubmission(draft, slashCommands);
+    if (actionSubmission) {
+      if (submittingRef.current) return;
+      if (actionSubmission.error) {
+        setCommandError(actionSubmission.error);
+        return;
+      }
+      submittingRef.current = true;
+      setCommandError(undefined);
+      try {
+        await onRunCommand(actionSubmission.command.action!);
+        updateDraft("");
+        reportDraftNow("");
+      } catch (error) {
+        setCommandError(error instanceof Error ? error.message : String(error));
+      } finally {
+        submittingRef.current = false;
+      }
+      return;
+    }
+    if (!hasComposerContent || adding || submittingRef.current) return;
     submittingRef.current = true;
+    const submittedConversationId = conversationIdRef.current;
+    const submittedGeneration = dropAdmissionGenerationRef.current;
     const sentDraft = draft;
     const sentAttachments = attachments;
     setDraft("");
     draftRef.current = "";
     setAttachments([]);
     attachmentsRef.current = [];
+    rememberConversationAttachmentDraft(submittedConversationId, []);
     setAttachmentError(undefined);
-    onDraftChange("");
+    reportDraftNow("");
     try {
       await onSend(sentDraft, sentAttachments, delivery);
     } catch (error) {
+      if (!shouldRestoreAttachmentSubmission(
+        submittedConversationId,
+        submittedGeneration,
+        conversationIdRef.current,
+        dropAdmissionGenerationRef.current,
+      )) {
+        await releaseAttachmentHandles(attachmentHandles(sentAttachments)).catch(() => undefined);
+        return;
+      }
       const currentDraft = draftRef.current;
       const restoredDraft = !currentDraft.trim() || currentDraft === sentDraft
         ? sentDraft
@@ -726,18 +1182,47 @@ function Composer({ project, conversation, models, commands, stats, sessionState
       draftRef.current = restoredDraft;
       setAttachments(restored.attachments);
       attachmentsRef.current = restored.attachments;
+      rememberConversationAttachmentDraft(submittedConversationId, restored.attachments);
       setAttachmentError(
         restored.issue
           ? attachmentIssueLabel(restored.issue, language)
           : attachmentSubmitError(error, language),
       );
-      onDraftChange(restoredDraft);
+      reportDraftNow(restoredDraft);
     } finally {
       submittingRef.current = false;
     }
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (slashPaletteOpen) {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setSlashSelection((current) => moveSlashCommandSelection(current, filteredSlashCommands.length, 1));
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setSlashSelection((current) => moveSlashCommandSelection(current, filteredSlashCommands.length, -1));
+        return;
+      }
+      if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault();
+        const command = filteredSlashCommands[slashSelection] ?? filteredSlashCommands[0];
+        if (command) void chooseSlashCommand(command);
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setSlashDismissed(true);
+        return;
+      }
+    }
+    if (event.key === "Backspace" && activeSlashCommand && !editorValue && event.currentTarget.selectionStart === 0) {
+      event.preventDefault();
+      clearActiveSlashCommand();
+      return;
+    }
     if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault();
       void submit(isRunning ? "follow_up" : undefined);
@@ -753,42 +1238,53 @@ function Composer({ project, conversation, models, commands, stats, sessionState
     );
     void releaseAttachmentHandles(rejectedHandles).catch(() => undefined);
     attachmentsRef.current = result.attachments;
+    rememberConversationAttachmentDraft(conversation.id, result.attachments);
     setAttachments(result.attachments);
     setAttachmentError(result.issue ? attachmentIssueLabel(result.issue, language) : undefined);
   };
 
   const addFiles = async () => {
+    if (dropAdmissionBusyRef.current) return;
+    const admissionGeneration = dropAdmissionGenerationRef.current;
+    const admissionIsCurrent = () => dropAdmissionGenerationRef.current === admissionGeneration;
+    dropAdmissionBusyRef.current = true;
     setAdding(true);
     setAttachmentError(undefined);
     try {
       const current = attachmentsRef.current;
       const remainingCount = Math.max(0, MAX_ATTACHMENT_COUNT - current.length);
-      const currentImageBytes = current.reduce(
-        (total, attachment) => total + (attachment.isImage ? attachment.size : 0),
-        0,
-      );
+      const currentAttachmentBytes = totalAttachmentBytes(current);
+      const currentImageBytes = totalImageAttachmentBytes(current);
       if (remainingCount === 0) {
         setAttachmentError(attachmentIssueLabel("count", language));
         return;
       }
       const results = await pickAttachments(
         remainingCount,
+        Math.max(0, MAX_TOTAL_ATTACHMENT_BYTES - currentAttachmentBytes),
         Math.max(0, MAX_TOTAL_IMAGE_BYTES - currentImageBytes),
       );
-      acceptAttachments(results.map((result) => ({
+      const admitted = results.map((result) => ({
         id: crypto.randomUUID(),
         name: result.name,
-        path: result.path,
         mimeType: result.mimeType,
         size: result.size,
         attachmentHandle: result.attachmentHandle,
         previewDataUrl: result.previewDataUrl,
         isImage: result.isImage,
-      })));
+      }));
+      if (!admissionIsCurrent()) {
+        await releaseAttachmentHandles(attachmentHandles(admitted)).catch(() => undefined);
+        return;
+      }
+      acceptAttachments(admitted);
     } catch (error) {
-      setAttachmentError(error instanceof Error ? error.message : String(error));
+      if (admissionIsCurrent()) setAttachmentError(attachmentDropError(error, language));
     } finally {
-      setAdding(false);
+      if (admissionIsCurrent()) {
+        dropAdmissionBusyRef.current = false;
+        setAdding(false);
+      }
     }
   };
 
@@ -796,15 +1292,108 @@ function Composer({ project, conversation, models, commands, stats, sessionState
     const files = Array.from(event.clipboardData.files);
     if (!files.length) return;
     event.preventDefault();
-    setAttachmentError(attachmentIssueLabel("native-picker-required", language));
+    void admitFiles(files);
   };
 
-  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+  const handleDragEnter = (event: DragEvent<HTMLDivElement>) => {
+    if (!event.dataTransfer.types.includes("Files")) return;
     event.preventDefault();
+    dragDepthRef.current += 1;
+    setDragging(true);
+  };
+
+  const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  };
+
+  const handleDragLeave = (event: DragEvent<HTMLDivElement>) => {
+    if (dragDepthRef.current === 0) return;
+    event.preventDefault();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragging(false);
+  };
+
+  const handleDrop = async (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    dragDepthRef.current = 0;
     setDragging(false);
     const files = Array.from(event.dataTransfer.files);
-    if (!files.length) return;
-    setAttachmentError(attachmentIssueLabel("native-picker-required", language));
+    await admitFiles(files);
+  };
+
+  const admitFiles = async (files: File[]) => {
+    if (!files.length || adding || dropAdmissionBusyRef.current) return;
+    const current = attachmentsRef.current;
+    if (current.length + files.length > MAX_ATTACHMENT_COUNT) {
+      setAttachmentError(attachmentIssueLabel("count", language));
+      return;
+    }
+    if (files.some((file) => isSupportedDroppedImage(file)
+      ? file.size > MAX_IMAGE_ATTACHMENT_BYTES
+      : file.size > MAX_DOCUMENT_ATTACHMENT_BYTES)) {
+      const oversizedImage = files.some((file) => isSupportedDroppedImage(file) && file.size > MAX_IMAGE_ATTACHMENT_BYTES);
+      setAttachmentError(attachmentIssueLabel(oversizedImage ? "image-size" : "document-size", language));
+      return;
+    }
+    const currentAttachmentBytes = totalAttachmentBytes(current);
+    const currentImageBytes = totalImageAttachmentBytes(current);
+    const droppedAttachmentBytes = files.reduce((total, file) => total + file.size, 0);
+    if (currentAttachmentBytes + droppedAttachmentBytes > MAX_TOTAL_ATTACHMENT_BYTES) {
+      setAttachmentError(attachmentIssueLabel("attachment-total", language));
+      return;
+    }
+    const droppedImageBytes = files.reduce(
+      (total, file) => total + (isSupportedDroppedImage(file) ? file.size : 0),
+      0,
+    );
+    if (currentImageBytes + droppedImageBytes > MAX_TOTAL_IMAGE_BYTES) {
+      setAttachmentError(attachmentIssueLabel("image-total", language));
+      return;
+    }
+
+    const admissionGeneration = dropAdmissionGenerationRef.current;
+    const admissionIsCurrent = () => dropAdmissionGenerationRef.current === admissionGeneration;
+    dropAdmissionBusyRef.current = true;
+    setAdding(true);
+    setAttachmentError(undefined);
+    const admitted: Attachment[] = [];
+    let remainingAttachmentBytes = MAX_TOTAL_ATTACHMENT_BYTES - currentAttachmentBytes;
+    let remainingImageBytes = MAX_TOTAL_IMAGE_BYTES - currentImageBytes;
+    try {
+      for (const file of files) {
+        const result = await admitDroppedAttachment(file, remainingAttachmentBytes, remainingImageBytes);
+        admitted.push({
+          id: crypto.randomUUID(),
+          name: result.name,
+          mimeType: result.mimeType,
+          size: result.size,
+          attachmentHandle: result.attachmentHandle,
+          previewDataUrl: result.previewDataUrl,
+          isImage: result.isImage,
+        });
+        if (!admissionIsCurrent()) {
+          await releaseAttachmentHandles(attachmentHandles(admitted)).catch(() => undefined);
+          return;
+        }
+        remainingAttachmentBytes = Math.max(0, remainingAttachmentBytes - result.size);
+        if (result.isImage) remainingImageBytes = Math.max(0, remainingImageBytes - result.size);
+      }
+      if (!admissionIsCurrent()) {
+        await releaseAttachmentHandles(attachmentHandles(admitted)).catch(() => undefined);
+        return;
+      }
+      acceptAttachments(admitted);
+    } catch (error) {
+      await releaseAttachmentHandles(attachmentHandles(admitted)).catch(() => undefined);
+      if (admissionIsCurrent()) setAttachmentError(attachmentDropError(error, language));
+    } finally {
+      if (admissionIsCurrent()) {
+        dropAdmissionBusyRef.current = false;
+        setAdding(false);
+      }
+    }
   };
 
   const contextPercent = stats?.contextUsage?.percent;
@@ -844,14 +1433,42 @@ function Composer({ project, conversation, models, commands, stats, sessionState
     void applyQueuedMutation(item, { type: "replace", text, lane: item.lane });
   };
   return (
-    <div className={`composer-shell ${dragging ? "is-dragging" : ""}`} onDragEnter={(event) => { event.preventDefault(); setDragging(true); }} onDragOver={(event) => event.preventDefault()} onDragLeave={(event) => event.currentTarget === event.target && setDragging(false)} onDrop={handleDrop}>
-      {dragging ? <div className="drop-overlay"><Paperclip size={24} /><strong>{bi(language, "Utilisez + pour autoriser ces fichiers", "Use + to authorize these files")}</strong></div> : null}
+    <div className={`composer-shell ${dragging ? "is-dragging" : ""}`} onDragEnter={handleDragEnter} onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={(event) => void handleDrop(event)}>
+      {slashPaletteOpen ? (
+        <div className="slash-command-palette">
+          <div className="slash-command-palette-header">
+            <span>{bi(language, "Commandes", "Commands")}</span>
+            <small><kbd>↑</kbd><kbd>↓</kbd> {bi(language, "naviguer", "navigate")} · <kbd>↵</kbd> {bi(language, "appliquer", "apply")}</small>
+          </div>
+          <div className="slash-command-list" id="composer-slash-command-list" ref={slashList} role="listbox" aria-label={bi(language, "Commandes disponibles", "Available commands")}>
+            {filteredSlashCommands.map((command, index) => (
+              <button
+                type="button"
+                role="option"
+                id={`composer-slash-command-${index}`}
+                aria-selected={index === slashSelection}
+                aria-disabled={Boolean(command.disabledReason)}
+                className={`${index === slashSelection ? "is-selected" : ""}${command.disabledReason ? " is-disabled" : ""}`}
+                key={`${command.source}:${command.name}`}
+                onMouseDown={(event) => event.preventDefault()}
+                onMouseEnter={() => setSlashSelection(index)}
+                onClick={() => void chooseSlashCommand(command)}
+              >
+                <span className="slash-command-icon">{slashCommandIcon(command)}</span>
+                <span className="slash-command-copy"><strong>/{command.name}</strong><small>{command.description}</small></span>
+                <span className="slash-command-source">{command.source === "session" ? bi(language, "Prime Agent · session", "Prime Agent · session") : command.source === "prime" ? "Prime Agent" : "Orbit"}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
+      {dragging ? <div className="drop-overlay"><Paperclip size={24} /><strong>{bi(language, "Déposez pour joindre ces fichiers", "Drop to attach these files")}</strong></div> : null}
       {queuedRows.length ? (
         <div className="queued-message-tray" aria-label={bi(language, "Instructions en attente", "Queued instructions")}>
           {queuedRows.map((item) => {
             const editing = queueEditor?.id === item.id;
             const busy = queueBusyId === item.id;
-            const editBlocked = item.index === undefined || Boolean(item.attachments?.length);
+            const editBlocked = item.index === undefined;
             return (
               <div className={`queued-message-row ${editing ? "is-editing" : ""}`} key={item.id}>
                 <span className="queued-message-icon">{busy ? <LoaderCircle size={13} className="spin" /> : <Layers3 size={13} />}</span>
@@ -879,7 +1496,7 @@ function Composer({ project, conversation, models, commands, stats, sessionState
                     </>
                   ) : (
                     <>
-                      <IconButton label={item.attachments?.length ? bi(language, "Les messages avec pièces jointes ne peuvent pas être modifiés après envoi", "Messages with attachments cannot be edited after sending") : bi(language, "Modifier le message en attente", "Edit queued message")} onClick={() => { setQueueEditor({ id: item.id, text: item.expectedText }); setQueueError(undefined); }} disabled={editBlocked || busy}><Pencil size={13} /></IconButton>
+                      <IconButton label={bi(language, "Modifier le message en attente", "Edit queued message")} onClick={() => { setQueueEditor({ id: item.id, text: item.expectedText }); setQueueError(undefined); }} disabled={editBlocked || busy}><Pencil size={13} /></IconButton>
                       <IconButton label={bi(language, "Supprimer le message en attente", "Delete queued message")} onClick={() => void applyQueuedMutation(item, { type: "delete" })} disabled={item.index === undefined || busy}><Trash2 size={13} /></IconButton>
                     </>
                   )}
@@ -890,14 +1507,16 @@ function Composer({ project, conversation, models, commands, stats, sessionState
           {queueError ? <p className="queued-message-error" role="alert"><CircleAlert size={13} />{queueError}</p> : null}
         </div>
       ) : null}
-      {attachments.length ? <div className="composer-attachments">{attachments.map((attachment) => <div key={attachment.id}>{attachment.isImage && attachment.previewDataUrl ? <img src={attachment.previewDataUrl} alt="" /> : attachment.isImage ? <Image size={18} /> : <FileCode2 size={18} />}<span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size, language, locale)}</small></span><IconButton label={`${bi(language, "Retirer", "Remove")} ${attachment.name}`} onClick={() => { const removed = attachmentsRef.current.find((item) => item.id === attachment.id); const next = attachmentsRef.current.filter((item) => item.id !== attachment.id); attachmentsRef.current = next; setAttachments(next); setAttachmentError(undefined); if (removed) void releaseAttachmentHandles(attachmentHandles([removed])).catch(() => undefined); }}><X size={14} /></IconButton></div>)}</div> : null}
+      {attachments.length ? <div className="composer-attachments">{attachments.map((attachment) => <div key={attachment.id}>{attachment.isImage && attachment.previewDataUrl ? <img src={attachment.previewDataUrl} alt="" /> : <AttachmentGlyph attachment={attachment} size={18} />}<span><strong>{attachment.name}</strong><small>{attachmentMetaLabel(attachment, language, locale)}</small></span><IconButton label={`${bi(language, "Retirer", "Remove")} ${attachment.name}`} onClick={() => { const removed = attachmentsRef.current.find((item) => item.id === attachment.id); const next = attachmentsRef.current.filter((item) => item.id !== attachment.id); attachmentsRef.current = next; rememberConversationAttachmentDraft(conversation.id, next); setAttachments(next); setAttachmentError(undefined); if (removed) void releaseAttachmentHandles(attachmentHandles([removed])).catch(() => undefined); }}><X size={14} /></IconButton></div>)}</div> : null}
       {attachmentError ? <p className="trust-note" role="alert"><Info size={14} />{attachmentError}</p> : null}
+      {commandError ? <p className="trust-note composer-command-error" role="alert"><CircleAlert size={14} />{commandError}</p> : null}
       <div className="composer-editor">
-        <textarea ref={textarea} value={draft} onChange={(event) => updateDraft(event.target.value)} onKeyDown={handleKeyDown} onPaste={handlePaste} placeholder={isRunning ? bi(language, "Ajoutez une instruction à la suite…", "Add a follow-up instruction…") : `${bi(language, "Demandez quelque chose sur", "Ask something about")} ${project.name}…`} rows={1} aria-label={bi(language, "Message à Prime Agent", "Message Prime Agent")} />
+        <textarea ref={textarea} value={editorValue} onChange={(event) => updateEditorValue(event.target.value)} onKeyDown={handleKeyDown} onPaste={handlePaste} onFocus={() => setComposerFocused(true)} onBlur={() => { setComposerFocused(false); if (draftRef.current !== reportedDraftRef.current) reportDraftNow(draftRef.current); }} placeholder={activeSlashCommand ? activeSlashCommand.command.description : isRunning ? bi(language, "Ajoutez une instruction à la suite…", "Add a follow-up instruction…") : `${bi(language, "Demandez quelque chose sur", "Ask something about")} ${project.name}…`} rows={1} aria-label={bi(language, "Message à Prime Agent", "Message Prime Agent")} aria-autocomplete="list" aria-expanded={slashPaletteOpen} aria-controls={slashPaletteOpen ? "composer-slash-command-list" : undefined} aria-activedescendant={slashPaletteOpen ? `composer-slash-command-${Math.min(slashSelection, filteredSlashCommands.length - 1)}` : undefined} />
       </div>
       <div className="composer-toolbar">
         <div className="composer-tools-left">
           <IconButton label={bi(language, "Joindre des fichiers", "Attach files")} onClick={() => void addFiles()} disabled={adding}>{adding ? <LoaderCircle size={17} className="spin" /> : <Plus size={18} />}</IconButton>
+          {activeSlashCommand ? <button type="button" className="active-slash-command" onClick={clearActiveSlashCommand} title={bi(language, `Retirer la commande /${activeSlashCommand.command.name}`, `Remove /${activeSlashCommand.command.name} command`)}>{slashCommandIcon(activeSlashCommand.command)}<span>{activeSlashCommand.command.label}</span><X size={12} /></button> : null}
           <div className="composer-popover-wrap" data-dismissable-layer="composer-tools">
             <button type="button" className="composer-chip" aria-haspopup="menu" aria-expanded={openPopover === "composer-tools"} onClick={() => onTogglePopover("composer-tools")}><Box size={14} />{bi(language, "Outils", "Tools")}<ChevronDown size={13} /></button>
             {openPopover === "composer-tools" ? <ToolsPopover commands={commands} onChoose={(command) => { updateDraft(`/${command.name} `); onClosePopover(); textarea.current?.focus(); }} onCompact={() => { void onRunCommand("compact"); onClosePopover(); }} onRefine={() => { void onRunCommand("refine"); onClosePopover(); }} /> : null}
@@ -918,8 +1537,8 @@ function Composer({ project, conversation, models, commands, stats, sessionState
             {openPopover === "composer-thinking" ? <ThinkingPopover active={conversation.thinkingLevel} onChoose={(level) => { void onThinking(level); onClosePopover(); }} /> : null}
           </div>
           {isRunning ? <IconButton label={bi(language, "Arrêter l’exécution", "Stop run")} className="composer-stop" onClick={() => void onAbort()}><CircleStop size={18} /></IconButton> : null}
-          {isRunning ? <button type="button" className="queued-force-send" disabled={(!draft.trim() && !attachments.length) || adding} onClick={() => void submit("steer")} title={bi(language, "Livrer après les outils en cours, avant le prochain appel au modèle", "Deliver after current tools, before the next model call")}><Zap size={15} />{bi(language, "Orienter", "Steer")}</button> : null}
-          <button type="button" className={`send-button ${draft.trim() || attachments.length ? "is-ready" : ""}`} disabled={(!draft.trim() && !attachments.length) || adding} onClick={() => void submit(isRunning ? "follow_up" : undefined)} aria-label={isRunning ? bi(language, "Ajouter à la file", "Add to queue") : bi(language, "Envoyer", "Send")} title={isRunning ? bi(language, "Attendre la fin puis démarrer un nouveau tour", "Wait for completion, then start a new turn") : bi(language, "Envoyer (Entrée)", "Send (Enter)")}>{isRunning ? <Layers3 size={18} /> : <Send size={18} />}</button>
+          {isRunning ? <button type="button" className="queued-force-send" disabled={!hasComposerContent || adding} onClick={() => void submit("steer")} title={bi(language, "Livrer après les outils en cours, avant le prochain appel au modèle", "Deliver after current tools, before the next model call")}><Zap size={15} />{bi(language, "Orienter", "Steer")}</button> : null}
+          <button type="button" className={`send-button ${hasComposerContent ? "is-ready" : ""}`} disabled={!hasComposerContent || adding} onClick={() => void submit(isRunning ? "follow_up" : undefined)} aria-label={isRunning ? bi(language, "Ajouter à la file", "Add to queue") : bi(language, "Envoyer", "Send")} title={isRunning ? bi(language, "Attendre la fin puis démarrer un nouveau tour", "Wait for completion, then start a new turn") : bi(language, "Envoyer (Entrée)", "Send (Enter)")}>{isRunning ? <Layers3 size={18} /> : <Send size={18} />}</button>
         </div>
       </div>
     </div>
@@ -1005,7 +1624,7 @@ function SessionPanel({ project, conversation, sessionState, schedules, heartbea
       <div className="section-title"><span>{bi(language, "Espace de travail", "Workspace")}</span></div>
       <div className="detail-card"><div><FolderIcon /><span><strong>{project.name}</strong><small>{project.path}</small></span></div><Badge tone="success">{bi(language, "Local", "Local")}</Badge></div>
       <div className="section-title"><span>{bi(language, "Pièces jointes explicites", "Explicit attachments")}</span><small>{attachments.length} {attachments.length === 1 ? bi(language, "fichier", "file") : bi(language, "fichiers", "files")}</small></div>
-      {attachments.length ? <div className="context-files">{attachments.map((attachment) => <div key={attachment.id}>{attachment.isImage && attachment.previewDataUrl ? <img className="context-file-preview" src={attachment.previewDataUrl} alt="" /> : attachment.isImage ? <Image size={16} /> : <File size={16} />}<span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size, language, locale)}</small></span></div>)}</div> : <InspectorEmpty icon={<Layers3 size={22} />} text={bi(language, "Ajoutez des fichiers ou des images depuis le composer.", "Add files or images from the composer.")} />}
+      {attachments.length ? <div className="context-files">{attachments.map((attachment) => <div key={attachment.id}>{attachment.isImage && attachment.previewDataUrl ? <img className="context-file-preview" src={attachment.previewDataUrl} alt="" /> : <AttachmentGlyph attachment={attachment} size={16} />}<span><strong>{attachment.name}</strong><small>{attachmentMetaLabel(attachment, language, locale)}</small></span></div>)}</div> : <InspectorEmpty icon={<Layers3 size={22} />} text={bi(language, "Ajoutez des fichiers ou des images depuis le composer.", "Add files or images from the composer.")} />}
       <div className="section-title"><span>{bi(language, "File d’instructions Prime Agent", "Prime Agent instruction queue")}</span><Badge tone={queued.length ? "accent" : "neutral"}>{queued.length}</Badge></div>
       {sessionActions?.active ? <div className="detail-card"><div><LoaderCircle size={16} className="spin" /><span><strong>{bi(language, "Action active", "Active action")}</strong><small>{sessionActions.active.label ?? (sessionActions.active.kind === "turn" ? bi(language, "Tour de l’agent", "Agent turn") : bi(language, "Commande de session", "Session command"))} · {sessionActions.active.phase}</small></span></div><Badge tone="accent">Live</Badge></div> : null}
       {queued.length ? <div className="context-files queue-items">{queued.map((item, index) => <div key={`${item.lane}:${index}:${item.text.slice(0, 32)}`}><Layers3 size={16} /><span><strong>{item.lane}</strong><small>{item.text}</small></span></div>)}</div> : <InspectorEmpty icon={<Layers3 size={22} />} text={bi(language, "Aucune instruction en attente dans Prime Agent.", "No instruction is queued in Prime Agent.")} />}
@@ -1241,6 +1860,20 @@ function ChangesPanel({ projectPath, changes, draft, onDraftChange }: { projectP
 
 function DetailsPanel({ project, conversation, stats, sessionState, onRunCommand, onCloneSession }: { project: Project; conversation: Conversation; stats?: SessionStats; sessionState?: AgentSessionState; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onCloneSession: () => Promise<void> }) {
   const { language, locale } = useI18n();
+  const [busyAction, setBusyAction] = useState<string>();
+  const [actionError, setActionError] = useState<string>();
+  const runAction = async (key: string, action: () => Promise<void>) => {
+    if (busyAction) return;
+    setBusyAction(key);
+    setActionError(undefined);
+    try {
+      await action();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusyAction(undefined);
+    }
+  };
   return (
     <div className="inspector-section">
       <div className="stats-grid">
@@ -1252,7 +1885,8 @@ function DetailsPanel({ project, conversation, stats, sessionState, onRunCommand
       <div className="section-title"><span>{bi(language, "Configuration", "Configuration")}</span></div>
       <dl className="details-list"><div><dt>{bi(language, "Modèle", "Model")}</dt><dd>{sessionState?.model?.name ?? shortModel(conversation.model) ?? bi(language, "Par défaut", "Default")}</dd></div><div><dt>{bi(language, "Raisonnement", "Reasoning")}</dt><dd>{thinkingLabel(conversation.thinkingLevel, language)}</dd></div><div><dt>{bi(language, "Projet", "Project")}</dt><dd>{project.name}</dd></div><div><dt>Session</dt><dd className="mono">{sessionState?.sessionId?.slice(0, 12) ?? conversation.sessionId?.slice(0, 12) ?? bi(language, "En attente", "Pending")}</dd></div><div><dt>{bi(language, "Persistance", "Persistence")}</dt><dd>{conversation.sessionPath ? bi(language, "Activée", "Enabled") : bi(language, "Nouvelle session", "New session")}</dd></div></dl>
       <div className="section-title"><span>{bi(language, "Maintenance", "Maintenance")}</span></div>
-      <div className="maintenance-actions"><Button variant="secondary" onClick={() => void onRunCommand("compact")}><ArchiveRestore size={15} />{bi(language, "Compacter", "Compact")}</Button><Button variant="secondary" onClick={() => void onRunCommand("refine")}><WandSparkles size={15} />{bi(language, "Raffiner", "Refine")}</Button><Button variant="secondary" onClick={() => void onCloneSession()}><Copy size={15} />{bi(language, "Dupliquer", "Duplicate")}</Button><Button variant="secondary" onClick={() => void onRunCommand("export_html")}><ArrowDown size={15} />{bi(language, "Exporter", "Export")}</Button></div>
+      <div className="maintenance-actions"><Button variant="secondary" loading={busyAction === "compact"} disabled={Boolean(busyAction)} onClick={() => void runAction("compact", () => onRunCommand("compact"))}><ArchiveRestore size={15} />{bi(language, "Compacter", "Compact")}</Button><Button variant="secondary" loading={busyAction === "refine"} disabled={Boolean(busyAction)} onClick={() => void runAction("refine", () => onRunCommand("refine"))}><WandSparkles size={15} />{bi(language, "Raffiner", "Refine")}</Button><Button variant="secondary" loading={busyAction === "clone"} disabled={Boolean(busyAction)} onClick={() => void runAction("clone", onCloneSession)}><Copy size={15} />{bi(language, "Dupliquer", "Duplicate")}</Button><Button variant="secondary" loading={busyAction === "export_html"} disabled={Boolean(busyAction)} onClick={() => void runAction("export_html", () => onRunCommand("export_html"))}><ArrowDown size={15} />{bi(language, "Exporter", "Export")}</Button></div>
+      {actionError ? <p className="popover-inline-error" role="alert"><CircleAlert size={14} />{actionError}</p> : null}
     </div>
   );
 }
@@ -1267,6 +1901,15 @@ function ToolsPopover({ commands, onChoose, onCompact, onRefine }: { commands: S
       {commands.length ? <><div className="popover-separator" /><div className="popover-label">{bi(language, "Skills et commandes", "Skills and commands")}</div>{commands.slice(0, 8).map((command) => <button key={command.name} type="button" onClick={() => onChoose(command)}><Zap size={15} /><span><strong>/{command.name}</strong><small>{command.description ?? command.source}</small></span></button>)}</> : null}
     </div>
   );
+}
+
+function slashCommandIcon(command: ComposerSlashCommand) {
+  if (command.name === "goal") return <Target size={15} />;
+  if (command.name === "compact") return <ArchiveRestore size={15} />;
+  if (command.name === "refine") return <WandSparkles size={15} />;
+  if (command.name === "autonomous") return <Bot size={15} />;
+  if (command.name === "reload") return <RefreshCw size={15} />;
+  return <Zap size={15} />;
 }
 
 function ModelPopover({ models, active, onChoose, align = "left" }: { models: ModelInfo[]; active?: string; onChoose: (model: ModelInfo) => void; align?: "left" | "right" }) {
@@ -1339,17 +1982,29 @@ export function buildQueuedRows(conversation: Conversation, sessionState?: Agent
   const authoritative = (["steer", "follow_up"] as const).flatMap((delivery) => {
     const lane = delivery === "steer" ? "steering" as const : "followUp" as const;
     const previews = delivery === "steer" ? actions?.steering ?? [] : actions?.followUps ?? [];
+    const attachmentPreviews = delivery === "steer"
+      ? actions?.queueAttachments?.steering ?? []
+      : actions?.queueAttachments?.followUps ?? [];
     return previews.map((text, index): QueuedMessageRow => {
       const match = local.find((item) => !item.used && item.delivery === delivery && item.payload === text);
       if (match) match.used = true;
+      const attachments = match?.message.attachments?.length
+        ? match.message.attachments
+        : attachmentPreviews[index]?.length
+          ? attachmentPreviews[index]
+          : undefined;
       return {
         id: match?.message.id ?? `remote-queue:${delivery}:${index}:${text.slice(0, 32)}`,
-        text: match?.message.content ?? text,
+        text: match?.message.content ?? (
+          text
+          || attachments?.map((attachment) => attachment.name).join(", ")
+          || "Fichier joint"
+        ),
         delivery,
         lane,
         index,
         expectedText: text,
-        attachments: match?.message.attachments,
+        attachments,
       };
     });
   });
@@ -1396,16 +2051,44 @@ function FolderIcon() { return <span className="detail-icon"><ListTree size={16}
 
 const MAX_IMAGE_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_DOCUMENT_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const MAX_TOTAL_ATTACHMENT_BYTES = 40 * 1024 * 1024;
 const MAX_ATTACHMENT_COUNT = 20;
+
+export function shouldRestoreAttachmentSubmission(
+  submittedConversationId: string,
+  submittedGeneration: number,
+  currentConversationId: string,
+  currentGeneration: number,
+) {
+  return submittedConversationId === currentConversationId
+    && submittedGeneration === currentGeneration;
+}
 
 function isSupportedInlineImageMime(mimeType: string) {
   return ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(mimeType.toLowerCase());
 }
 
-export type AttachmentSelectionIssue = "count" | "image-size" | "image-total" | "missing-image-handle" | "pathless-file" | "unsupported-image" | "native-picker-required";
+export type AttachmentSelectionIssue = "count" | "image-size" | "document-size" | "image-total" | "attachment-total" | "missing-handle" | "unsupported-image";
 
 function attachmentHandles(attachments: Attachment[]) {
   return attachments.flatMap((attachment) => attachment.attachmentHandle ? [attachment.attachmentHandle] : []);
+}
+
+export function isSupportedDroppedImage(file: Pick<File, "name" | "type">) {
+  if (isSupportedInlineImageMime(file.type)) return true;
+  return !file.type && /\.(?:png|jpe?g|webp|gif)$/i.test(file.name);
+}
+
+function totalAttachmentBytes(attachments: Attachment[]) {
+  return attachments.reduce((total, attachment) => total + attachment.size, 0);
+}
+
+function totalImageAttachmentBytes(attachments: Attachment[]) {
+  return attachments.reduce(
+    (total, attachment) => total + (attachment.isImage ? attachment.size : 0),
+    0,
+  );
 }
 
 export function mergeAttachmentSelection(
@@ -1413,27 +2096,32 @@ export function mergeAttachmentSelection(
   incoming: Attachment[],
 ): { attachments: Attachment[]; issue?: AttachmentSelectionIssue } {
   const accepted = [...current];
-  let imageBytes = current.reduce((total, attachment) => total + (attachment.isImage ? attachment.size : 0), 0);
+  let attachmentBytes = totalAttachmentBytes(current);
+  let imageBytes = totalImageAttachmentBytes(current);
   let issue: AttachmentSelectionIssue | undefined;
   for (const attachment of incoming) {
     if (accepted.length >= MAX_ATTACHMENT_COUNT) {
       issue ??= "count";
       continue;
     }
-    if (!attachment.isImage && !attachment.path) {
-      issue ??= "pathless-file";
+    if (!attachment.attachmentHandle) {
+      issue ??= "missing-handle";
       continue;
     }
     if (attachment.isImage && attachment.size > MAX_IMAGE_ATTACHMENT_BYTES) {
       issue ??= "image-size";
       continue;
     }
+    if (!attachment.isImage && attachment.size > MAX_DOCUMENT_ATTACHMENT_BYTES) {
+      issue ??= "document-size";
+      continue;
+    }
     if (attachment.isImage && !isSupportedInlineImageMime(attachment.mimeType)) {
       issue ??= "unsupported-image";
       continue;
     }
-    if (attachment.isImage && !attachment.attachmentHandle) {
-      issue ??= "missing-image-handle";
+    if (attachmentBytes + attachment.size > MAX_TOTAL_ATTACHMENT_BYTES) {
+      issue ??= "attachment-total";
       continue;
     }
     if (attachment.isImage && imageBytes + attachment.size > MAX_TOTAL_IMAGE_BYTES) {
@@ -1441,6 +2129,7 @@ export function mergeAttachmentSelection(
       continue;
     }
     accepted.push(attachment);
+    attachmentBytes += attachment.size;
     if (attachment.isImage) imageBytes += attachment.size;
   }
   return { attachments: accepted, issue };
@@ -1448,12 +2137,32 @@ export function mergeAttachmentSelection(
 
 function attachmentIssueLabel(issue: AttachmentSelectionIssue, language: AppLanguage) {
   if (issue === "count") return bi(language, "Vous pouvez joindre au maximum 20 fichiers.", "You can attach up to 20 files.");
-  if (issue === "image-size") return bi(language, "Une image dépasse la limite de 8 Mio.", "An image exceeds the 8 MB limit.");
-  if (issue === "image-total") return bi(language, "Le total des images jointes ne peut pas dépasser 10 Mio.", "Attached images cannot exceed 10 MB in total.");
-  if (issue === "missing-image-handle") return bi(language, "Une image a expiré. Sélectionnez-la de nouveau avec le bouton +.", "An image has expired. Select it again with the + button.");
+  if (issue === "image-size") return bi(language, "Une image dépasse la limite de 8 Mio.", "An image exceeds the 8 MiB limit.");
+  if (issue === "document-size") return bi(language, "Un document dépasse la limite de 20 Mio.", "A document exceeds the 20 MiB limit.");
+  if (issue === "image-total") return bi(language, "Le total des images jointes ne peut pas dépasser 10 Mio.", "Attached images cannot exceed 10 MiB in total.");
+  if (issue === "attachment-total") return bi(language, "Le total des pièces jointes ne peut pas dépasser 40 Mio.", "Attachments cannot exceed 40 MiB in total.");
+  if (issue === "missing-handle") return bi(language, "Une pièce jointe a expiré. Sélectionnez-la de nouveau.", "An attachment has expired. Select it again.");
   if (issue === "unsupported-image") return bi(language, "Seules les images PNG, JPEG, WebP et GIF sont prises en charge.", "Only PNG, JPEG, WebP, and GIF images are supported.");
-  if (issue === "native-picker-required") return bi(language, "Pour joindre un fichier en toute sécurité, utilisez le bouton + et confirmez-le dans le sélecteur système.", "To attach a file securely, use the + button and confirm it in the system picker.");
-  return bi(language, "Pour joindre un document, utilisez le bouton + afin d’autoriser explicitement son chemin local.", "To attach a document, use the + button to explicitly authorize its local path.");
+  return bi(language, "Impossible de joindre ce fichier.", "This file could not be attached.");
+}
+
+export function attachmentDropError(error: unknown, language: AppLanguage) {
+  const message = error instanceof Error ? error.message : String(error);
+  const normalized = message.toLowerCase();
+  if (normalized.includes("expir") || normalized.includes("autorisation") || normalized.includes("grant")) {
+    return bi(language, "Le dépôt a expiré. Déposez de nouveau les fichiers.", "The drop expired. Drop the files again.");
+  }
+  if (normalized.includes("fichier(s)") || normalized.includes("maximum") || normalized.includes("count")) {
+    return attachmentIssueLabel("count", language);
+  }
+  if (normalized.includes("budget") || normalized.includes("10 mio") || normalized.includes("8 mio")) {
+    return bi(language, "Les pièces jointes dépassent les limites autorisées (8 Mio par image, 20 Mio par document, 10 Mio d’images et 40 Mio au total).", "The attachments exceed the limits (8 MiB per image, 20 MiB per document, 10 MiB of images and 40 MiB total).");
+  }
+  return bi(
+    language,
+    `Impossible de joindre les fichiers : ${message}`,
+    "One or more files could not be attached. Check that they are readable regular files and try again.",
+  );
 }
 
 export function attachmentSubmitError(error: unknown, language: AppLanguage) {
@@ -1461,8 +2170,8 @@ export function attachmentSubmitError(error: unknown, language: AppLanguage) {
   if (/expir|handle|disponible|available/i.test(detail)) {
     return bi(
       language,
-      "L’image jointe n’est plus disponible. Sélectionnez-la de nouveau avec le bouton +.",
-      "The attached image is no longer available. Select it again with the + button.",
+      "La pièce jointe n’est plus disponible. Sélectionnez-la de nouveau.",
+      "The attachment is no longer available. Select it again.",
     );
   }
   return `${bi(language, "Envoi impossible.", "Could not send.")} ${detail}`.trim();

@@ -13,13 +13,15 @@ use std::{
     fmt,
     fs::{self, OpenOptions},
     io::{Read, Write},
+    net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
         OnceLock,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
 use url::{Host, Url};
@@ -39,7 +41,10 @@ use windows_sys::Win32::{
 
 const MAX_SETTINGS_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_AUTH_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_MODELS_BYTES: u64 = 4 * 1024 * 1024;
 const SETTINGS_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
+const OLLAMA_PROBE_TIMEOUT: Duration = Duration::from_millis(900);
+const DEFAULT_OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434/v1";
 static SETTINGS_LOCK_RECLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
 static PROCESS_START_FALLBACK: OnceLock<String> = OnceLock::new();
 const BUILTIN_SERVERS: [(&str, &str); 2] = [
@@ -80,6 +85,21 @@ pub struct PublicMcpServer {
 pub struct PrimeAgentConnections {
     pub provider_ids: Vec<String>,
     pub mcp_servers: Vec<PublicMcpServer>,
+}
+
+/// A bounded, secret-free reachability snapshot for the Ollama endpoint used
+/// by Prime Agent. Configuration and catalog presence are deliberately not
+/// treated as proof that the local server is actually running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OllamaHealth {
+    pub reachable: bool,
+    /// False for HTTPS endpoints where a TCP connection succeeds but this
+    /// lightweight probe cannot authenticate the service as Ollama.
+    pub verified: bool,
+    pub endpoint: String,
+    pub latency_ms: u64,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -420,6 +440,314 @@ fn read_regular_file_limited(path: &Path, limit: u64) -> Result<Option<Vec<u8>>,
         ));
     }
     Ok(Some(bytes))
+}
+
+fn configured_ollama_endpoint(document: &Value) -> Result<String, String> {
+    let configured = document
+        .get("providers")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get("ollama"))
+        .and_then(Value::as_object)
+        .and_then(|provider| provider.get("baseUrl"))
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_OLLAMA_ENDPOINT);
+    let mut endpoint = Url::parse(configured)
+        .map_err(|error| format!("L’endpoint Ollama est invalide: {error}"))?;
+    if !matches!(endpoint.scheme(), "http" | "https")
+        || endpoint.host().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+    {
+        return Err(
+            "L’endpoint Ollama doit être une URL HTTP(S) sans identifiants intégrés".to_string(),
+        );
+    }
+    // Query strings and fragments are never required for an Ollama health
+    // probe and may contain secrets. Do not return them to the renderer.
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+    Ok(endpoint.to_string().trim_end_matches('/').to_string())
+}
+
+fn load_ollama_endpoint(app: &AppHandle) -> Result<String, String> {
+    let path = agent_config_directory(&home_directory(app)?, false)?.join("models.json");
+    let Some(bytes) = read_regular_file_limited(&path, MAX_MODELS_BYTES)? else {
+        return Ok(DEFAULT_OLLAMA_ENDPOINT.to_string());
+    };
+    let document: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Le catalogue de modèles est invalide: {error}"))?;
+    configured_ollama_endpoint(&document)
+}
+
+fn ollama_socket_addresses(endpoint: &Url) -> Result<Vec<SocketAddr>, String> {
+    let port = endpoint
+        .port_or_known_default()
+        .ok_or_else(|| "L’endpoint Ollama ne précise aucun port utilisable".to_string())?;
+    let addresses = match endpoint
+        .host()
+        .ok_or_else(|| "L’endpoint Ollama ne précise aucun hôte".to_string())?
+    {
+        Host::Ipv4(address) => vec![SocketAddr::new(IpAddr::V4(address), port)],
+        Host::Ipv6(address) => vec![SocketAddr::new(IpAddr::V6(address), port)],
+        Host::Domain(domain) if domain.eq_ignore_ascii_case("localhost") => vec![
+            SocketAddr::new(IpAddr::from_str("127.0.0.1").expect("valid loopback"), port),
+            SocketAddr::new(IpAddr::from_str("::1").expect("valid loopback"), port),
+        ],
+        // `std::net` does not expose a deadline-aware DNS resolver. Keep this
+        // synchronous lookup off the UI thread (the command runs through
+        // `run_blocking`); the default and `localhost` endpoints above avoid
+        // DNS entirely, while connect/read/write operations remain governed by
+        // the probe's absolute deadline. Supporting a hard DNS deadline would
+        // require an asynchronous resolver rather than another blocking task.
+        Host::Domain(domain) => (domain, port)
+            .to_socket_addrs()
+            .map_err(|error| format!("Impossible de résoudre l’hôte Ollama: {error}"))?
+            .collect(),
+    };
+    if addresses.is_empty() {
+        return Err("L’hôte Ollama n’a renvoyé aucune adresse".to_string());
+    }
+    Ok(addresses)
+}
+
+fn failed_ollama_health(endpoint: &str, started: Instant, error: String) -> OllamaHealth {
+    OllamaHealth {
+        reachable: false,
+        verified: true,
+        endpoint: endpoint.to_string(),
+        latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        error: Some(error),
+    }
+}
+
+/// Prime Agent stores Ollama's OpenAI-compatible base URL (normally `/v1`),
+/// while Ollama exposes its native health/catalog endpoint at `/api/tags`.
+/// Preserve an optional reverse-proxy prefix but never append `/api/tags` to
+/// `/v1` (which would produce the invalid `/v1/api/tags` route).
+fn ollama_native_tags_path(endpoint: &Url) -> String {
+    let configured_path = endpoint.path().trim_end_matches('/');
+    if configured_path.is_empty() || configured_path == "/" || configured_path == "/v1" {
+        return "/api/tags".to_string();
+    }
+    if configured_path.ends_with("/api/tags") {
+        return configured_path.to_string();
+    }
+    if configured_path.ends_with("/api") {
+        return format!("{configured_path}/tags");
+    }
+    if let Some(prefix) = configured_path.strip_suffix("/v1") {
+        return format!("{prefix}/api/tags");
+    }
+    "/api/tags".to_string()
+}
+
+fn header_uses_chunked_encoding(headers: &str) -> bool {
+    headers.lines().skip(1).any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("transfer-encoding")
+                && value
+                    .split(',')
+                    .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
+        })
+    })
+}
+
+/// Decodes as much of a chunked response body as has been received. The
+/// health probe deliberately caps its read buffer, so the final chunk may be
+/// incomplete when a user has a very large local model catalog. The opening
+/// JSON object still contains the discriminator (`models`) needed here.
+fn decode_chunked_body_prefix(body: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::with_capacity(body.len());
+    let mut cursor = 0usize;
+    while cursor < body.len() {
+        let Some(line_end) = body[cursor..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|offset| cursor + offset)
+        else {
+            break;
+        };
+        let size = std::str::from_utf8(&body[cursor..line_end])
+            .ok()
+            .and_then(|line| line.split(';').next())
+            .map(str::trim)
+            .and_then(|size| usize::from_str_radix(size, 16).ok());
+        let Some(size) = size else {
+            break;
+        };
+        if size == 0 {
+            break;
+        }
+        let chunk_start = line_end + 2;
+        let available = body.len().saturating_sub(chunk_start).min(size);
+        decoded.extend_from_slice(&body[chunk_start..chunk_start + available]);
+        if available < size {
+            break;
+        }
+        cursor = chunk_start + size;
+        if body.get(cursor..cursor + 2) == Some(b"\r\n") {
+            cursor += 2;
+        } else {
+            break;
+        }
+    }
+    decoded
+}
+
+fn probe_ollama_endpoint(endpoint: &str, timeout: Duration) -> OllamaHealth {
+    let started = Instant::now();
+    let parsed = match Url::parse(endpoint) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return failed_ollama_health(
+                endpoint,
+                started,
+                format!("L’endpoint Ollama est invalide: {error}"),
+            )
+        }
+    };
+    let addresses = match ollama_socket_addresses(&parsed) {
+        Ok(addresses) => addresses,
+        Err(error) => return failed_ollama_health(endpoint, started, error),
+    };
+    let mut last_error = "Le serveur Ollama n’accepte pas les connexions".to_string();
+    let mut connected = None;
+    for address in addresses {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            last_error = "La vérification d’Ollama a expiré".to_string();
+            break;
+        }
+        match TcpStream::connect_timeout(&address, remaining) {
+            Ok(stream) => {
+                connected = Some(stream);
+                break;
+            }
+            Err(error) => last_error = format!("Ollama est injoignable: {error}"),
+        }
+    }
+    let Some(mut stream) = connected else {
+        return failed_ollama_health(endpoint, started, last_error);
+    };
+
+    // A successful TLS handshake would require a full HTTP client. A bounded
+    // TCP connection still proves that a configured remote HTTPS endpoint is
+    // accepting connections; the standard local Ollama endpoint is verified
+    // below with an actual HTTP request.
+    if parsed.scheme() == "https" {
+        return OllamaHealth {
+            reachable: true,
+            verified: false,
+            endpoint: endpoint.to_string(),
+            latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            error: None,
+        };
+    }
+
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return failed_ollama_health(
+            endpoint,
+            started,
+            "La vérification HTTP d’Ollama a expiré".to_string(),
+        );
+    }
+    let _ = stream.set_write_timeout(Some(remaining));
+    let host = parsed.host_str().unwrap_or("localhost");
+    let host_header = match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    let probe_path = ollama_native_tags_path(&parsed);
+    let request = format!(
+        "GET {probe_path} HTTP/1.1\r\nHost: {host_header}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+    );
+    if let Err(error) = stream.write_all(request.as_bytes()) {
+        return failed_ollama_health(
+            endpoint,
+            started,
+            format!("Ollama n’a pas accepté la requête de vérification: {error}"),
+        );
+    }
+    let mut response = [0u8; 8192];
+    let mut count = 0usize;
+    loop {
+        // Socket read timeouts apply to each individual read, not to the
+        // complete response. Recompute the remaining wall-clock budget before
+        // every read so a server cannot keep the probe alive indefinitely by
+        // dripping one byte just before each per-call timeout.
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        if let Err(error) = stream.set_read_timeout(Some(remaining)) {
+            return failed_ollama_health(
+                endpoint,
+                started,
+                format!("Impossible de borner la lecture de la réponse Ollama: {error}"),
+            );
+        }
+        match stream.read(&mut response[count..]) {
+            Ok(0) => break,
+            Ok(read) => {
+                count += read;
+                if count == response.len() {
+                    break;
+                }
+            }
+            Err(error)
+                if count > 0
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+            {
+                break
+            }
+            Err(error) => {
+                return failed_ollama_health(
+                    endpoint,
+                    started,
+                    format!("Ollama n’a pas répondu dans le délai imparti: {error}"),
+                )
+            }
+        }
+    }
+    let response = &response[..count];
+    let header_end = response.windows(4).position(|window| window == b"\r\n\r\n");
+    let (headers, raw_body) = header_end.map_or((response, &[][..]), |header_end| {
+        (&response[..header_end], &response[header_end + 4..])
+    });
+    let headers = String::from_utf8_lossy(headers);
+    let decoded_body =
+        header_uses_chunked_encoding(&headers).then(|| decode_chunked_body_prefix(raw_body));
+    let body = String::from_utf8_lossy(decoded_body.as_deref().unwrap_or(raw_body));
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok());
+    let ollama_payload = body.trim_start().starts_with('{') && body.contains("\"models\"");
+    if status.is_some_and(|code| (200..300).contains(&code)) && ollama_payload {
+        OllamaHealth {
+            reachable: true,
+            verified: true,
+            endpoint: endpoint.to_string(),
+            latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            error: None,
+        }
+    } else {
+        failed_ollama_health(
+            endpoint,
+            started,
+            match status {
+                Some(code) => format!(
+                    "Le service joint a répondu HTTP {code}, sans réponse {probe_path} valide d’Ollama"
+                ),
+                None => "Le service joint n’a pas renvoyé de réponse HTTP Ollama".to_string(),
+            },
+        )
+    }
 }
 
 struct AuthKeyVisitor;
@@ -1401,6 +1729,15 @@ pub async fn inspect_prime_agent_connections(
         .await
 }
 
+#[tauri::command]
+pub async fn check_ollama_health(app: AppHandle) -> Result<OllamaHealth, String> {
+    crate::run_blocking(move || {
+        let endpoint = load_ollama_endpoint(&app)?;
+        Ok(probe_ollama_endpoint(&endpoint, OLLAMA_PROBE_TIMEOUT))
+    })
+    .await
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub async fn save_mcp_server(
     app: AppHandle,
@@ -1430,6 +1767,181 @@ pub async fn delete_mcp_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn one_shot_http_server(
+        expected_path: &'static str,
+        response: &'static [u8],
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        // Accepted sockets inherit the listener's non-blocking
+                        // mode on Windows. The fixture performs one bounded,
+                        // blocking request read so parallel test scheduling
+                        // cannot turn it into a spurious WouldBlock failure.
+                        socket.set_nonblocking(false).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        let mut request = [0u8; 512];
+                        let count = socket.read(&mut request).unwrap();
+                        assert!(String::from_utf8_lossy(&request[..count])
+                            .starts_with(&format!("GET {expected_path} HTTP/1.1")));
+                        socket.write_all(response).unwrap();
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "health probe never connected");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("listener failed: {error}"),
+                }
+            }
+        });
+        (address, server)
+    }
+
+    #[test]
+    fn ollama_endpoint_comes_from_the_effective_provider_without_exposing_query_secrets() {
+        let document = serde_json::json!({
+            "providers": {
+                "ollama": {
+                    "baseUrl": "http://127.0.0.1:11434/v1?token=NEVER_EXPOSED#fragment"
+                }
+            }
+        });
+        let endpoint = configured_ollama_endpoint(&document).unwrap();
+        assert_eq!(endpoint, "http://127.0.0.1:11434/v1");
+        assert!(!endpoint.contains("NEVER_EXPOSED"));
+        assert_eq!(
+            configured_ollama_endpoint(&serde_json::json!({ "providers": {} })).unwrap(),
+            DEFAULT_OLLAMA_ENDPOINT
+        );
+        assert!(configured_ollama_endpoint(&serde_json::json!({
+            "providers": { "ollama": { "baseUrl": "http://user:secret@127.0.0.1:11434/v1" } }
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn ollama_native_probe_path_translates_openai_compatible_base_urls() {
+        assert_eq!(
+            ollama_native_tags_path(&Url::parse("http://127.0.0.1:11434/v1").unwrap()),
+            "/api/tags"
+        );
+        assert_eq!(
+            ollama_native_tags_path(&Url::parse("https://models.example.test/ollama/v1").unwrap()),
+            "/ollama/api/tags"
+        );
+        assert_eq!(
+            ollama_native_tags_path(&Url::parse("http://127.0.0.1:11434/api/tags").unwrap()),
+            "/api/tags"
+        );
+    }
+
+    #[test]
+    fn ollama_probe_accepts_the_chunked_response_used_by_the_real_server() {
+        let (address, server) = one_shot_http_server(
+            "/api/tags",
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\nd\r\n{\"models\":[]}\r\n0\r\n\r\n",
+        );
+        let endpoint = format!("http://{address}/v1");
+        let health = probe_ollama_endpoint(&endpoint, Duration::from_millis(500));
+        server.join().unwrap();
+        assert!(health.reachable, "{:?}", health.error);
+        assert!(health.verified);
+        assert_eq!(health.endpoint, endpoint);
+    }
+
+    #[test]
+    fn ollama_probe_requires_an_http_response_and_is_bounded() {
+        let (address, server) = one_shot_http_server(
+            "/api/tags",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n{\"models\":[]}",
+        );
+        let endpoint = format!("http://{address}/v1");
+        let health = probe_ollama_endpoint(&endpoint, Duration::from_millis(500));
+        server.join().unwrap();
+        assert!(health.reachable, "{:?}", health.error);
+        assert!(health.verified);
+        assert_eq!(health.endpoint, endpoint);
+        assert!(health.error.is_none());
+
+        let (address, server) = one_shot_http_server(
+            "/api/tags",
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\n\r\n{\"models\":[]}",
+        );
+        let health =
+            probe_ollama_endpoint(&format!("http://{address}/v1"), Duration::from_millis(500));
+        server.join().unwrap();
+        assert!(
+            !health.reachable,
+            "a generic HTTP response is not Ollama health"
+        );
+
+        let (address, server) = one_shot_http_server(
+            "/api/tags",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+        );
+        let health =
+            probe_ollama_endpoint(&format!("http://{address}/v1"), Duration::from_millis(500));
+        server.join().unwrap();
+        assert!(
+            !health.reachable,
+            "a 2xx response without an Ollama payload is not healthy"
+        );
+
+        let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unavailable_address = unavailable.local_addr().unwrap();
+        drop(unavailable);
+        let started = Instant::now();
+        let health = probe_ollama_endpoint(
+            &format!("http://{unavailable_address}/v1"),
+            Duration::from_millis(150),
+        );
+        assert!(!health.reachable);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn ollama_probe_enforces_one_deadline_for_a_slow_drip_response() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut request = [0u8; 512];
+            let _ = socket.read(&mut request).unwrap();
+            // Every individual byte arrives well within the probe timeout. A
+            // fixed per-read timeout would therefore allow the peer to extend
+            // the probe until the whole response has been sent.
+            for byte in b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{" {
+                if socket.write_all(std::slice::from_ref(byte)).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        });
+
+        let started = Instant::now();
+        let health =
+            probe_ollama_endpoint(&format!("http://{address}/v1"), Duration::from_millis(120));
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+
+        assert!(!health.reachable);
+        assert!(
+            elapsed < Duration::from_millis(450),
+            "slow response exceeded the absolute deadline: {elapsed:?}"
+        );
+    }
 
     #[test]
     fn auth_parser_returns_only_sorted_root_keys() {

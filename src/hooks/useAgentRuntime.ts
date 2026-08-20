@@ -1,9 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  beginHtmlExport,
+  cancelHtmlExport,
+  completeHtmlExport,
   isNative,
   listenToAgentEvents,
+  listenToAgentResourceReloads,
+  listenToAgentRestarts,
+  listRunningAgents,
   loadSessionHistory,
   mutateAgentQueue,
+  reloadAgentResources,
+  restartAgent,
   sendRpc,
   startAgent,
   stopAgent,
@@ -11,6 +19,7 @@ import {
   type StartAgentOptions,
 } from "../lib/bridge";
 import { redactText, redactValue } from "../lib/redaction";
+import type { RuntimeNotice } from "../lib/runtime-notices";
 import type {
   ActivityItem,
   AgentRlmChild,
@@ -64,13 +73,29 @@ interface PendingSelectionRequest {
   conversationId: string;
   generation: number;
   timeout: number;
+  transcriptEpoch?: number;
   resolve?: (message: RpcEnvelope) => void;
   reject?: (error: Error) => void;
 }
 
+interface PendingConversationRequest {
+  conversationId: string;
+  timeout: number;
+  resolve: (message: RpcEnvelope) => void;
+  reject: (error: Error) => void;
+}
+
+interface HistoryLoad {
+  promise: Promise<void>;
+  transcriptEpoch: number;
+}
+
+type MaintenanceKind = "restart" | "reload";
+
 const HISTORY_RESPONSE_TIMEOUT_MS = 30_000;
 const HISTORY_REQUEST_ATTEMPTS = 1;
 const PASSIVE_RESPONSE_TIMEOUT_MS = 30_000;
+const HTML_EXPORT_RESPONSE_TIMEOUT_MS = 20 * 60_000;
 const SELECTION_SCOPED_COMMANDS = new Set([
   "get_state",
   "get_messages",
@@ -90,6 +115,7 @@ const ACKNOWLEDGED_COMMANDS = new Set([
 
 const now = () => new Date().toISOString();
 const uid = (prefix: string) => `${prefix}-${crypto.randomUUID()}`;
+const maintenanceEventKey = (kind: MaintenanceKind, conversationId: string) => `${kind}:${conversationId}`;
 const localHistoryIdentity = (conversation: Pick<Conversation, "id" | "sessionPath" | "sessionId">) => (
   `${conversation.id}\0${conversation.sessionPath ?? ""}\0${conversation.sessionId ?? ""}`
 );
@@ -99,18 +125,34 @@ const cleanDiagnostic = (value: unknown) => (
   typeof value === "string" && value.trim() ? redactText(value.trim()) : undefined
 );
 
-/** Only durable display metadata is allowed into app state. Native image
+/** Only durable display metadata is allowed into app state. Native attachment
  * handles are short-lived capabilities. The optional preview is a bounded
- * thumbnail generated natively, never the original image bytes. */
+ * thumbnail generated natively, never the original file bytes. */
 export function durableAttachmentMetadata(attachment: Attachment): Attachment {
   return {
     id: attachment.id,
     name: attachment.name,
-    ...(attachment.path ? { path: attachment.path } : {}),
     mimeType: attachment.mimeType,
     size: attachment.size,
     isImage: attachment.isImage,
-    ...(attachment.previewDataUrl ? { previewDataUrl: attachment.previewDataUrl } : {}),
+    ...(attachment.isImage && attachment.previewDataUrl
+      ? { previewDataUrl: attachment.previewDataUrl }
+      : {}),
+  };
+}
+
+/** Builds the capability-only attachment fields accepted by the native RPC
+ * bridge. Neither the prompt nor renderer state needs a source path. */
+export function promptAttachmentPayload(attachments: Attachment[]) {
+  const images = attachments
+    .filter((item) => item.isImage && item.attachmentHandle)
+    .map((item) => ({ type: "image", attachmentHandle: item.attachmentHandle! }));
+  const documents = attachments
+    .filter((item) => !item.isImage && item.attachmentHandle)
+    .map((item) => ({ attachmentHandle: item.attachmentHandle! }));
+  return {
+    ...(images.length ? { images } : {}),
+    ...(documents.length ? { attachments: documents } : {}),
   };
 }
 
@@ -183,23 +225,21 @@ export function beginPromptTransaction(
 
 /** Reconciles optimistic queue rows with Prime Agent's authoritative lanes.
  * A row stays out of the transcript while queued, then becomes a normal user
- * turn only after Prime Agent has exposed it in the queue and later removes it,
- * or explicitly marks it as the active action. Merely accepting the prompt is
- * not delivery evidence: the queue snapshot can lag just after the RPC reply. */
+ * turn only on Prime Agent's user message_start. Queue snapshots describe
+ * state, not transcript position: both an active and an empty snapshot may
+ * arrive after the assistant reply and would otherwise invert the turn. */
 export function reconcileQueuedMessages(
   conversation: Conversation,
   actions: AgentSessionState["sessionActions"] | undefined,
 ): Conversation {
   if (!actions || !conversation.messages.some((message) => message.queueDelivery)) return conversation;
+  const visibleActions = normalizePrimeOrbitSessionActions(actions);
   const available = {
-    steer: [...(actions.steering ?? [])],
-    follow_up: [...(actions.followUps ?? [])],
+    steer: [...visibleActions.steering],
+    follow_up: [...visibleActions.followUps],
   };
   let changed = false;
-  let activeConsumed = false;
-  const activeLabel = actions.active?.kind === "turn" ? normalizeQueuedText(actions.active.label ?? "") : "";
   const messages: ChatMessage[] = [];
-  const delivered: ChatMessage[] = [];
   for (const message of conversation.messages) {
     const lane = message.queueDelivery;
     if (!lane) {
@@ -217,18 +257,40 @@ export function reconcileQueuedMessages(
       }
       continue;
     }
-    const isActive: boolean = !activeConsumed
-      && activeLabel.length > 0
-      && activeLabel === normalizeQueuedText(payload);
-    if (!message.queueObserved && !isActive) {
-      messages.push(message);
-      continue;
-    }
-    if (isActive) activeConsumed = true;
-    changed = true;
-    delivered.push(withoutQueueMetadata(message));
+    // A terminal/late snapshot can omit a row after its turn has already been
+    // persisted. Keep it hidden at its original anchor until message_start or
+    // the persisted history establishes the authoritative turn boundary.
+    messages.push(message);
   }
-  return changed ? { ...conversation, messages: [...messages, ...delivered] } : conversation;
+  return changed ? { ...conversation, messages } : conversation;
+}
+
+/** A previously observed queue row can disappear without a message_start when
+ * the terminal queue snapshot races the final assistant events. In that one
+ * idle/empty state, reload the persisted session instead of guessing where the
+ * user turn belongs. Prime Agent's JSONL history is the ordering authority. */
+export function shouldReloadQueuedTranscript(
+  conversation: Conversation | undefined,
+  actions: AgentSessionState["sessionActions"] | undefined,
+): boolean {
+  if (!conversation || !actions || actions.active) return false;
+  if (
+    (actions.queuedCount ?? 0) > 0
+    || (actions.steering?.length ?? 0) > 0
+    || (actions.followUps?.length ?? 0) > 0
+  ) return false;
+  return conversation.messages.some((message) => message.queueDelivery && message.queueObserved);
+}
+
+/** Normal bootstrap histories remain applicable without an epoch. A targeted
+ * terminal queue reload is accepted only if no newer prompt/run has started. */
+export function shouldApplyHistoryResponse(
+  expectedTranscriptEpoch: number | undefined,
+  currentTranscriptEpoch: number,
+  isRunning: boolean,
+): boolean {
+  return expectedTranscriptEpoch === undefined
+    || (!isRunning && expectedTranscriptEpoch === currentTranscriptEpoch);
 }
 
 function normalizeQueuedText(value: string) {
@@ -253,16 +315,34 @@ export function applyAuthoritativeUserMessageStart(
   conversation: Conversation,
   text: string,
   createdAt: string,
+  structuredAttachments: Attachment[] = [],
+  authoritativeMessageId?: string,
 ): Conversation {
-  const normalized = normalizeQueuedText(text);
-  if (!normalized) return conversation;
+  const parsedContext = parsePrimeOrbitAttachmentContext(text);
+  const visibleText = parsedContext.visibleText;
+  const eventAttachments = sanitizeAuthoritativeAttachments(structuredAttachments);
+  const authoritativeAttachments = eventAttachments.length
+    ? eventAttachments
+    : parsedContext.attachments;
+  if (authoritativeMessageId && conversation.messages.some((message) => (
+    message.role === "user"
+    && (message.id === authoritativeMessageId || message.entryId === authoritativeMessageId)
+  ))) return conversation;
+  const normalized = normalizeQueuedText(visibleText);
   const queuedIndex = conversation.messages.findIndex((message) => message.queueDelivery
-    && normalizeQueuedText(message.queueText ?? message.content) === normalized);
+    && normalizeQueuedText(message.queueText ?? message.content) === normalized
+    && (normalized.length > 0 || (message.attachments?.length ?? 0) > 0 || authoritativeAttachments.length > 0));
   if (queuedIndex >= 0) {
     const messages = [...conversation.messages];
     const [queued] = messages.splice(queuedIndex, 1);
     if (!queued) return conversation;
-    messages.push(withoutQueueMetadata(queued));
+    messages.push(withoutQueueMetadata({
+      ...queued,
+      ...(authoritativeMessageId ? { entryId: authoritativeMessageId } : {}),
+      ...(!queued.attachments?.length && authoritativeAttachments.length
+        ? { attachments: authoritativeAttachments }
+        : {}),
+    }));
     return { ...conversation, hasContent: true, messages };
   }
 
@@ -271,31 +351,45 @@ export function applyAuthoritativeUserMessageStart(
     const message = conversation.messages[index]!;
     if (message.role === "user"
       && message.status === "pending"
-      && normalizeQueuedText(message.content) === normalized) {
+      && (
+        normalizeQueuedText(message.content) === normalized
+        || (!normalized && authoritativeAttachments.length > 0 && (message.attachments?.length ?? 0) > 0)
+      )
+      && (normalized.length > 0 || (message.attachments?.length ?? 0) > 0 || authoritativeAttachments.length > 0)) {
       pendingIndex = index;
       break;
     }
   }
   if (pendingIndex >= 0) {
     const messages = [...conversation.messages];
-    messages[pendingIndex] = { ...messages[pendingIndex]!, status: "complete" };
+    messages[pendingIndex] = {
+      ...messages[pendingIndex]!,
+      ...(authoritativeMessageId ? { entryId: authoritativeMessageId } : {}),
+      status: "complete",
+    };
     return { ...conversation, hasContent: true, messages };
   }
 
   const lastVisible = [...conversation.messages].reverse().find((message) => !message.queueDelivery);
-  if (lastVisible?.role === "user" && normalizeQueuedText(lastVisible.content) === normalized) {
+  if (lastVisible?.role === "user"
+    && normalizeQueuedText(lastVisible.content) === normalized
+    && (normalized.length > 0 || (lastVisible.attachments?.length ?? 0) > 0 || authoritativeAttachments.length > 0)) {
     return conversation;
   }
+
+  if (!normalized && !authoritativeAttachments.length) return conversation;
 
   return {
     ...conversation,
     hasContent: true,
     messages: [...conversation.messages, {
-      id: uid("user"),
+      id: authoritativeMessageId || uid("user"),
+      ...(authoritativeMessageId ? { entryId: authoritativeMessageId } : {}),
       role: "user",
-      content: text,
+      content: visibleText || "Fichier joint",
       createdAt,
       status: "complete",
+      attachments: authoritativeAttachments.length ? authoritativeAttachments : undefined,
     }],
   };
 }
@@ -324,29 +418,51 @@ export function applyQueueMutationSnapshot(
 ): SessionActionSnapshot {
   const steering = [...(actions.steering ?? [])];
   const followUps = [...(actions.followUps ?? [])];
+  const steeringAttachments = steering.map((_, attachmentIndex) => (
+    sanitizePrimeOrbitDocumentAttachments(actions.queueAttachments?.steering?.[attachmentIndex] ?? [])
+  ));
+  const followUpAttachments = followUps.map((_, attachmentIndex) => (
+    sanitizePrimeOrbitDocumentAttachments(actions.queueAttachments?.followUps?.[attachmentIndex] ?? [])
+  ));
   const source = lane === "steering" ? steering : followUps;
+  const sourceAttachments = lane === "steering" ? steeringAttachments : followUpAttachments;
   const actualIndex = source[index] === expectedText ? index : source.indexOf(expectedText);
   if (actualIndex < 0) return actions;
 
   if (mutation.type === "delete") {
     source.splice(actualIndex, 1);
+    sourceAttachments.splice(actualIndex, 1);
   } else if (mutation.type === "move") {
     const destination = actualIndex + mutation.direction;
     if (destination < 0 || destination >= source.length) return actions;
     [source[actualIndex], source[destination]] = [source[destination]!, source[actualIndex]!];
+    [sourceAttachments[actualIndex], sourceAttachments[destination]] = [
+      sourceAttachments[destination]!,
+      sourceAttachments[actualIndex]!,
+    ];
   } else {
     const destination = mutation.lane === "steering" ? steering : followUps;
+    const destinationAttachments = mutation.lane === "steering" ? steeringAttachments : followUpAttachments;
     if (destination === source) {
       source.splice(actualIndex, 1, mutation.text);
     } else {
       source.splice(actualIndex, 1);
+      const [movedAttachments] = sourceAttachments.splice(actualIndex, 1);
       destination.push(mutation.text);
+      destinationAttachments.push(movedAttachments ?? []);
     }
   }
   return {
     ...actions,
     steering,
     followUps,
+    queueAttachments: {
+      steering: steeringAttachments,
+      followUps: followUpAttachments,
+      ...(actions.queueAttachments?.active?.length
+        ? { active: sanitizePrimeOrbitDocumentAttachments(actions.queueAttachments.active) }
+        : {}),
+    },
     queuedCount: steering.length + followUps.length,
   };
 }
@@ -433,31 +549,37 @@ export function useAgentRuntime(options: {
   updateConversation: (id: string, updater: Partial<Conversation> | ((current: Conversation) => Conversation)) => void;
   onInstallProgress: (phase: string, message: string) => void;
   onInstallComplete: (detection: RuntimeDetection) => void;
+  onNotice?: (notice: RuntimeNotice) => void;
 }) {
   const {
     active = true,
     detection,
     selectedProject,
     selectedConversation,
+    getProject,
     getConversation,
     preserveSessionReference,
     discardSessionReference,
     updateConversation,
     onInstallProgress,
     onInstallComplete,
+    onNotice,
   } = options;
   const [runtimes, setRuntimes] = useState<RuntimeMap>({});
   const [extensionRequests, setExtensionRequests] = useState<PendingExtensionUiRequest[]>([]);
   const [eventsReady, setEventsReady] = useState(!isNative());
   const started = useRef(new Set<string>());
   const startInFlight = useRef(new Map<string, Promise<void>>());
-  const historyInFlight = useRef(new Map<string, Promise<void>>());
+  const historyInFlight = useRef(new Map<string, HistoryLoad>());
   const historyLoaded = useRef(new Set<string>());
+  const transcriptEpoch = useRef(new Map<string, number>());
   const localHistoryInFlight = useRef(new Map<string, Promise<void>>());
   const localHistoryLoaded = useRef(new Set<string>());
   const localHistoryApplied = useRef(new Map<string, string>());
+  const sessionActionsByConversation = useRef(new Map<string, AgentSessionState["sessionActions"]>());
   const bootstrapGeneration = useRef(new Map<string, number>());
   const pendingSelectionRequests = useRef(new Map<string, PendingSelectionRequest>());
+  const pendingConversationRequests = useRef(new Map<string, PendingConversationRequest>());
   const activeSelection = useRef<SelectionToken>({ generation: 0 });
   const selectedConversationId = useRef(active ? selectedConversation?.id : undefined);
   const intentionallyStopped = useRef(new Set<string>());
@@ -469,12 +591,16 @@ export function useAgentRuntime(options: {
   // as queued even when both handlers crossed ensureStarted concurrently.
   const activePromptRuns = useRef(new Set<string>());
   const extensionResponsesInFlight = useRef(new Set<string>());
+  const maintenanceEventVersions = useRef(new Map<string, number>());
+  const maintenanceRefreshes = useRef(new Map<string, Promise<void>>());
+  const getProjectRef = useRef(getProject);
   const getConversationRef = useRef(getConversation);
 
   // Event callbacks can run between React's render and effect phases. Keeping
   // this ref current prevents a late history response from the previous
   // conversation from ever replacing the newly selected transcript.
   selectedConversationId.current = active ? selectedConversation?.id : undefined;
+  getProjectRef.current = getProject;
   getConversationRef.current = getConversation;
 
   const isCurrentSelection = useCallback((conversationId: string, generation: number) => (
@@ -505,12 +631,61 @@ export function useAgentRuntime(options: {
     bootstrapGeneration.current.delete(conversationId);
   }, [clearPendingRequest]);
 
+  const clearPendingConversationRequest = useCallback((requestId: string, error?: Error) => {
+    const pending = pendingConversationRequests.current.get(requestId);
+    if (!pending) return;
+    pendingConversationRequests.current.delete(requestId);
+    window.clearTimeout(pending.timeout);
+    if (error) pending.reject(error);
+  }, []);
+
+  const cancelPersistentConversationRequests = useCallback((conversationId: string, reason: string) => {
+    for (const [requestId, pending] of pendingConversationRequests.current) {
+      if (pending.conversationId !== conversationId) continue;
+      clearPendingConversationRequest(requestId, new Error(reason));
+    }
+  }, [clearPendingConversationRequest]);
+
+  const sendConversationRequest = useCallback((
+    conversationId: string,
+    type: string,
+    fields: Record<string, unknown> = {},
+    timeoutMs = PASSIVE_RESPONSE_TIMEOUT_MS,
+  ): Promise<RpcEnvelope> => {
+    const requestId = uid(type);
+    let resolveResponse!: (message: RpcEnvelope) => void;
+    let rejectResponse!: (error: Error) => void;
+    const response = new Promise<RpcEnvelope>((resolve, reject) => {
+      resolveResponse = resolve;
+      rejectResponse = reject;
+    });
+    const timeout = window.setTimeout(() => {
+      clearPendingConversationRequest(
+        requestId,
+        new Error(`Prime Agent n’a pas répondu à ${type} dans le délai prévu.`),
+      );
+    }, timeoutMs);
+    pendingConversationRequests.current.set(requestId, {
+      conversationId,
+      timeout,
+      resolve: resolveResponse,
+      reject: rejectResponse,
+    });
+    return sendRpc(conversationId, { id: requestId, type, ...fields })
+      .then(() => response)
+      .catch((error) => {
+        clearPendingConversationRequest(requestId);
+        throw error;
+      });
+  }, [clearPendingConversationRequest]);
+
   const sendSelectionRequest = useCallback((
     conversationId: string,
     generation: number,
     type: string,
     waitForResponse = false,
     fields: Record<string, unknown> = {},
+    requestMetadata: { transcriptEpoch?: number } = {},
   ): Promise<RpcEnvelope | void> => {
     if (!isCurrentSelection(conversationId, generation)) return Promise.resolve();
     const requestId = uid(type);
@@ -532,6 +707,7 @@ export function useAgentRuntime(options: {
       conversationId,
       generation,
       timeout,
+      transcriptEpoch: requestMetadata.transcriptEpoch,
       resolve: resolveResponse,
       reject: rejectResponse,
     });
@@ -543,22 +719,33 @@ export function useAgentRuntime(options: {
       });
   }, [clearPendingRequest, isCurrentSelection]);
 
-  const loadConversationHistory = useCallback((conversationId: string, generation: number) => {
+  const loadConversationHistory = useCallback((
+    conversationId: string,
+    generation: number,
+    requestedTranscriptEpoch?: number,
+  ) => {
     if (historyLoaded.current.has(conversationId)) return Promise.resolve();
+    const requestEpoch = requestedTranscriptEpoch ?? transcriptEpoch.current.get(conversationId) ?? 0;
     const existing = historyInFlight.current.get(conversationId);
-    if (existing) return existing;
+    if (existing?.transcriptEpoch === requestEpoch) return existing.promise;
 
     const load = (async () => {
       let lastError: unknown;
       for (let attempt = 0; attempt < HISTORY_REQUEST_ATTEMPTS; attempt += 1) {
         if (!isCurrentSelection(conversationId, generation)) return;
         try {
-          const response = await sendSelectionRequest(conversationId, generation, "get_messages", true);
+          const response = await sendSelectionRequest(
+            conversationId,
+            generation,
+            "get_messages",
+            true,
+            {},
+            { transcriptEpoch: requestEpoch },
+          );
           if (!response || !isCurrentSelection(conversationId, generation)) return;
           if (response.success === false) throw new Error(response.error ?? "Le chargement de la conversation a échoué.");
           const data = asRecord(response.data);
           if (!Array.isArray(data?.messages)) throw new Error("Prime Agent a renvoyé un historique invalide.");
-          historyLoaded.current.add(conversationId);
           return;
         } catch (error) {
           lastError = error;
@@ -568,11 +755,11 @@ export function useAgentRuntime(options: {
         throw lastError instanceof Error ? lastError : new Error(String(lastError));
       }
     })().finally(() => {
-      if (historyInFlight.current.get(conversationId) === load) {
+      if (historyInFlight.current.get(conversationId)?.promise === load) {
         historyInFlight.current.delete(conversationId);
       }
     });
-    historyInFlight.current.set(conversationId, load);
+    historyInFlight.current.set(conversationId, { promise: load, transcriptEpoch: requestEpoch });
     return load;
   }, [isCurrentSelection, sendSelectionRequest]);
 
@@ -684,10 +871,40 @@ export function useAgentRuntime(options: {
     });
   }, []);
 
+  const reloadDeliveredQueueTranscript = useCallback((
+    conversationId: string,
+    actions: AgentSessionState["sessionActions"] | undefined,
+  ) => {
+    const token = activeSelection.current;
+    if (
+      token.conversationId !== conversationId
+      || !isCurrentSelection(conversationId, token.generation)
+      || activePromptRuns.current.has(conversationId)
+      || !shouldReloadQueuedTranscript(getConversationRef.current(conversationId), actions)
+    ) return;
+    const epoch = transcriptEpoch.current.get(conversationId) ?? 0;
+    historyLoaded.current.delete(conversationId);
+    void loadConversationHistory(conversationId, token.generation, epoch).catch(() => undefined);
+  }, [isCurrentSelection, loadConversationHistory]);
+
   const handleResponse = useCallback(
     (conversationId: string, message: RpcEnvelope) => {
       const requestId = textValue(message.id);
       const scopedCommand = SELECTION_SCOPED_COMMANDS.has(message.command ?? "");
+      const persistentPending = requestId ? pendingConversationRequests.current.get(requestId) : undefined;
+      if (persistentPending) {
+        pendingConversationRequests.current.delete(requestId!);
+        window.clearTimeout(persistentPending.timeout);
+        if (persistentPending.conversationId !== conversationId) {
+          persistentPending.reject(new Error("Prime Agent a répondu pour une autre conversation."));
+          return;
+        }
+        persistentPending.resolve(message);
+        // Export is completed by the initiating command after native
+        // validation. It must not change the health of the conversation when
+        // the file operation itself fails.
+        if (message.command === "export_html") return;
+      }
       const pending = requestId ? pendingSelectionRequests.current.get(requestId) : undefined;
       if (pending) {
         pendingSelectionRequests.current.delete(requestId!);
@@ -715,7 +932,12 @@ export function useAgentRuntime(options: {
 
       const data = message.data as Record<string, unknown> | undefined;
       if (message.command === "get_state" && data) {
-        const sessionState = data as unknown as AgentSessionState;
+        const rawSessionState = data as unknown as AgentSessionState;
+        const sessionState = {
+          ...rawSessionState,
+          sessionActions: normalizePrimeOrbitSessionActions(rawSessionState.sessionActions),
+        };
+        sessionActionsByConversation.current.set(conversationId, sessionState.sessionActions);
         setRuntimes((current) => ({
           ...current,
           [conversationId]: { ...(current[conversationId] ?? { models: [], commands: [], logs: [] }), state: sessionState },
@@ -734,10 +956,22 @@ export function useAgentRuntime(options: {
           status: sessionState.isStreaming ? "streaming" : conversation.status === "starting" ? "starting" : "idle",
           lastError: undefined,
         }, sessionState.sessionActions));
+        if (!sessionState.isStreaming) {
+          window.setTimeout(() => reloadDeliveredQueueTranscript(conversationId, sessionState.sessionActions), 0);
+        }
         return;
       }
 
       if (message.command === "get_messages" && data && Array.isArray(data.messages)) {
+        const expectedEpoch = pending?.transcriptEpoch;
+        const currentEpoch = transcriptEpoch.current.get(conversationId) ?? 0;
+        if (!shouldApplyHistoryResponse(
+          expectedEpoch,
+          currentEpoch,
+          activePromptRuns.current.has(conversationId),
+        )) {
+          return;
+        }
         historyLoaded.current.add(conversationId);
         localHistoryApplied.current.delete(conversationId);
         const mapped = mapAgentMessages(data.messages);
@@ -847,13 +1081,10 @@ export function useAgentRuntime(options: {
         return;
       }
 
-      if (message.command === "export_html" && data && typeof data.path === "string") {
-        addActivity(conversationId, {
-          type: "export",
-          title: "Session exportée",
-          detail: data.path,
-          status: "success",
-        });
+      if (message.command === "export_html") {
+        // The renderer only sees Prime Agent's private staging path here. The
+        // user-visible destination is published after native validation and
+        // atomic completion in `runCommand`.
         return;
       }
 
@@ -898,7 +1129,7 @@ export function useAgentRuntime(options: {
         updateConversation(conversationId, { model: `${model.provider}/${model.id}` });
       }
     },
-    [addActivity, isCurrentSelection, loadConversationHistory, sendSelectionRequest, updateConversation],
+    [addActivity, isCurrentSelection, loadConversationHistory, reloadDeliveredQueueTranscript, sendSelectionRequest, updateConversation],
   );
 
   const handleAgentEvent = useCallback(
@@ -929,6 +1160,7 @@ export function useAgentRuntime(options: {
         return;
       }
       if (eventType === "agent_start") {
+        transcriptEpoch.current.set(conversationId, (transcriptEpoch.current.get(conversationId) ?? 0) + 1);
         activePromptRuns.current.add(conversationId);
         updateConversation(conversationId, { status: "streaming", lastError: undefined });
         addActivity(conversationId, { type: eventType, title: "Prime Agent réfléchit", status: "running", raw: event });
@@ -949,6 +1181,13 @@ export function useAgentRuntime(options: {
         });
         addActivity(conversationId, { type: eventType, title: "Exécution terminée", status: "success", raw: event });
         window.setTimeout(() => {
+          const actions = sessionActionsByConversation.current.get(conversationId);
+          // agent_end is a stronger boundary than a possibly stale `active`
+          // field. Keep real remaining lanes, but ignore that stale marker when
+          // deciding whether the persisted transcript must resolve the turn.
+          reloadDeliveredQueueTranscript(conversationId, actions ? { ...actions, active: undefined } : actions);
+        }, 0);
+        window.setTimeout(() => {
           const token = activeSelection.current;
           if (token.conversationId !== conversationId) return;
           void sendSelectionRequest(conversationId, token.generation, "get_session_stats").catch(() => undefined);
@@ -962,6 +1201,9 @@ export function useAgentRuntime(options: {
         return;
       }
       if (eventType === "message_start" || eventType === "message_update" || eventType === "message_end") {
+        if (eventType === "message_start") {
+          transcriptEpoch.current.set(conversationId, (transcriptEpoch.current.get(conversationId) ?? 0) + 1);
+        }
         handleMessageEvent(conversationId, event, updateConversation);
         return;
       }
@@ -997,7 +1239,10 @@ export function useAgentRuntime(options: {
         return;
       }
       if (eventType === "session_action_update") {
-        const actions = event.actions as AgentSessionState["sessionActions"];
+        const actions = normalizePrimeOrbitSessionActions(
+          event.actions as AgentSessionState["sessionActions"],
+        );
+        sessionActionsByConversation.current.set(conversationId, actions);
         setRuntimes((current) => {
           const runtime = current[conversationId];
           if (!runtime?.state) return current;
@@ -1010,13 +1255,14 @@ export function useAgentRuntime(options: {
           };
         });
         updateConversation(conversationId, (conversation) => reconcileQueuedMessages(conversation, actions));
+        window.setTimeout(() => reloadDeliveredQueueTranscript(conversationId, actions), 0);
         addActivity(conversationId, {
           id: "session-actions",
           type: eventType,
           title: "File d’actions mise à jour",
           detail: summarizeSessionActions(event.actions),
           status: "info",
-          raw: event,
+          raw: { ...event, actions },
         });
         return;
       }
@@ -1183,7 +1429,7 @@ export function useAgentRuntime(options: {
         addActivity(conversationId, { type: eventType, title: humanizeEvent(eventType), status: "info", raw: event });
       }
     },
-    [addActivity, handleResponse, sendSelectionRequest, updateConversation],
+    [addActivity, handleResponse, reloadDeliveredQueueTranscript, sendSelectionRequest, updateConversation],
   );
 
   useEffect(() => {
@@ -1214,6 +1460,7 @@ export function useAgentRuntime(options: {
         started.current.delete(conversationId);
         startInFlight.current.delete(conversationId);
         const expected = intentionallyStopped.current.delete(conversationId);
+        sessionActionsByConversation.current.delete(conversationId);
         const stderr = lastStderr.current.get(conversationId);
         lastStderr.current.delete(conversationId);
         const exitDiagnostic = expected
@@ -1224,6 +1471,10 @@ export function useAgentRuntime(options: {
         cancelConversationRequests(
           conversationId,
           exitDiagnostic ?? "Prime Agent s’est arrêté pendant le chargement.",
+        );
+        cancelPersistentConversationRequests(
+          conversationId,
+          exitDiagnostic ?? "Prime Agent s’est arrêté pendant l’opération en arrière-plan.",
         );
         const terminalToolStatus: ToolActivity["status"] = expected ? "cancelled" : "failed";
         const boundaryTime = now();
@@ -1247,7 +1498,7 @@ export function useAgentRuntime(options: {
       if (isNative()) setEventsReady(false);
       unlisten?.();
     };
-  }, [addActivity, addLog, cancelConversationRequests, handleAgentEvent, onInstallComplete, onInstallProgress, updateConversation]);
+  }, [addActivity, addLog, cancelConversationRequests, cancelPersistentConversationRequests, handleAgentEvent, onInstallComplete, onInstallProgress, updateConversation]);
 
   const ensureProcessStarted = useCallback(
     async (conversation: Conversation, project: Project) => {
@@ -1371,6 +1622,139 @@ export function useAgentRuntime(options: {
     [active, addActivity, ensureProcessStarted, ensureRuntime, eventsReady, isCurrentSelection, loadConversationHistory, sendSelectionRequest, updateConversation],
   );
 
+  const refreshAfterMaintenance = useCallback(async (
+    conversationId: string,
+    kind: MaintenanceKind,
+  ) => {
+    const ownedByThisWindow = started.current.has(conversationId);
+    const transcriptWasLoaded = historyLoaded.current.has(conversationId);
+    bootstrapGeneration.current.delete(conversationId);
+    sessionActionsByConversation.current.delete(conversationId);
+    if (kind === "restart") {
+      historyLoaded.current.delete(conversationId);
+      activePromptRuns.current.delete(conversationId);
+      processExitErrors.current.delete(conversationId);
+      lastStderr.current.delete(conversationId);
+      cancelPersistentConversationRequests(
+        conversationId,
+        "Le redémarrage d’urgence a interrompu l’opération en arrière-plan.",
+      );
+    }
+    setRuntimes((current) => {
+      const runtime = current[conversationId];
+      if (!runtime) return current;
+      return {
+        ...current,
+        [conversationId]: kind === "restart"
+          ? { models: [], commands: [], logs: runtime.logs }
+          : { ...runtime, state: undefined, models: [], commands: [], stats: undefined },
+      };
+    });
+
+    const token = activeSelection.current;
+    if (!isCurrentSelection(conversationId, token.generation)) {
+      // A global event must not make an unrelated window pretend it owns the
+      // runtime. Existing native owners are preserved across a restart; other
+      // windows will acquire a lease normally when the conversation is opened.
+      if (ownedByThisWindow && kind === "restart") {
+        updateConversation(conversationId, { status: "idle", lastError: undefined });
+      }
+      return;
+    }
+
+    cancelConversationRequests(
+      conversationId,
+      kind === "restart"
+        ? "La connexion Prime Agent a été remplacée."
+        : "Les ressources Prime Agent ont été rechargées.",
+    );
+    if (kind === "reload" && transcriptWasLoaded) historyLoaded.current.add(conversationId);
+
+    const conversation = getConversationRef.current(conversationId);
+    const project = conversation ? getProjectRef.current(conversation.projectId) : undefined;
+    if (!conversation || !project) return;
+    updateConversation(conversationId, { status: "starting", lastError: undefined });
+
+    try {
+      // start_agent is idempotent and also acquires this window's lease. This
+      // matters when another window initiated the maintenance operation.
+      await ensureProcessStarted(conversation, project);
+      if (!isCurrentSelection(conversationId, token.generation)) return;
+      const stateResponse = await sendSelectionRequest(conversationId, token.generation, "get_state", true);
+      if (stateResponse?.success === false) {
+        throw new Error(stateResponse.error ?? "Prime Agent n’a pas renvoyé son état après l’opération de maintenance.");
+      }
+      if (kind === "restart") {
+        await loadConversationHistory(conversationId, token.generation);
+      }
+      await Promise.all([
+        sendSelectionRequest(conversationId, token.generation, "get_available_models", true),
+        sendSelectionRequest(conversationId, token.generation, "get_commands", true),
+      ]);
+      if (!isCurrentSelection(conversationId, token.generation)) return;
+      updateConversation(conversationId, { status: "idle", lastError: undefined });
+      void sendSelectionRequest(conversationId, token.generation, "get_session_stats").catch(() => undefined);
+      void sendSelectionRequest(conversationId, token.generation, "list_schedules", true, { includeInactive: false }).catch(() => undefined);
+      void sendSelectionRequest(conversationId, token.generation, "get_heartbeat").catch(() => undefined);
+      void sendSelectionRequest(conversationId, token.generation, "list_heartbeats").catch(() => undefined);
+    } catch (error) {
+      if (isCurrentSelection(conversationId, token.generation)) {
+        updateConversation(conversationId, {
+          status: "error",
+          lastError: redactText(error instanceof Error ? error.message : String(error)),
+        });
+      }
+      throw error;
+    }
+  }, [cancelConversationRequests, cancelPersistentConversationRequests, ensureProcessStarted, isCurrentSelection, loadConversationHistory, sendSelectionRequest, updateConversation]);
+
+  const trackMaintenanceRefresh = useCallback((conversationId: string, kind: MaintenanceKind) => {
+    const key = maintenanceEventKey(kind, conversationId);
+    maintenanceEventVersions.current.set(key, (maintenanceEventVersions.current.get(key) ?? 0) + 1);
+    const refresh = refreshAfterMaintenance(conversationId, kind);
+    maintenanceRefreshes.current.set(key, refresh);
+    // Keep the settled promise until the next event for this key. The native
+    // invoke resolves after the global event is emitted, so the initiating
+    // window can still observe a refresh failure without issuing duplicate RPC.
+    void refresh.catch(() => undefined);
+  }, [refreshAfterMaintenance]);
+
+  const awaitMaintenanceRefresh = useCallback(async (
+    conversationId: string,
+    kind: MaintenanceKind,
+    previousEventVersion: number,
+  ) => {
+    const key = maintenanceEventKey(kind, conversationId);
+    if ((maintenanceEventVersions.current.get(key) ?? 0) > previousEventVersion) {
+      await maintenanceRefreshes.current.get(key);
+      return;
+    }
+    const refresh = refreshAfterMaintenance(conversationId, kind);
+    maintenanceRefreshes.current.set(key, refresh);
+    await refresh;
+  }, [refreshAfterMaintenance]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const unlistens: Array<() => void> = [];
+    const register = (pending: Promise<() => void>) => {
+      void pending.then((unlisten) => {
+        if (cancelled) unlisten();
+        else unlistens.push(unlisten);
+      }).catch(() => undefined);
+    };
+    register(listenToAgentRestarts((result) => {
+      trackMaintenanceRefresh(result.agent.conversationId, "restart");
+    }));
+    register(listenToAgentResourceReloads(({ conversationId }) => {
+      trackMaintenanceRefresh(conversationId, "reload");
+    }));
+    return () => {
+      cancelled = true;
+      unlistens.forEach((unlisten) => unlisten());
+    };
+  }, [trackMaintenanceRefresh]);
+
   // Selection ownership is intentionally keyed only by IDs. Session metadata
   // is populated by get_state and must never invalidate an in-flight bootstrap.
   useEffect(() => {
@@ -1436,7 +1820,10 @@ export function useAgentRuntime(options: {
     selectedConversationId.current = undefined;
     activeSelection.current = { generation: activeSelection.current.generation + 1 };
     if (conversationId) cancelConversationRequests(conversationId, "La fenêtre se ferme.");
-  }, [cancelConversationRequests]);
+    for (const requestId of pendingConversationRequests.current.keys()) {
+      clearPendingConversationRequest(requestId, new Error("La fenêtre se ferme."));
+    }
+  }, [cancelConversationRequests, clearPendingConversationRequest]);
 
   const sendPrompt = useCallback(
     async (message: string, attachments: Attachment[], requestedDelivery?: "steer" | "follow_up") => {
@@ -1444,8 +1831,8 @@ export function useAgentRuntime(options: {
       const conversationId = selectedConversation.id;
       const trimmed = message.trim();
       if (!trimmed && attachments.length === 0) return;
-      if (attachments.some((item) => item.isImage && !item.attachmentHandle)) {
-        throw new Error("Image attachment handle unavailable; select the image again.");
+      if (attachments.some((item) => !item.attachmentHandle)) {
+        throw new Error("Attachment handle unavailable; select the file again.");
       }
       const beforeStart = getConversationRef.current(conversationId) ?? selectedConversation;
       const forceQueued = requestedDelivery !== undefined
@@ -1453,6 +1840,7 @@ export function useAgentRuntime(options: {
         || beforeStart.status === "streaming"
         || beforeStart.status === "tool"
         || beforeStart.status === "queued";
+      transcriptEpoch.current.set(conversationId, (transcriptEpoch.current.get(conversationId) ?? 0) + 1);
       activePromptRuns.current.add(conversationId);
       try {
         await ensureStarted(selectedConversation, selectedProject);
@@ -1460,11 +1848,7 @@ export function useAgentRuntime(options: {
         if (!forceQueued) activePromptRuns.current.delete(conversationId);
         throw error;
       }
-      const textAttachments = attachments.filter((item) => !item.isImage && item.path);
-      const attachmentContext = textAttachments.length
-        ? `\n\nFichiers joints explicitement sélectionnés (chemins locaux) :\n${textAttachments.map((item) => `- ${JSON.stringify(item.path)}`).join("\n")}`
-        : "";
-      const content = `${trimmed}${attachmentContext}`.trim();
+      const content = trimmed;
       const preparation: { value?: ReturnType<typeof beginPromptTransaction> } = {};
       const messageId = uid("user");
       const createdAt = now();
@@ -1515,15 +1899,13 @@ export function useAgentRuntime(options: {
         }, 700);
         return;
       }
-      const images = attachments
-        .filter((item) => item.isImage && item.attachmentHandle)
-        .map((item) => ({ type: "image", attachmentHandle: item.attachmentHandle }));
+      const attachmentPayload = promptAttachmentPayload(attachments);
       try {
         await sendRpc(conversationId, {
           id: uid("prompt"),
           type: "prompt",
           message: content,
-          ...(images.length ? { images } : {}),
+          ...attachmentPayload,
           ...(forceQueued
             ? { streamingBehavior: requestedDelivery === "steer" ? "steer" : "followUp" }
             : {}),
@@ -1682,8 +2064,151 @@ export function useAgentRuntime(options: {
   const runCommand = useCallback(
     async (type: string, fields: Record<string, unknown> = {}) => {
       if (!selectedConversation || !selectedProject) return;
+      if (type === "restart_agent") {
+        if (!isNative()) throw new Error("Le redémarrage d’urgence est uniquement disponible dans l’application desktop.");
+        const conversationId = selectedConversation.id;
+        const maintenanceKey = maintenanceEventKey("restart", conversationId);
+        const previousEventVersion = maintenanceEventVersions.current.get(maintenanceKey) ?? 0;
+        cancelConversationRequests(conversationId, "La connexion Prime Agent redémarre.");
+        cancelPersistentConversationRequests(conversationId, "Le redémarrage d’urgence a interrompu l’opération en arrière-plan.");
+        processExitErrors.current.delete(conversationId);
+        lastStderr.current.delete(conversationId);
+        historyLoaded.current.delete(conversationId);
+        bootstrapGeneration.current.delete(conversationId);
+        activePromptRuns.current.delete(conversationId);
+        updateConversation(conversationId, (conversation) => ({
+          ...finalizeConversationTools(conversation, "cancelled", now()),
+          status: "starting",
+          lastError: undefined,
+        }));
+        try {
+          const running = (await listRunningAgents()).some((agent) => agent.conversationId === conversationId);
+          let title: string;
+          let detail: string;
+          if (running) {
+            const result = await restartAgent(conversationId);
+            if (!result) throw new Error("Prime Agent n’a pas pu être redémarré.");
+            started.current.add(conversationId);
+            await awaitMaintenanceRefresh(conversationId, "restart", previousEventVersion);
+            title = "Connexion Prime Agent redémarrée";
+            detail = `Processus ${result.previousPid} remplacé par ${result.agent.pid}`;
+          } else {
+            // The process may already have crashed and therefore cannot be
+            // restarted. Reuse the normal validated launch path instead of
+            // reporting a misleading "no active agent" error.
+            started.current.delete(conversationId);
+            await ensureProcessStarted(selectedConversation, selectedProject);
+            await awaitMaintenanceRefresh(conversationId, "restart", previousEventVersion);
+            title = "Connexion Prime Agent relancée";
+            detail = "Aucun processus actif n’existait ; une nouvelle connexion a été ouverte depuis la session persistante.";
+          }
+          addActivity(conversationId, { type: "agent_restart", title, detail, status: "success" });
+        } catch (error) {
+          const message = redactText(error instanceof Error ? error.message : String(error));
+          updateConversation(conversationId, { status: "error", lastError: message });
+          addActivity(conversationId, {
+            type: "agent_restart_error",
+            title: "Échec du redémarrage Prime Agent",
+            detail: message,
+            status: "error",
+          });
+          throw error;
+        }
+        return;
+      }
+      if (type === "reload_resources") {
+        if (detection?.mode === "system") {
+          throw new Error("Le rechargement desktop des ressources nécessite l’installation source ou gérée de Prime Agent.");
+        }
+        await ensureStarted(selectedConversation, selectedProject);
+        const conversationId = selectedConversation.id;
+        const maintenanceKey = maintenanceEventKey("reload", conversationId);
+        const previousEventVersion = maintenanceEventVersions.current.get(maintenanceKey) ?? 0;
+        const result = await reloadAgentResources(conversationId);
+        if (result.status === "busy") {
+          const reason = result.reason === "compacting"
+            ? "un compactage est en cours"
+            : result.reason === "bash"
+              ? "une commande système est en cours"
+              : result.reason === "session_action"
+                ? "une action de session est en cours"
+                : "Prime Agent traite encore un message";
+          throw new Error(`Les ressources ne peuvent pas être rechargées maintenant : ${reason}. Attendez la fin de l’exécution puis réessayez.`);
+        }
+        if (result.status === "unavailable") {
+          throw new Error("La session Prime Agent active est introuvable. Actualisez l’état ou utilisez le redémarrage d’urgence.");
+        }
+        if (result.status === "pending") {
+          throw new Error("Prime Agent n’a pas confirmé le rechargement dans le délai de sécurité. Son état est inconnu : attendez avant de réessayer, puis utilisez « Actualiser l’état ».");
+        }
+        if (result.status === "unsupported") {
+          throw new Error("Cette installation de Prime Agent n’expose pas encore le rechargement des ressources au mode desktop.");
+        }
+        await awaitMaintenanceRefresh(conversationId, "reload", previousEventVersion);
+        addActivity(conversationId, {
+          type: "resource_reload",
+          title: "Ressources Prime Agent rechargées",
+          detail: "Réglages, skills, extensions, prompts et intégrations MCP ont été relus.",
+          status: "success",
+        });
+        return;
+      }
       await ensureStarted(selectedConversation, selectedProject);
       const token = activeSelection.current;
+      if (type === "export_html") {
+        const exportConversationId = selectedConversation.id;
+        const exportConversationTitle = selectedConversation.title;
+        const reservation = await beginHtmlExport(exportConversationId, exportConversationTitle);
+        if (!reservation) return;
+        let completed = false;
+        try {
+          const response = await sendConversationRequest(
+            exportConversationId,
+            type,
+            { ...fields, outputPath: reservation.outputPath },
+            HTML_EXPORT_RESPONSE_TIMEOUT_MS,
+          );
+          if (response.success === false) {
+            throw new Error(response.error ?? "Prime Agent n’a pas pu générer l’export HTML.");
+          }
+          const saved = await completeHtmlExport(reservation.token);
+          completed = true;
+          addActivity(exportConversationId, {
+            type: "export",
+            title: "Session exportée",
+            detail: saved.path,
+            status: "success",
+          });
+          onNotice?.({
+            kind: "html_export",
+            status: "success",
+            conversationId: exportConversationId,
+            conversationTitle: exportConversationTitle,
+            path: saved.path,
+          });
+        } catch (error) {
+          const message = redactText(error instanceof Error ? error.message : String(error));
+          addActivity(exportConversationId, {
+            type: "export",
+            title: "Échec de l’export HTML",
+            detail: message,
+            status: "error",
+          });
+          onNotice?.({
+            kind: "html_export",
+            status: "error",
+            conversationId: exportConversationId,
+            conversationTitle: exportConversationTitle,
+            error: message,
+          });
+          throw error;
+        } finally {
+          if (!completed) {
+            await cancelHtmlExport(reservation.token).catch(() => undefined);
+          }
+        }
+        return;
+      }
       if (SELECTION_SCOPED_COMMANDS.has(type) && Object.keys(fields).length === 0) {
         if (type === "get_messages") {
           historyLoaded.current.delete(selectedConversation.id);
@@ -1700,7 +2225,7 @@ export function useAgentRuntime(options: {
       }
       await sendRpc(selectedConversation.id, { id: uid(type), type, ...fields });
     },
-    [ensureStarted, loadConversationHistory, selectedConversation, selectedProject, sendSelectionRequest],
+    [addActivity, awaitMaintenanceRefresh, cancelConversationRequests, cancelPersistentConversationRequests, detection?.mode, ensureProcessStarted, ensureStarted, loadConversationHistory, onNotice, selectedConversation, selectedProject, sendConversationRequest, sendSelectionRequest, updateConversation],
   );
 
   const observeSubagent = useCallback(async (activeSessionId?: string) => {
@@ -1908,11 +2433,13 @@ export function selectForkEntryId(
   const normalize = (value: string) => value.replace(/\s+/g, " ").trim();
   const sourceText = normalize(source.content);
   const occurrence = users.filter((message) => normalize(message.content) === sourceText).length - 1;
-  const exact = candidates.filter((candidate) => normalize(candidate.text) === sourceText);
+  const exact = candidates.filter((candidate) => (
+    normalize(stripPrimeOrbitAttachmentWrapper(candidate.text)) === sourceText
+  ));
   return exact[occurrence]?.entryId ?? candidates[users.length - 1]?.entryId;
 }
 
-function handleMessageEvent(
+export function handleMessageEvent(
   conversationId: string,
   event: RpcEnvelope,
   updateConversation: (id: string, updater: Partial<Conversation> | ((current: Conversation) => Conversation)) => void,
@@ -1920,8 +2447,15 @@ function handleMessageEvent(
   const rawMessage = event.message as Record<string, unknown> | undefined;
   const role = String(rawMessage?.role ?? "assistant");
   const extracted = extractMessageText(rawMessage);
+  const eventId = String(rawMessage?.id ?? event.messageId ?? "");
   if (role === "user") {
-    if (event.type !== "message_start" || !extracted) return;
+    const messageAttachments = sanitizePrimeOrbitDocumentAttachments(rawMessage?.primeOrbitAttachments);
+    const eventDocuments = messageAttachments.length
+      ? messageAttachments
+      : sanitizePrimeOrbitDocumentAttachments(event.primeOrbitAttachments);
+    const eventImages = historicalImageAttachments(rawMessage?.content, eventId || "runtime");
+    const eventAttachments = [...eventImages, ...eventDocuments];
+    if (event.type !== "message_start" || (!extracted && !eventAttachments.length)) return;
     const timestamp = typeof rawMessage?.timestamp === "number" ? rawMessage.timestamp : undefined;
     const createdAt = timestamp && Number.isFinite(timestamp)
       ? new Date(timestamp).toISOString()
@@ -1930,11 +2464,12 @@ function handleMessageEvent(
       conversation,
       extracted,
       createdAt,
+      eventAttachments,
+      eventId || undefined,
     ));
     return;
   }
   if (role !== "assistant") return;
-  const eventId = String(rawMessage?.id ?? event.messageId ?? "");
   const assistantEvent = event.assistantMessageEvent as Record<string, unknown> | undefined;
   const isTextDelta = assistantEvent?.type === "text_delta";
   const delta = isTextDelta && typeof assistantEvent.delta === "string" ? assistantEvent.delta : "";
@@ -2289,6 +2824,277 @@ function finalizeTurnTools(conversation: Conversation, event: RpcEnvelope, event
   return finalized.status === "tool" ? { ...finalized, status: "streaming" } : finalized;
 }
 
+const PRIME_ORBIT_MANIFEST_MAX_ENCODED_CHARS = 87_382;
+const PRIME_ORBIT_MANIFEST_MAX_JSON_BYTES = 64 * 1024;
+const PRIME_ORBIT_MANIFEST_MAX_DOCUMENTS = 20;
+const PRIME_ORBIT_MANIFEST_MAX_DOCUMENT_BYTES = 20 * 1024 * 1024;
+const PRIME_ORBIT_MANIFEST_MAX_TOTAL_BYTES = 40 * 1024 * 1024;
+const PRIME_ORBIT_FRAGMENT_MAX_UTF16 = 16 * 1024 * 1024;
+const PRIME_ORBIT_CONTEXT_ID = "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+const PRIME_ORBIT_BOUNDARY_RE = new RegExp(
+  `<prime_orbit_ui_boundary v="1" id="(${PRIME_ORBIT_CONTEXT_ID})" visible_utf16="(0|[1-9][0-9]{0,9})"\\/>$`,
+  "u",
+);
+
+export interface ParsedPrimeOrbitAttachmentContext {
+  visibleText: string;
+  attachments: Attachment[];
+  contextId?: string;
+}
+
+function decodeBase64UrlUtf8(encoded: string): string | undefined {
+  if (!encoded || encoded.length > PRIME_ORBIT_MANIFEST_MAX_ENCODED_CHARS
+    || !/^[A-Za-z0-9_-]+$/u.test(encoded)) return undefined;
+  try {
+    const standard = encoded.replaceAll("-", "+").replaceAll("_", "/");
+    const padded = standard.padEnd(standard.length + ((4 - standard.length % 4) % 4), "=");
+    const binary = atob(padded);
+    const canonical = btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
+    if (canonical !== encoded) return undefined;
+    if (binary.length > PRIME_ORBIT_MANIFEST_MAX_JSON_BYTES) return undefined;
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return undefined;
+  }
+}
+
+function decodePrimeOrbitManifest(encoded: string, contextId: string): Attachment[] | undefined {
+  const json = decodeBase64UrlUtf8(encoded);
+  if (json === undefined) return undefined;
+  try {
+    const entries = JSON.parse(json) as unknown;
+    if (!Array.isArray(entries) || entries.length === 0
+      || entries.length > PRIME_ORBIT_MANIFEST_MAX_DOCUMENTS) return undefined;
+    let totalBytes = 0;
+    const attachments: Attachment[] = [];
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = asRecord(entries[index]);
+      if (!entry) return undefined;
+      const keys = Object.keys(entry).sort();
+      if (keys.join("\0") !== ["isImage", "mimeType", "name", "size"].sort().join("\0")) return undefined;
+      const { name, mimeType, size, isImage } = entry;
+      if (typeof name !== "string" || !name || new TextEncoder().encode(name).length > 2_048
+        || /[\\/\u0000-\u001f\u007f]/u.test(name)) return undefined;
+      if (typeof mimeType !== "string" || !mimeType || new TextEncoder().encode(mimeType).length > 256
+        || /[\u0000-\u001f\u007f]/u.test(mimeType)) return undefined;
+      if (!Number.isSafeInteger(size) || Number(size) < 0
+        || Number(size) > PRIME_ORBIT_MANIFEST_MAX_DOCUMENT_BYTES || isImage !== false) return undefined;
+      totalBytes += Number(size);
+      if (totalBytes > PRIME_ORBIT_MANIFEST_MAX_TOTAL_BYTES) return undefined;
+      attachments.push({
+        id: `orbit-attachment:${contextId}:${index}`,
+        name,
+        mimeType,
+        size: Number(size),
+        isImage: false,
+      });
+    }
+    return attachments;
+  } catch {
+    return undefined;
+  }
+}
+
+function escapePrimeOrbitFileName(name: string) {
+  return name
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+/** Validates the native fragments without interpreting their content. The
+ * UTF-16 length lets us skip arbitrary inline text (including tag-shaped text)
+ * while still requiring an exact one-to-one manifest match. */
+function primeOrbitFragmentsMatchManifest(fragments: string, attachments: Attachment[]) {
+  let cursor = 0;
+  for (let index = 0; index < attachments.length; index += 1) {
+    if (index > 0) {
+      if (fragments[cursor] !== "\n") return false;
+      cursor += 1;
+    }
+    const opener = `<file name="${escapePrimeOrbitFileName(attachments[index].name)}" content_utf16="`;
+    if (!fragments.startsWith(opener, cursor)) return false;
+    const encodedLengthStart = cursor + opener.length;
+    const encodedLengthEnd = fragments.indexOf('\">\n', encodedLengthStart);
+    if (encodedLengthEnd < encodedLengthStart) return false;
+    const encodedLength = fragments.slice(encodedLengthStart, encodedLengthEnd);
+    if (!/^(0|[1-9][0-9]*)$/u.test(encodedLength)) return false;
+    const contentUtf16 = Number(encodedLength);
+    if (!Number.isSafeInteger(contentUtf16) || contentUtf16 > PRIME_ORBIT_FRAGMENT_MAX_UTF16) return false;
+    const bodyStart = encodedLengthEnd + 3;
+    const bodyEnd = bodyStart + contentUtf16;
+    if (bodyEnd > fragments.length || fragments.slice(bodyEnd, bodyEnd + 8) !== "\n</file>") return false;
+    cursor = bodyEnd + 8;
+  }
+  return cursor === fragments.length;
+}
+
+/** Parses only a complete, native-generated trailing context. The boundary's
+ * UTF-16 length selects the visible prefix exactly, so prompt text containing
+ * similar tags is never searched, trimmed, or normalized. */
+export function parsePrimeOrbitAttachmentContext(content: string): ParsedPrimeOrbitAttachmentContext {
+  const fallback = { visibleText: content, attachments: [] };
+  const boundary = PRIME_ORBIT_BOUNDARY_RE.exec(content);
+  if (!boundary || boundary.index === undefined) return fallback;
+  const contextId = boundary[1];
+  const visibleUtf16 = Number(boundary[2]);
+  if (!contextId || !Number.isSafeInteger(visibleUtf16) || visibleUtf16 < 0 || visibleUtf16 > content.length) return fallback;
+  const contextStart = visibleUtf16 === 0 ? 0 : visibleUtf16 + 2;
+  if (visibleUtf16 > 0 && content.slice(visibleUtf16, contextStart) !== "\n\n") return fallback;
+  const context = content.slice(contextStart, boundary.index);
+  const open = `<prime_orbit_attachment_context v="1" id="${contextId}">\n<prime_orbit_manifest encoding="base64url">`;
+  const manifestClose = "</prime_orbit_manifest>\n";
+  const contextClose = "\n</prime_orbit_attachment_context>\n";
+  if (!context.startsWith(open) || !context.endsWith(contextClose)) return fallback;
+  const encodedStart = open.length;
+  const encodedEnd = context.indexOf(manifestClose, encodedStart);
+  if (encodedEnd < encodedStart) return fallback;
+  const fragments = context.slice(encodedEnd + manifestClose.length, -contextClose.length);
+  const attachments = decodePrimeOrbitManifest(context.slice(encodedStart, encodedEnd), contextId);
+  if (!attachments || !primeOrbitFragmentsMatchManifest(fragments, attachments)) return fallback;
+  return { visibleText: content.slice(0, visibleUtf16), attachments, contextId };
+}
+
+export function stripPrimeOrbitAttachmentWrapper(content: string) {
+  return parsePrimeOrbitAttachmentContext(content).visibleText;
+}
+
+const PRIME_ORBIT_ATTACHMENT_ID_RE = new RegExp(
+  `^orbit-attachment:(${PRIME_ORBIT_CONTEXT_ID}):(0|[1-9][0-9]*)$`,
+  "u",
+);
+
+/** Accepts only the capability-free document metadata emitted by the native
+ * sanitizer. Rebuilding each object ensures unrecognized fields such as a
+ * staging path, attachment handle, or inline bytes cannot cross into state. */
+export function sanitizePrimeOrbitDocumentAttachments(value: unknown): Attachment[] {
+  if (!Array.isArray(value) || value.length > PRIME_ORBIT_MANIFEST_MAX_DOCUMENTS) return [];
+  const attachments: Attachment[] = [];
+  let totalBytes = 0;
+  for (const candidate of value) {
+    const record = asRecord(candidate);
+    if (!record) return [];
+    const keys = Object.keys(record).sort();
+    if (keys.join("\0") !== ["id", "isImage", "mimeType", "name", "size"].sort().join("\0")) return [];
+    const { id, name, mimeType, size, isImage } = record;
+    if (typeof id !== "string" || !PRIME_ORBIT_ATTACHMENT_ID_RE.test(id)
+      || typeof name !== "string" || !name || name.length > 2_048
+      || /[\u0000-\u001f\u007f]/u.test(name)
+      || typeof mimeType !== "string" || mimeType.length > 256
+      || /[\u0000-\u001f\u007f]/u.test(mimeType)
+      || !Number.isSafeInteger(size) || Number(size) < 0
+      || Number(size) > PRIME_ORBIT_MANIFEST_MAX_DOCUMENT_BYTES
+      || isImage !== false) return [];
+    totalBytes += Number(size);
+    if (totalBytes > PRIME_ORBIT_MANIFEST_MAX_TOTAL_BYTES) return [];
+    attachments.push({ id, name, mimeType, size: Number(size), isImage: false });
+  }
+  return attachments;
+}
+
+function sanitizeRuntimeImageAttachments(value: unknown): Attachment[] {
+  if (!Array.isArray(value) || value.length > PRIME_ORBIT_MANIFEST_MAX_DOCUMENTS) return [];
+  const attachments: Attachment[] = [];
+  let totalBytes = 0;
+  for (const candidate of value) {
+    const record = asRecord(candidate);
+    if (!record) return [];
+    const allowedKeys = ["id", "isImage", "mimeType", "name", "previewDataUrl", "size"];
+    if (Object.keys(record).some((key) => !allowedKeys.includes(key))) return [];
+    const { id, name, mimeType, size, isImage, previewDataUrl } = record;
+    if (typeof id !== "string" || !id || id.length > 256
+      || /[\u0000-\u001f\u007f]/u.test(id)
+      || typeof name !== "string" || !name || name.length > 2_048
+      || /[\u0000-\u001f\u007f]/u.test(name)
+      || typeof mimeType !== "string"
+      || !["image/png", "image/jpeg", "image/webp", "image/gif"].includes(mimeType.toLowerCase())
+      || !Number.isSafeInteger(size) || Number(size) < 0 || Number(size) > 8 * 1024 * 1024
+      || isImage !== true
+      || (previewDataUrl !== undefined && (
+        typeof previewDataUrl !== "string"
+        || previewDataUrl.length > 512 * 1024
+        || !/^data:image\/(?:png|jpeg|webp|gif);base64,[a-z0-9+/=]+$/iu.test(previewDataUrl)
+      ))) return [];
+    totalBytes += Number(size);
+    if (totalBytes > 10 * 1024 * 1024) return [];
+    attachments.push({
+      id,
+      name,
+      mimeType,
+      size: Number(size),
+      isImage: true,
+      ...(typeof previewDataUrl === "string" ? { previewDataUrl } : {}),
+    });
+  }
+  return attachments;
+}
+
+function sanitizeAuthoritativeAttachments(value: unknown): Attachment[] {
+  if (!Array.isArray(value) || value.length > PRIME_ORBIT_MANIFEST_MAX_DOCUMENTS) return [];
+  const documentsInput = value.filter((candidate) => asRecord(candidate)?.isImage === false);
+  const imagesInput = value.filter((candidate) => asRecord(candidate)?.isImage === true);
+  const documents = sanitizePrimeOrbitDocumentAttachments(documentsInput);
+  const images = sanitizeRuntimeImageAttachments(imagesInput);
+  return documents.length + images.length === value.length ? [...images, ...documents] : [];
+}
+
+/** Keeps Prime Agent's queue shape while ensuring hydrated attachment
+ * contents and native staging paths never enter renderer state or matching. */
+export function normalizePrimeOrbitSessionActions(
+  actions: AgentSessionState["sessionActions"] | undefined,
+): AgentSessionState["sessionActions"] {
+  if (!actions) return { queuedCount: 0, steering: [], followUps: [] };
+  const steeringContexts = Array.isArray(actions.steering)
+    ? actions.steering.map((text) => parsePrimeOrbitAttachmentContext(String(text)))
+    : [];
+  const followUpContexts = Array.isArray(actions.followUps)
+    ? actions.followUps.map((text) => parsePrimeOrbitAttachmentContext(String(text)))
+    : [];
+  const activeContext = typeof actions.active?.label === "string"
+    ? parsePrimeOrbitAttachmentContext(actions.active.label)
+    : undefined;
+  const nativeSteeringAttachments = Array.isArray(actions.queueAttachments?.steering)
+    ? actions.queueAttachments.steering.map(sanitizePrimeOrbitDocumentAttachments)
+    : [];
+  const nativeFollowUpAttachments = Array.isArray(actions.queueAttachments?.followUps)
+    ? actions.queueAttachments.followUps.map(sanitizePrimeOrbitDocumentAttachments)
+    : [];
+  const nativeActiveAttachments = sanitizePrimeOrbitDocumentAttachments(actions.queueAttachments?.active);
+  const steering = steeringContexts.map((context) => context.visibleText);
+  const followUps = followUpContexts.map((context) => context.visibleText);
+  const active = actions.active
+    ? {
+      ...actions.active,
+      ...(activeContext ? { label: activeContext.visibleText } : {}),
+    }
+    : undefined;
+  return {
+    ...actions,
+    steering,
+    followUps,
+    queueAttachments: {
+      steering: steeringContexts.map((context, index) => (
+        nativeSteeringAttachments[index]?.length
+          ? nativeSteeringAttachments[index]!
+          : context.attachments
+      )),
+      followUps: followUpContexts.map((context, index) => (
+        nativeFollowUpAttachments[index]?.length
+          ? nativeFollowUpAttachments[index]!
+          : context.attachments
+      )),
+      ...(nativeActiveAttachments.length
+        ? { active: nativeActiveAttachments }
+        : activeContext?.attachments.length
+          ? { active: activeContext.attachments }
+          : {}),
+    },
+    ...(active ? { active } : {}),
+  };
+}
+
 export function mapAgentMessages(messages: unknown[]): ChatMessage[] {
   const mapped: ChatMessage[] = [];
   const toolLocations = new Map<string, { messageIndex: number; toolIndex: number }>();
@@ -2361,9 +3167,22 @@ export function mapAgentMessages(messages: unknown[]): ChatMessage[] {
     }
 
     if (role === "user" || role === "system") {
-      const content = extractMessageText(message) || (containsImageContent(message.content) ? "Image jointe" : "");
+      const extracted = extractMessageText(message);
+      const parsedContext = role === "user"
+        ? parsePrimeOrbitAttachmentContext(extracted)
+        : { visibleText: extracted, attachments: [] };
+      const structuredAttachments = role === "user"
+        ? sanitizePrimeOrbitDocumentAttachments(message.primeOrbitAttachments)
+        : [];
+      const attachments = [
+        ...historicalImageAttachments(message.content, index),
+        ...(structuredAttachments.length ? structuredAttachments : parsedContext.attachments),
+      ];
+      const content = role === "user"
+        ? parsedContext.visibleText
+          || (containsImageContent(message.content) ? "Image jointe" : attachments.length ? "Fichier joint" : "")
+        : extracted || (containsImageContent(message.content) ? "Image jointe" : "");
       if (!content) continue;
-      const attachments = historicalImageAttachments(message.content, index);
       mapped.push({
         id: String(message.id ?? `history-${index}`),
         role,
@@ -2384,6 +3203,15 @@ export function mapAgentMessages(messages: unknown[]): ChatMessage[] {
       continue;
     }
     if (role === "custom" && message.display === true) {
+      // Prime Agent persists injected context such as the IPython restore
+      // envelope as a displayable custom message so it can be supplied to the
+      // model on the next turn. Its terminal renderer intentionally shows only
+      // a compact status label and never the raw XML-like prompt or restored
+      // variable names. Orbit has no actionable UI for this internal event, so
+      // keep it out of the chat transcript instead of presenting it as an
+      // assistant answer. The role/type checks are important: identical text
+      // typed by a user or returned by an assistant remains visible.
+      if (isInternalCustomMessage(message)) continue;
       const content = extractMessageText(message);
       if (content) mapped.push({ id: `history-${index}`, role: "system", content, createdAt, status: "complete" });
       continue;
@@ -2415,7 +3243,22 @@ export function mapAgentMessages(messages: unknown[]): ChatMessage[] {
   return mapped;
 }
 
-function historicalImageAttachments(value: unknown, messageIndex: number): Attachment[] {
+const HIDDEN_INTERNAL_CUSTOM_TYPES = new Set(["ipython_state_restored"]);
+
+/**
+ * Some read-only histories predate preservation of `customType` in the native
+ * sanitizer. Recognize the legacy payload only when it is the complete content
+ * of a custom message; never scan or strip arbitrary user/assistant text.
+ */
+export function isInternalCustomMessage(message: Record<string, unknown>): boolean {
+  if (String(message.role ?? "") !== "custom") return false;
+  const customType = textValue(message.customType);
+  if (customType && HIDDEN_INTERNAL_CUSTOM_TYPES.has(customType)) return true;
+  const content = extractMessageText(message).trim();
+  return /^<ipython_state_restored>\s*[\s\S]*?\s*<\/ipython_state_restored>$/u.test(content);
+}
+
+function historicalImageAttachments(value: unknown, messageIndex: number | string): Attachment[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((block, blockIndex): Attachment[] => {
     const record = asRecord(block);
@@ -2435,20 +3278,63 @@ function historicalImageAttachments(value: unknown, messageIndex: number): Attac
 }
 
 export function mergeHistoricalAttachmentPreviews(next: ChatMessage[], previous: ChatMessage[]): ChatMessage[] {
-  const previousUsers = previous.filter((message) => message.role === "user");
-  let userIndex = 0;
+  const previousUsers = previous.filter((message) => message.role === "user" && message.attachments?.length);
+  const usedPrevious = new Set<number>();
   return next.map((message) => {
-    if (message.role !== "user") return message;
-    const old = previousUsers[userIndex++];
-    if (message.attachments?.some((attachment) => attachment.previewDataUrl) || !old?.attachments?.length) return message;
-    const oldImages = old.attachments.filter((attachment) => attachment.isImage);
-    if (!oldImages.length) return message;
-    const attachments = (message.attachments ?? oldImages).map((attachment, index) => ({
-      ...attachment,
-      ...(oldImages[index]?.name ? { name: oldImages[index]!.name } : {}),
-      ...(oldImages[index]?.size ? { size: oldImages[index]!.size } : {}),
-      ...(oldImages[index]?.previewDataUrl ? { previewDataUrl: oldImages[index]!.previewDataUrl } : {}),
-    }));
+    if (message.role !== "user" || !message.attachments?.length) return message;
+    const normalizedContent = normalizeQueuedText(message.content);
+    let previousIndex = previousUsers.findIndex((candidate, index) => (
+      !usedPrevious.has(index) && candidate.id === message.id
+    ));
+    if (previousIndex < 0 && normalizedContent) {
+      const messageTime = Date.parse(message.createdAt);
+      const candidates = previousUsers
+        .map((candidate, index) => ({
+          candidate,
+          index,
+          distance: Number.isFinite(messageTime) && Number.isFinite(Date.parse(candidate.createdAt))
+            ? Math.abs(messageTime - Date.parse(candidate.createdAt))
+            : Number.POSITIVE_INFINITY,
+        }))
+        .filter(({ candidate, index }) => !usedPrevious.has(index)
+          && normalizeQueuedText(candidate.content) === normalizedContent)
+        .sort((left, right) => left.distance - right.distance);
+      // History and the optimistic turn normally share a timestamp within a
+      // few seconds. A bound prevents compaction/reordering from transferring
+      // a thumbnail between old duplicate prompts.
+      if ((candidates[0]?.distance ?? Number.POSITIVE_INFINITY) <= 5 * 60_000) {
+        previousIndex = candidates[0]!.index;
+      }
+    }
+    const old = previousIndex >= 0 ? previousUsers[previousIndex] : undefined;
+    if (!old?.attachments?.length) {
+      return { ...message, attachments: message.attachments.map(durableAttachmentMetadata) };
+    }
+    usedPrevious.add(previousIndex);
+    const oldAttachments = old.attachments.map(durableAttachmentMetadata);
+    const used = new Set<number>();
+    const attachments = message.attachments.map((attachment) => {
+      const durable = durableAttachmentMetadata(attachment);
+      let matchIndex = oldAttachments.findIndex((candidate, index) => !used.has(index)
+        && candidate.isImage === durable.isImage
+        && candidate.name === durable.name
+        && candidate.mimeType === durable.mimeType);
+      if (matchIndex < 0 && durable.isImage) {
+        matchIndex = oldAttachments.findIndex((candidate, index) => !used.has(index)
+          && candidate.isImage === durable.isImage);
+      }
+      if (matchIndex < 0) return durable;
+      used.add(matchIndex);
+      const prior = oldAttachments[matchIndex]!;
+      return {
+        ...durable,
+        // Prime Agent's historical image blocks use generated names and do
+        // not retain byte size. Prefer the local bounded display metadata.
+        ...(durable.isImage && prior.name ? { name: prior.name } : {}),
+        ...(durable.isImage && prior.size ? { size: prior.size } : {}),
+        ...(prior.previewDataUrl ? { previewDataUrl: prior.previewDataUrl } : {}),
+      };
+    });
     return { ...message, attachments };
   });
 }
@@ -2677,6 +3563,9 @@ function summarizeRpcLog(line: string, event: RpcEnvelope): string {
     const data = asRecord(event.data);
     const count = Array.isArray(data?.messages) ? data.messages.length : 0;
     return `Réponse get_messages · ${count.toLocaleString("fr-FR")} message${count === 1 ? "" : "s"} · ${Math.ceil(line.length / 1_024).toLocaleString("fr-FR")} Ko`;
+  }
+  if (line.includes("<prime_orbit_attachment_context")) {
+    return `${humanizeEvent(String(event.type ?? "rpc"))} · contenu des pièces jointes masqué`;
   }
   return truncateRuntimeLog(line);
 }

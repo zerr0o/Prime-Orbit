@@ -21,10 +21,9 @@ export interface Project {
 export interface Attachment {
   id: string;
   name: string;
-  path?: string;
   mimeType: string;
   size: number;
-  /** Ephemeral, owner-scoped native cache key. Never persisted after submit. */
+  /** Ephemeral, owner-scoped native cache key. Required before submit and never persisted. */
   attachmentHandle?: string;
   /** Bounded native-generated thumbnail. Never contains the original image. */
   previewDataUrl?: string;
@@ -146,6 +145,12 @@ export interface SessionActionSnapshot {
   queuedCount: number;
   steering: string[];
   followUps: string[];
+  /** Sanitized metadata decoded from Orbit manifests; never contains capabilities or paths. */
+  queueAttachments?: {
+    steering: Attachment[][];
+    followUps: Attachment[][];
+    active?: Attachment[];
+  };
   active?: {
     kind: "turn" | "session_command";
     phase: "preparing" | "committing" | "running";
@@ -296,6 +301,16 @@ export interface PrimeAgentConnections {
   mcpServers: McpServerSummary[];
 }
 
+export interface OllamaHealth {
+  reachable: boolean;
+  /** True only when the response is positively identified as Ollama. */
+  verified: boolean;
+  /** Sanitized endpoint: native code removes credentials, query and fragment. */
+  endpoint: string;
+  latencyMs: number;
+  error?: string;
+}
+
 export interface McpServerInput {
   name: string;
   url: string;
@@ -360,10 +375,9 @@ export interface InstallProgressPayload {
 }
 
 export interface AttachmentReadResult {
-  path?: string;
   name: string;
   mimeType: string;
-  attachmentHandle?: string;
+  attachmentHandle: string;
   previewDataUrl?: string;
   size: number;
   isImage: boolean;

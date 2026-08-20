@@ -1,4 +1,4 @@
-import { useEffect, type ButtonHTMLAttributes, type PropsWithChildren, type ReactNode } from "react";
+import { useEffect, useId, useRef, type ButtonHTMLAttributes, type PropsWithChildren, type ReactNode } from "react";
 import { LoaderCircle, X } from "lucide-react";
 import { useI18n } from "../i18n";
 
@@ -29,20 +29,63 @@ export function Switch({ checked, onChange, label }: { checked: boolean; onChang
 
 export function Modal({ title, description, children, onClose, width = "560px", footer }: PropsWithChildren<{ title: string; description?: string; onClose: () => void; width?: string; footer?: ReactNode }>) {
   const { t } = useI18n();
+  const dialogRef = useRef<HTMLElement>(null);
+  const titleId = useId();
+  const descriptionId = useId();
   useEffect(() => {
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
+    const dialog = dialogRef.current;
+    const focusableSelector = [
+      "button:not([disabled])",
+      "a[href]",
+      "input:not([disabled])",
+      "select:not([disabled])",
+      "textarea:not([disabled])",
+      "[tabindex]:not([tabindex='-1'])",
+    ].join(",");
+    const focusFirstControl = () => {
+      const first = dialog?.querySelector<HTMLElement>("[autofocus]")
+        ?? dialog?.querySelector<HTMLElement>(focusableSelector);
+      (first ?? dialog)?.focus();
+    };
+    const frame = window.requestAnimationFrame(focusFirstControl);
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab" || !dialog) return;
+      const controls = Array.from(dialog.querySelectorAll<HTMLElement>(focusableSelector));
+      if (controls.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+      if (previousFocus?.isConnected) previousFocus.focus();
+    };
   }, [onClose]);
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section className="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title" style={{ maxWidth: width }}>
+      <section ref={dialogRef} className="modal-card" role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={description ? descriptionId : undefined} tabIndex={-1} style={{ maxWidth: width }}>
         <header className="modal-header">
           <div>
-            <h2 id="modal-title">{title}</h2>
-            {description ? <p>{description}</p> : null}
+            <h2 id={titleId}>{title}</h2>
+            {description ? <p id={descriptionId}>{description}</p> : null}
           </div>
           <IconButton label={t("common.close")} onClick={onClose}><X size={18} /></IconButton>
         </header>

@@ -100,6 +100,56 @@ pub(crate) fn resolve_agent_dir(home: &Path, cwd: &Path, configured: Option<&OsS
     }
 }
 
+fn resolved_session_lease_path(
+    app: &AppHandle,
+    session_path: &Path,
+    cwd: &Path,
+) -> Result<PathBuf, String> {
+    let home = app
+        .path()
+        .home_dir()
+        .map_err(|error| format!("Impossible de localiser les verrous Prime Agent: {error}"))?;
+    let configured = std::env::var_os("PRIME_AGENT_CODING_AGENT_DIR")
+        .or_else(|| std::env::var_os("PI_CODING_AGENT_DIR"));
+    let agent_dir = resolve_agent_dir(&home, cwd, configured.as_deref());
+    let canonical_session = canonicalize(session_path).map_err(|error| {
+        format!(
+            "Impossible de vérifier la session {}: {error}",
+            session_path.display()
+        )
+    })?;
+    let hash = format!(
+        "{:x}",
+        Sha256::digest(canonical_session.to_string_lossy().as_bytes())
+    );
+    Ok(agent_dir
+        .join("session-leases")
+        .join(format!("{hash}.lock")))
+}
+
+/// Returns whether the exact session still has a Prime Agent lease owner.
+/// This is used only as an attestation barrier after an ungraceful RPC client
+/// stop; the caller must not relaunch while it returns true.
+pub(crate) fn session_lease_exists(
+    app: &AppHandle,
+    session_path: &Path,
+    cwd: &Path,
+) -> Result<bool, String> {
+    let lock_path = resolved_session_lease_path(app, session_path, cwd)?;
+    match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(format!(
+            "Le verrou Prime Agent {} n’est pas un dossier local sûr",
+            lock_path.display()
+        )),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Impossible d’inspecter le verrou {}: {error}",
+            lock_path.display()
+        )),
+    }
+}
+
 #[cfg(windows)]
 fn reclaim_stale_session_lease_in(lease_root: &Path, session_path: &Path) -> Result<bool, String> {
     let canonical_session = canonicalize(session_path).map_err(|error| {

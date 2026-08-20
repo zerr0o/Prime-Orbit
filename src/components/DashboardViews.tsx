@@ -43,7 +43,7 @@ import {
 import { deleteMcpServer, inspectPrimeAgentConnections, openPrimeAgentTerminal, readModelsJson, saveMcpServer, saveModelsJson } from "../lib/bridge";
 import { useI18n } from "../i18n";
 import packageMetadata from "../../package.json";
-import type { AppView, Conversation, McpAuthKind, McpScope, McpServerSummary, ModelInfo, PersistedAppState, PrimeAgentConnections, Project, RuntimeDetection } from "../types";
+import type { AppView, Conversation, McpAuthKind, McpScope, McpServerSummary, ModelInfo, OllamaHealth, PersistedAppState, PrimeAgentConnections, Project, RuntimeDetection } from "../types";
 import { Badge, Button, EmptyState, Modal, Switch } from "./Ui";
 
 interface HomeViewProps {
@@ -138,7 +138,7 @@ export function RunsView({ projects, conversations, onConversation }: { projects
   );
 }
 
-export function ConnectionsView({ models, projectPath, onOpenSetup }: { models: ModelInfo[]; projectPath?: string; onOpenSetup: (kind: "provider" | "mcp") => void }) {
+export function ConnectionsView({ models, projectPath, ollamaHealth, ollamaHealthChecking, onCheckOllama, onOpenSetup }: { models: ModelInfo[]; projectPath?: string; ollamaHealth?: OllamaHealth; ollamaHealthChecking: boolean; onCheckOllama: () => void; onOpenSetup: (kind: "provider" | "mcp") => void }) {
   const { t } = useI18n();
   const providers = useMemo(() => {
     const map = new Map<string, ModelInfo[]>();
@@ -242,7 +242,7 @@ export function ConnectionsView({ models, projectPath, onOpenSetup }: { models: 
   const builtinMcp = (name: string) => connections?.mcpServers.find((server) => server.builtin && server.name.toLowerCase() === name);
   return (
     <div className="page-scroll standard-page connections-page">
-      <PageHeader eyebrow={t("connections.eyebrow")} title={t("connections.title")} description={t("connections.description")} actions={<><Button variant="ghost" loading={loadingConnections} onClick={() => void refreshConnections(projectPath)}><RefreshCw size={15} />{t("common.refresh")}</Button><Button variant="secondary" onClick={() => onOpenSetup("provider")}><Settings2 size={16} />{t("connections.officialGuide")}</Button></>} />
+      <PageHeader eyebrow={t("connections.eyebrow")} title={t("connections.title")} description={t("connections.description")} actions={<><Button variant="ghost" loading={loadingConnections || ollamaHealthChecking} onClick={() => { void refreshConnections(projectPath); onCheckOllama(); }}><RefreshCw size={15} />{t("common.refresh")}</Button><Button variant="secondary" onClick={() => onOpenSetup("provider")}><Settings2 size={16} />{t("connections.officialGuide")}</Button></>} />
       {notice ? <div className={`connection-notice is-${notice.tone}`}><Info size={16} /><span>{notice.message}</span><button type="button" onClick={() => setNotice(undefined)} aria-label={t("connections.closeNotice")}><X size={14} /></button></div> : null}
       <section className="connections-section">
         <SectionHeader title={t("connections.providers")} subtitle={t("connections.providerSummary", { auth: providerIds.length, catalogs: providers.length })} />
@@ -250,9 +250,35 @@ export function ConnectionsView({ models, projectPath, onOpenSetup }: { models: 
           const connectedModels = providers.filter(([id]) => provider.aliases.includes(id)).flatMap(([, entries]) => entries);
           const configuredIds = providerIds.filter((id) => provider.aliases.some((alias) => id === alias || id.startsWith(`${alias}:`)));
           const configured = configuredIds.length > 0 || connectedModels.length > 0;
+          const isOllama = provider.id === "ollama";
           const ProviderIcon = provider.icon;
-          const status = provider.id === "openai" && configuredIds.some((id) => id.startsWith("openai-codex")) ? t("connections.codexConfigured") : configuredIds.length ? t("connections.authConfigured") : connectedModels.length ? t("connections.modelsAvailable", { count: connectedModels.length }) : t("connections.notConfigured");
-          return <article key={provider.id} className="provider-card"><header><span className={`connection-logo logo-${provider.id}`}><ProviderIcon size={22} /></span><div><h3>{provider.name}</h3><p>{provider.description}</p></div><span className={`status-dot ${configured ? "is-online" : ""}`} /></header><div className="provider-card-meta"><span>{status}</span>{connectedModels.some((model) => model.input?.includes("image")) ? <Badge><Image size={12} /> Vision</Badge> : null}</div><footer>{configured ? <span><Check size={14} />{t("connections.configured")}</span> : <span className="muted-status">{t("connections.toConnect")}</span>}<Button variant={configured ? "ghost" : "secondary"} onClick={() => void openOfficialSetup("/login", `${t("common.manage")} ${provider.name}.`)}>{configured ? <Settings2 size={14} /> : <KeyRound size={14} />}{configured ? t("common.manage") : t("common.configure")}</Button></footer></article>;
+          const status = isOllama && ollamaHealthChecking
+            ? t("connections.ollamaChecking")
+            : isOllama && ollamaHealth?.reachable && ollamaHealth.verified
+              ? t("connections.ollamaOnline", { latency: ollamaHealth.latencyMs })
+              : isOllama && ollamaHealth?.reachable
+                ? t("connections.ollamaEndpointReachable")
+              : isOllama && ollamaHealth?.reachable === false
+                ? t("connections.ollamaUnavailable")
+                : provider.id === "openai" && configuredIds.some((id) => id.startsWith("openai-codex"))
+                  ? t("connections.codexConfigured")
+                  : configuredIds.length
+                    ? t("connections.authConfigured")
+                    : connectedModels.length
+                      ? t("connections.modelsAvailable", { count: connectedModels.length })
+                      : t("connections.notConfigured");
+          const providerOnline = configured && (!isOllama || (ollamaHealth?.reachable === true && ollamaHealth.verified));
+          const retryOllama = isOllama && configured && (ollamaHealthChecking || ollamaHealth?.reachable === false);
+          const providerFooterStatus = !configured
+            ? t("connections.toConnect")
+            : isOllama && ollamaHealthChecking
+              ? t("connections.ollamaChecking")
+              : isOllama && ollamaHealth?.reachable === false
+                ? t("connections.ollamaUnavailable")
+                : isOllama && ollamaHealth?.reachable && !ollamaHealth.verified
+                  ? t("connections.ollamaEndpointReachable")
+                  : t("connections.configured");
+          return <article key={provider.id} className="provider-card"><header><span className={`connection-logo logo-${provider.id}`}><ProviderIcon size={22} /></span><div><h3>{provider.name}</h3><p>{provider.description}</p></div><span className={`status-dot ${providerOnline ? "is-online" : ""}`} /></header><div className="provider-card-meta"><span>{status}</span>{connectedModels.some((model) => model.input?.includes("image")) ? <Badge><Image size={12} /> Vision</Badge> : null}</div><footer>{providerOnline ? <span><Check size={14} />{providerFooterStatus}</span> : <span className="muted-status">{providerFooterStatus}</span>}<Button variant={configured ? "ghost" : "secondary"} loading={retryOllama && ollamaHealthChecking} onClick={() => retryOllama ? onCheckOllama() : void openOfficialSetup("/login", `${t("common.manage")} ${provider.name}.`)}>{retryOllama ? <RefreshCw size={14} /> : configured ? <Settings2 size={14} /> : <KeyRound size={14} />}{retryOllama ? t("app.ollamaRecheck") : configured ? t("common.manage") : t("common.configure")}</Button></footer></article>;
         })}</div>
       </section>
       <section className="connections-section">

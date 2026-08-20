@@ -4,6 +4,35 @@ All notable changes to Prime Orbit are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-08-20
+
+### Native Prime Agent maintenance
+
+- Added Prime Agent's real `/reload` operation for settings, skills, extensions, prompts, and MCP resources without creating a model turn or restarting the session.
+- Added a per-conversation emergency restart with graceful daemon handoff, exact session-lease attestation, multi-window synchronization, and honest cancellation warnings for active work and undelivered messages.
+- Separated read-only state refresh, resource reload, and emergency restart throughout the interface, with capability gates for unsupported runtime kinds.
+- Added a native Save As flow for HTML exports, background completion across navigation, atomic final writes, and persistent success or failure notifications.
+
+### Secure attachments and history
+
+- Extended opaque, owner-scoped native attachment handles to every image and document selected, pasted, or dropped into the composer; original filesystem paths never reach the renderer or transcript.
+- Preserved unsent attachments per conversation and reconstructed safe attachment cards from history, live user events, and queued messages.
+- Added bounded native staging, payload sanitization, strict attachment manifests, retry-safe handle consumption, and lifecycle cleanup for document delivery through Prime Agent's RPC protocol.
+- Hid Prime Agent's internal IPython state-restoration envelope from the visible transcript without suppressing legitimate user or assistant text.
+
+### Reliability and integrations
+
+- Fixed late queue snapshots and history responses that could display a queued user message after its assistant reply.
+- Added bounded, chunk-aware Ollama health checks against the configured native endpoint and corrected OpenAI-compatible `/v1` URL translation.
+- Hardened session restart and reload races, Windows lease recovery, concurrent stop/start behavior, and global multi-window maintenance events.
+- Added accessible maintenance confirmations, native export errors, bilingual status feedback, and clearer queue-mode explanations.
+
+### Validation
+
+- 65 frontend unit tests and TypeScript production build.
+- 114 Rust tests, formatting, strict Clippy, and Rust 1.88 MSRV check.
+- Windows Tauri release build with NSIS and MSI installers.
+
 ## [0.1.12] - 2026-08-19
 
 ### Prime Agent fidelity
@@ -113,6 +142,7 @@ All notable changes to Prime Orbit are documented in this file.
 - TypeScript build and checks.
 - Strict Rust Clippy validation with warnings denied.
 
+[0.1.13]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.13
 [0.1.12]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.12
 [0.1.11]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.11
 [0.1.10]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.10

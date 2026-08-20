@@ -23,15 +23,20 @@ import {
   X,
 } from "lucide-react";
 import { AppContextMenu } from "./components/AppContextMenu";
-import { ConversationView } from "./components/ConversationView";
+import {
+  ConversationView,
+  releaseAllConversationAttachmentDrafts,
+  releaseConversationAttachmentDrafts,
+} from "./components/ConversationView";
 import { ConnectionsView, HomeView, Onboarding, ProjectsView, RunsView, SettingsView } from "./components/DashboardViews";
 import { GlobalRail, ProjectSidebar } from "./components/Navigation";
 import { Button, IconButton, Modal, Skeleton } from "./components/Ui";
 import { useAgentRuntime } from "./hooks/useAgentRuntime";
 import { useWorkspace } from "./hooks/useWorkspace";
-import { setAppLanguage, useI18n } from "./i18n";
+import { getAppLanguage, setAppLanguage, useI18n } from "./i18n";
 import {
   createWorkspaceWindow,
+  checkOllamaHealth,
   detectPrimeAgent,
   listGitChanges,
   listPrimeAgentSessions,
@@ -42,13 +47,20 @@ import {
   stopAgent,
 } from "./lib/bridge";
 import { redactText } from "./lib/redaction";
-import type { AppView, ExtensionUiRequest, GitChange, PersistedAppState, Project, RuntimeDetection } from "./types";
+import { runtimeNoticeToast, type RuntimeNoticeToast } from "./lib/runtime-notices";
+import type { AppView, ExtensionUiRequest, GitChange, OllamaHealth, PersistedAppState, Project, RuntimeDetection } from "./types";
 
 interface InstallState {
   running: boolean;
   outcome?: "success" | "error";
   phase?: string;
   lines: string[];
+}
+
+interface OllamaHealthState {
+  checking: boolean;
+  result?: OllamaHealth;
+  error?: string;
 }
 
 function App() {
@@ -107,10 +119,27 @@ function App() {
   const [setupKind, setSetupKind] = useState<"provider" | "mcp">("provider");
   const [changes, setChanges] = useState<GitChange[]>([]);
   const [onboardingDismissed, setOnboardingDismissed] = useState(false);
-  const [toast, setToast] = useState<{ tone: "info" | "success" | "error"; message: string }>();
+  const [toast, setToast] = useState<({ tone: "info"; message: string; persistent?: boolean } | RuntimeNoticeToast | { tone: "success" | "error"; message: string; persistent?: boolean })>();
   const [projectToDelete, setProjectToDelete] = useState<Project>();
   const [projectToRename, setProjectToRename] = useState<Project>();
   const [projectToArchive, setProjectToArchive] = useState<Project>();
+  const [ollamaHealth, setOllamaHealth] = useState<OllamaHealthState>();
+
+  useEffect(() => {
+    const releaseDraftAttachments = () => {
+      void releaseAllConversationAttachmentDrafts().catch(() => undefined);
+    };
+    window.addEventListener("pagehide", releaseDraftAttachments);
+    return () => {
+      window.removeEventListener("pagehide", releaseDraftAttachments);
+      releaseDraftAttachments();
+    };
+  }, []);
+  const [ollamaHealthGeneration, setOllamaHealthGeneration] = useState(0);
+
+  const handleRuntimeNotice = useCallback((notice: Parameters<typeof runtimeNoticeToast>[1]) => {
+    setToast(runtimeNoticeToast(getAppLanguage(), notice));
+  }, []);
 
   useEffect(() => {
     setAppLanguage(state.preferences.language);
@@ -179,7 +208,41 @@ function App() {
     updateConversation,
     onInstallProgress,
     onInstallComplete,
+    onNotice: handleRuntimeNotice,
   });
+
+  const selectedProvider = selectedConversation?.model?.split("/", 1)[0]?.toLowerCase();
+  const ollamaSelected = selectedProvider === "ollama";
+  const ollamaCatalogAvailable = agent.models.some((model) => model.provider.toLowerCase() === "ollama");
+  const shouldCheckOllama = ollamaSelected || (view === "connections" && ollamaCatalogAvailable);
+
+  useEffect(() => {
+    if (!shouldCheckOllama) {
+      setOllamaHealth(undefined);
+      return;
+    }
+    let cancelled = false;
+    setOllamaHealth((current) => ({ checking: true, result: current?.result }));
+    void checkOllamaHealth()
+      .then((result) => {
+        if (!cancelled) setOllamaHealth({ checking: false, result });
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setOllamaHealth({
+            checking: false,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [ollamaHealthGeneration, shouldCheckOllama]);
+
+  const recheckOllama = useCallback(() => {
+    setOllamaHealthGeneration((current) => current + 1);
+  }, []);
 
   useEffect(() => {
     if (!selectedProject) {
@@ -220,7 +283,10 @@ function App() {
 
   const archiveConversationAndStop = useCallback((conversationId: string) => {
     void stopAgent(conversationId)
-      .then(() => archiveConversation(conversationId))
+      .then(async () => {
+        await releaseConversationAttachmentDrafts(conversationId).catch(() => undefined);
+        archiveConversation(conversationId);
+      })
       .catch((error) => setToast({
         tone: "error",
         message: t("app.archiveFailed", { error: error instanceof Error ? error.message : String(error) }),
@@ -254,7 +320,10 @@ function App() {
 
   const removeProject = useCallback(async (project: Project) => {
     const conversations = state.conversations.filter((conversation) => conversation.projectId === project.id);
-    await Promise.allSettled(conversations.map((conversation) => stopAgent(conversation.id)));
+    await Promise.allSettled([
+      ...conversations.map((conversation) => stopAgent(conversation.id)),
+      releaseConversationAttachmentDrafts(conversations.map((conversation) => conversation.id)),
+    ]);
     const wasSelected = state.selectedProjectId === project.id;
     deleteProject(project.id);
     if (wasSelected) setView("projects");
@@ -294,6 +363,10 @@ function App() {
       archiveConversation(conversations[index]!.id);
       archivedCount += 1;
     });
+    const archivedIds = conversations
+      .filter((_, index) => results[index]?.status === "fulfilled")
+      .map((conversation) => conversation.id);
+    await releaseConversationAttachmentDrafts(archivedIds).catch(() => undefined);
     const failedCount = conversations.length - archivedCount;
     setProjectToArchive(undefined);
     setToast(failedCount > 0
@@ -325,7 +398,7 @@ function App() {
   }, [commandPalette, newConversation, openProject, setView]);
 
   useEffect(() => {
-    if (!toast) return;
+    if (!toast || toast.persistent) return;
     const timer = window.setTimeout(() => setToast(undefined), 3_500);
     return () => window.clearTimeout(timer);
   }, [toast]);
@@ -385,7 +458,7 @@ function App() {
         {view === "home" ? <HomeView projects={state.projects} conversations={state.conversations} detection={detection} onView={setView} onProject={selectProject} onConversation={selectConversation} onOpenProject={() => void openProject()} onNewConversation={newConversation} /> : null}
         {view === "projects" ? <ProjectsView projects={state.projects} conversations={state.conversations} onProject={selectProject} onOpenProject={() => void openProject()} onDeleteProject={(project) => setProjectToDelete(project)} /> : null}
         {view === "runs" ? <RunsView projects={state.projects} conversations={state.conversations} onConversation={selectConversation} /> : null}
-        {view === "connections" ? <ConnectionsView models={agent.models} projectPath={terminalProjectPath} onOpenSetup={openSetup} /> : null}
+        {view === "connections" ? <ConnectionsView models={agent.models} projectPath={terminalProjectPath} ollamaHealth={ollamaHealth?.result} ollamaHealthChecking={Boolean(ollamaHealth?.checking)} onCheckOllama={recheckOllama} onOpenSetup={openSetup} /> : null}
         {view === "settings" ? <SettingsView state={state} setState={updateState} detection={detection} installState={installState} onRefreshDetection={refreshDetection} onInstall={installPrimeAgent} /> : null}
         {view === "chat" && selectedProject && selectedConversation ? (
           <ConversationView
@@ -402,6 +475,7 @@ function App() {
             observedSubagent={agent.observedSubagent}
             inspectorOpen={state.preferences.inspectorOpen}
             changes={changes}
+            resourceReloadSupported={detection.mode !== "system"}
             onToggleInspector={toggleInspector}
             onDraftChange={(draft) => updateConversation(selectedConversation.id, { draft })}
             onSend={agent.sendPrompt}
@@ -477,12 +551,24 @@ function App() {
       {projectToRename ? <RenameProjectModal project={projectToRename} onClose={() => setProjectToRename(undefined)} onConfirm={renameProject} /> : null}
       {projectToArchive ? <ArchiveProjectModal project={projectToArchive} conversationCount={state.conversations.filter((conversation) => conversation.projectId === projectToArchive.id && !conversation.archived).length} onClose={() => setProjectToArchive(undefined)} onConfirm={archiveProjectConversations} /> : null}
       {projectToDelete ? <DeleteProjectModal project={projectToDelete} conversationCount={state.conversations.filter((conversation) => conversation.projectId === projectToDelete.id).length} onClose={() => setProjectToDelete(undefined)} onConfirm={removeProject} /> : null}
-      {toast ? <div className={`toast toast-${toast.tone}`}>{toast.tone === "success" ? <Check size={16} /> : toast.tone === "error" ? <CircleAlert size={16} /> : <Sparkles size={16} />}{toast.message}<IconButton label={t("common.close")} onClick={() => setToast(undefined)}><X size={14} /></IconButton></div> : null}
+      {toast ? <div className={`toast toast-${toast.tone}`} role={toast.tone === "error" ? "alert" : "status"} aria-live={toast.tone === "error" ? "assertive" : "polite"}>{toast.tone === "success" ? <Check size={16} /> : toast.tone === "error" ? <CircleAlert size={16} /> : <Sparkles size={16} />}<span>{toast.message}</span><IconButton label={t("common.close")} onClick={() => setToast(undefined)}><X size={14} /></IconButton></div> : null}
       {workspaceSaveError ? (
         <div className="toast toast-error" role="alert" title={workspaceSaveError} style={{ bottom: toast ? 94 : 42 }}>
           <CircleAlert size={16} />
           <span>{state.preferences.language === "en" ? "Workspace changes could not be saved." : "Les modifications de l’espace de travail n’ont pas pu être enregistrées."}</span>
           <Button variant="ghost" onClick={retryWorkspaceSave}>{state.preferences.language === "en" ? "Retry" : "Réessayer"}</Button>
+        </div>
+      ) : null}
+      {ollamaSelected && (ollamaHealth?.result?.reachable === false || ollamaHealth?.error) ? (
+        <div
+          className="toast toast-error"
+          role="alert"
+          style={{ bottom: 42 + (toast ? 52 : 0) + (workspaceSaveError ? 52 : 0), maxWidth: 500 }}
+          title={ollamaHealth.result?.error ?? ollamaHealth.error}
+        >
+          <CircleAlert size={16} />
+          <span>{t("app.ollamaUnavailable", { endpoint: ollamaHealth.result?.endpoint ?? "Ollama" })}</span>
+          <Button variant="ghost" loading={ollamaHealth.checking} onClick={recheckOllama}>{t("app.ollamaRecheck")}</Button>
         </div>
       ) : null}
     </div>

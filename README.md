@@ -63,10 +63,10 @@ Prime Agent's interactive `/login`, `/logout`, and OAuth MCP flows still run in 
 4. Let the onboarding flow detect Prime Agent, or use **Quick install** to install it from the official repository.
 5. Configure a provider, create a conversation, and start working.
 
-The 0.1.12 desktop build is validated on Windows 10/11 x64. Microsoft Edge WebView2 is normally already present on supported Windows installations.
+The 0.1.13 desktop build is validated on Windows 10/11 x64. Microsoft Edge WebView2 is normally already present on supported Windows installations.
 
 > [!IMPORTANT]
-> The 0.1.12 installers are not code-signed yet. Windows SmartScreen may display an unknown-publisher warning. Verify the SHA-256 values in the release notes before running a downloaded installer.
+> The 0.1.13 installers are not code-signed yet. Windows SmartScreen may display an unknown-publisher warning. Verify the SHA-256 values in the release notes before running a downloaded installer.
 
 ### Prime Agent requirements
 
@@ -180,7 +180,7 @@ Tauri writes platform bundles under `src-tauri/target/release/bundle/`.
 
 ## Release status
 
-Prime Orbit is an early desktop release. Version 0.1.12 ships Windows x64 NSIS and MSI installers. macOS and Linux code paths exist, but official binaries have not yet been validated or published.
+Prime Orbit is an early desktop release. Version 0.1.13 ships Windows x64 NSIS and MSI installers. macOS and Linux code paths exist, but official binaries have not yet been validated or published.
 
 See [CHANGELOG.md](CHANGELOG.md) for release details.
 

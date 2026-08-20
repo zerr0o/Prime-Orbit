@@ -1,5 +1,6 @@
 mod agents;
 mod connections;
+mod exports;
 mod files;
 mod install;
 #[cfg(windows)]
@@ -11,11 +12,14 @@ mod session_lease;
 mod storage;
 
 use agents::AgentsState;
+use exports::HtmlExportState;
 use files::AttachmentCache;
 use install::InstallState;
 use serde::Serialize;
 use storage::PersistenceLock;
 use tauri::{Emitter, Manager};
+
+pub(crate) const MAX_RPC_BYTES: usize = 16 * 1024 * 1024;
 
 /// Moves filesystem and process work off Tauri's command executor. Keeping
 /// command futures lightweight is especially important during startup, when
@@ -58,6 +62,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AgentsState::default())
         .manage(AttachmentCache::default())
+        .manage(HtmlExportState::default())
         .manage(InstallState::default())
         .manage(PersistenceLock::default())
         .invoke_handler(tauri::generate_handler![
@@ -70,7 +75,9 @@ pub fn run() {
             agents::release_agent,
             agents::send_rpc,
             agents::mutate_agent_queue,
+            agents::reload_agent_resources,
             agents::stop_agent,
+            agents::restart_agent,
             agents::list_running_agents,
             session_history::load_session_history,
             session_history::list_prime_agent_sessions,
@@ -81,17 +88,28 @@ pub fn run() {
             install::quick_install_prime_agent,
             install::is_prime_agent_installing,
             files::pick_attachments,
+            files::admit_dropped_attachment,
             files::release_attachment_handles,
+            exports::begin_html_export,
+            exports::complete_html_export,
+            exports::cancel_html_export,
             files::list_git_changes,
             files::get_git_file_diff,
             files::open_project_folder,
             files::open_git_file_folder,
             connections::inspect_prime_agent_connections,
+            connections::check_ollama_health,
             connections::save_mcp_server,
             connections::delete_mcp_server,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Prime Orbit");
+
+    if let Ok(app_data_dir) = app.path().app_data_dir() {
+        tauri::async_runtime::spawn_blocking(move || {
+            files::cleanup_fallback_attachment_artifacts_throttled(&app_data_dir);
+        });
+    }
 
     app.run(|app, event| match event {
         tauri::RunEvent::WindowEvent {
@@ -104,10 +122,12 @@ pub fn run() {
             // active agents are retained until their agent_end boundary.
             let agents = app.state::<AgentsState>().inner().clone();
             let attachments = app.state::<AttachmentCache>().inner().clone();
+            let exports = app.state::<HtmlExportState>().inner().clone();
             let attachment_owner = label.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 agents::release_window_agents(agents, label);
                 files::release_window_attachments(attachments, &attachment_owner);
+                exports::release_window_exports(exports, &attachment_owner);
             });
         }
         tauri::RunEvent::ExitRequested { .. } => {

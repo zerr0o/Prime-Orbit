@@ -13,6 +13,7 @@ import type {
   McpScope,
   McpServerInput,
   McpServerSummary,
+  OllamaHealth,
   PersistedAppState,
   PrimeAgentConnections,
   RuntimeDetection,
@@ -89,13 +90,31 @@ export interface RunningAgentInfo {
   pid: number;
   cwd: string;
   sessionPath?: string;
+  sessionId?: string;
   provider?: string;
   model?: string;
   thinking?: string;
   startedAt: number;
 }
 
+export interface RestartAgentResult {
+  previousPid: number;
+  agent: RunningAgentInfo;
+}
+
+export type ReloadAgentResourcesResult =
+  | { status: "reloaded"; supported: true }
+  | { status: "busy"; supported: true; reason: "streaming" | "compacting" | "bash" | "session_action" }
+  | { status: "unavailable"; supported: true; reason: "inactive_session" }
+  | { status: "pending"; supported: true; reason: "timeout" }
+  | { status: "unsupported"; supported: false; reason: "runtime_kind" | "daemon_protocol" | "daemon_command" };
+
+export interface AgentResourcesReloadedEvent {
+  conversationId: string;
+}
+
 let detectionInFlight: Promise<RuntimeDetection> | undefined;
+let ollamaHealthInFlight: Promise<OllamaHealth> | undefined;
 
 function mapDetection(raw: NativeDetection, items: NativePrerequisite[] = []): RuntimeDetection {
   return {
@@ -243,6 +262,43 @@ export async function stopAgent(conversationId: string): Promise<void> {
   await invoke("stop_agent", { conversationId });
 }
 
+/**
+ * Emergency-restarts the native Prime Agent RPC client for one conversation
+ * while retaining its cwd, resume session, model options, and all window
+ * leases. Unlike a get_state resynchronization, this closes the RPC client
+ * gracefully, attests daemon lease release, then relaunches it. Forced
+ * termination is used only after the bounded graceful timeout.
+ */
+export async function restartAgent(conversationId: string): Promise<RestartAgentResult | undefined> {
+  if (!isNative()) return undefined;
+  return invoke<RestartAgentResult>("restart_agent", { conversationId });
+}
+
+/**
+ * Rebuilds Prime Agent's resources for the active daemon session without
+ * creating a model turn or restarting the process. This is the native `/reload`
+ * capability: callers must handle busy, unavailable, and unsupported states.
+ */
+export async function reloadAgentResources(conversationId: string): Promise<ReloadAgentResourcesResult> {
+  if (!isNative()) return { status: "unsupported", supported: false, reason: "runtime_kind" };
+  return invoke<ReloadAgentResourcesResult>("reload_agent_resources", { conversationId });
+}
+
+export async function listenToAgentRestarts(
+  handler: Handler<RestartAgentResult>,
+): Promise<UnlistenFn> {
+  if (!isNative()) return () => undefined;
+  return listen<RestartAgentResult>("prime-agent://restarted", (event) => handler(event.payload));
+}
+
+/** Broadcast after Prime Agent has acknowledged a completed resource reload. */
+export async function listenToAgentResourceReloads(
+  handler: Handler<AgentResourcesReloadedEvent>,
+): Promise<UnlistenFn> {
+  if (!isNative()) return () => undefined;
+  return listen<AgentResourcesReloadedEvent>("prime-agent://resources-reloaded", (event) => handler(event.payload));
+}
+
 export async function listRunningAgents(): Promise<RunningAgentInfo[]> {
   if (!isNative()) return [];
   return invoke<RunningAgentInfo[]>("list_running_agents");
@@ -296,15 +352,60 @@ export async function pickProjectFolder(): Promise<string | null> {
 
 export async function pickAttachments(
   remainingCount: number,
+  remainingAttachmentBytes: number,
   remainingImageBytes: number,
 ): Promise<AttachmentReadResult[]> {
   if (!isNative()) return [];
-  return invoke<AttachmentReadResult[]>("pick_attachments", { remainingCount, remainingImageBytes });
+  return invoke<AttachmentReadResult[]>("pick_attachments", { remainingCount, remainingAttachmentBytes, remainingImageBytes });
+}
+
+/**
+ * Transfers a file explicitly dropped or pasted by the user as raw IPC bytes.
+ * This avoids a base64/JSON copy and never grants the renderer a filesystem path.
+ */
+export async function admitDroppedAttachment(
+  file: File,
+  remainingAttachmentBytes: number,
+  remainingImageBytes: number,
+): Promise<AttachmentReadResult> {
+  if (!isNative()) throw new Error("Native attachment admission is unavailable");
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  return invoke<AttachmentReadResult>("admit_dropped_attachment", bytes, {
+    headers: {
+      "x-prime-orbit-file-name": encodeURIComponent(file.name),
+      "x-prime-orbit-mime-type": file.type,
+      "x-prime-orbit-remaining-attachment-bytes": String(remainingAttachmentBytes),
+      "x-prime-orbit-remaining-image-bytes": String(remainingImageBytes),
+    },
+  });
 }
 
 export async function releaseAttachmentHandles(handles: string[]): Promise<void> {
   if (!isNative() || handles.length === 0) return;
   await invoke("release_attachment_handles", { handles });
+}
+
+export interface HtmlExportReservation {
+  token: string;
+  outputPath: string;
+}
+
+export async function beginHtmlExport(
+  conversationId: string,
+  suggestedName: string,
+): Promise<HtmlExportReservation | null> {
+  if (!isNative()) return null;
+  return invoke<HtmlExportReservation | null>("begin_html_export", { conversationId, suggestedName });
+}
+
+export async function completeHtmlExport(token: string): Promise<{ path: string }> {
+  if (!isNative()) throw new Error("L’export HTML natif n’est pas disponible dans ce mode.");
+  return invoke<{ path: string }>("complete_html_export", { token });
+}
+
+export async function cancelHtmlExport(token: string): Promise<void> {
+  if (!isNative()) return;
+  await invoke("cancel_html_export", { token });
 }
 
 export async function listGitChanges(cwd: string): Promise<GitChange[]> {
@@ -369,6 +470,25 @@ export async function inspectPrimeAgentConnections(cwd?: string): Promise<PrimeA
     };
   }
   return invoke<PrimeAgentConnections>("inspect_prime_agent_connections", { cwd: cwd ?? null });
+}
+
+/**
+ * Checks the endpoint configured for Prime Agent's Ollama provider. The native
+ * command runs the bounded network probe away from the WebView event loop.
+ */
+export async function checkOllamaHealth(): Promise<OllamaHealth> {
+  if (!isNative()) {
+    return { reachable: true, verified: true, endpoint: "http://127.0.0.1:11434/v1", latencyMs: 0 };
+  }
+  if (!ollamaHealthInFlight) {
+    ollamaHealthInFlight = invoke<OllamaHealth>("check_ollama_health");
+  }
+  const request = ollamaHealthInFlight;
+  try {
+    return await request;
+  } finally {
+    if (ollamaHealthInFlight === request) ollamaHealthInFlight = undefined;
+  }
 }
 
 export async function saveMcpServer(cwd: string | undefined, scope: McpScope, server: McpServerInput): Promise<{ path: string; backupPath: string | null; server: McpServerSummary }> {

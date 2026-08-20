@@ -2,33 +2,55 @@ use crate::{
     paths::canonicalize,
     runtime::{capture_command_output, external_command, find_program},
 };
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use image::ImageFormat;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
     fs::{self, File},
-    io::{Cursor, Read},
+    io::{BufRead, BufReader, Cursor, Read},
     path::{Component, Path, PathBuf},
     process::{ExitStatus, Output, Stdio},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
-use tauri::{AppHandle, Manager, WebviewWindow};
+use tauri::{
+    ipc::{InvokeBody, Request},
+    AppHandle, Manager, WebviewWindow,
+};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
 
 const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_DOCUMENT_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 40 * 1024 * 1024;
+const MAX_INLINE_DOCUMENT_BYTES: usize = 1024 * 1024;
 const MAX_ATTACHMENT_COUNT: usize = 20;
-const MAX_CACHED_IMAGE_BYTES: u64 = 40 * 1024 * 1024;
-const MAX_CACHED_IMAGE_COUNT: usize = 80;
-const CACHED_IMAGE_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_ORBIT_MANIFEST_BYTES: usize = 64 * 1024;
+const MAX_ORBIT_MANIFEST_ENCODED_CHARS: usize = 87_382;
+const MAX_ATTACHMENT_NAME_BYTES: usize = 2_048;
+const MAX_ATTACHMENT_MIME_BYTES: usize = 256;
+const MAX_OWNER_CACHED_ATTACHMENT_BYTES: u64 = 40 * 1024 * 1024;
+const MAX_OWNER_CACHED_ATTACHMENT_COUNT: usize = 80;
+const MAX_CACHED_ATTACHMENT_BYTES: u64 = 160 * 1024 * 1024;
+const MAX_CACHED_ATTACHMENT_COUNT: usize = 320;
+const CACHED_ATTACHMENT_TTL: Duration = Duration::from_secs(30 * 60);
+const FALLBACK_ARTIFACT_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+const FALLBACK_ARTIFACT_ACTIVE_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+const FALLBACK_ARTIFACT_CLEANUP_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const MAX_FALLBACK_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_FALLBACK_ARTIFACT_CONVERSATIONS: usize = 256;
+const MAX_FALLBACK_ARTIFACT_ENTRIES: usize = 20_000;
 const MAX_GIT_DIFF_BYTES: usize = 192 * 1024;
 const MAX_GIT_ERROR_BYTES: usize = 32 * 1024;
 const MAX_UNTRACKED_STAT_BYTES: u64 = 2 * 1024 * 1024;
@@ -43,8 +65,6 @@ fn supported_inline_image(mime_type: &str) -> bool {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttachmentData {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
     pub name: String,
     pub mime_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,49 +75,78 @@ pub struct AttachmentData {
     pub is_image: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublicAttachmentMetadata {
+    pub id: String,
+    pub name: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub is_image: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OrbitAttachmentContext {
+    pub context_id: String,
+    pub visible_text: String,
+    pub attachments: Vec<PublicAttachmentMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AttachmentManifestEntry {
+    name: String,
+    mime_type: String,
+    size: u64,
+    is_image: bool,
+}
+
 #[derive(Clone)]
 pub struct AttachmentCache(Arc<Mutex<AttachmentCacheInner>>);
 
 impl Default for AttachmentCache {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(AttachmentCacheInner::default())))
+        Self(Arc::new(Mutex::new(AttachmentCacheInner {
+            attachments: HashMap::new(),
+            total_bytes: 0,
+        })))
     }
 }
 
-#[derive(Default)]
 struct AttachmentCacheInner {
-    images: HashMap<String, CachedImage>,
+    attachments: HashMap<String, CachedAttachment>,
     total_bytes: u64,
 }
 
-struct CachedImage {
+struct CachedAttachment {
     owner: String,
+    name: String,
     mime_type: String,
     bytes: Vec<u8>,
+    is_image: bool,
     inserted_at: Instant,
     reserved: bool,
 }
 
-struct PreparedImage {
+#[derive(Debug)]
+struct PreparedAttachment {
     name: String,
     mime_type: String,
     bytes: Vec<u8>,
-    preview_data_url: String,
+    preview_data_url: Option<String>,
+    is_image: bool,
 }
 
-enum PreparedAttachment {
-    Image(PreparedImage),
-    Document(AttachmentData),
-}
-
-pub(crate) struct ImageReservation {
+pub(crate) struct AttachmentReservation {
     cache: AttachmentCache,
     owner: String,
     handles: Vec<String>,
+    staged_directories: Vec<PathBuf>,
+    staging_context: Option<PathBuf>,
     committed: bool,
 }
 
-impl ImageReservation {
+impl AttachmentReservation {
     pub(crate) fn commit(mut self) {
         self.cache
             .finish_reservation(&self.owner, &self.handles, true);
@@ -105,11 +154,18 @@ impl ImageReservation {
     }
 }
 
-impl Drop for ImageReservation {
+impl Drop for AttachmentReservation {
     fn drop(&mut self) {
         if !self.committed {
             self.cache
                 .finish_reservation(&self.owner, &self.handles, false);
+            if let Some(context) = self.staging_context.as_ref() {
+                let _ = fs::remove_dir_all(context);
+            } else {
+                for directory in &self.staged_directories {
+                    let _ = fs::remove_dir_all(directory);
+                }
+            }
         }
     }
 }
@@ -174,20 +230,15 @@ fn regular_file(path: PathBuf) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err("Le chemin de la pièce jointe doit être absolu".to_string());
     }
-    let link_metadata = fs::symlink_metadata(&path).map_err(|error| {
-        format!(
-            "La pièce jointe {} est inaccessible: {error}",
-            path.display()
-        )
-    })?;
+    let link_metadata = fs::symlink_metadata(&path)
+        .map_err(|error| format!("La pièce jointe sélectionnée est inaccessible: {error}"))?;
     if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
-        return Err(format!(
-            "La pièce jointe {} doit être un fichier régulier non symbolique",
-            path.display()
-        ));
+        return Err(
+            "La pièce jointe sélectionnée doit être un fichier régulier non symbolique".to_string(),
+        );
     }
     canonicalize(&path)
-        .map_err(|error| format!("Impossible de résoudre {}: {error}", path.display()))
+        .map_err(|error| format!("Impossible de résoudre la pièce jointe sélectionnée: {error}"))
 }
 
 fn image_signature_matches(mime_type: &str, bytes: &[u8]) -> bool {
@@ -223,6 +274,7 @@ pub(crate) fn image_preview_data_url(mime_type: &str, bytes: &[u8]) -> Result<St
 
 fn read_selected_attachment(
     path: PathBuf,
+    remaining_attachment_bytes: u64,
     remaining_image_bytes: u64,
 ) -> Result<PreparedAttachment, String> {
     let path = regular_file(path)?;
@@ -236,76 +288,121 @@ fn read_selected_attachment(
         .and_then(|value| value.to_str())
         .map(str::to_string)
         .ok_or_else(|| "Le nom de la pièce jointe n’est pas représentable en UTF-8".to_string())?;
-
-    // Non-image documents deliberately remain external path references. Their
-    // contents never cross the native/WebView boundary.
-    if !is_image {
-        let size = fs::metadata(&path)
-            .map_err(|error| format!("Impossible d’inspecter {}: {error}", path.display()))?
-            .len();
-        return Ok(PreparedAttachment::Document(AttachmentData {
-            path: Some(path.to_string_lossy().into_owned()),
-            name,
-            mime_type,
-            attachment_handle: None,
-            preview_data_url: None,
-            size,
-            is_image: false,
-        }));
+    if name.is_empty() || name.chars().any(char::is_control) {
+        return Err("Le nom de la pièce jointe sélectionnée est invalide.".to_string());
     }
 
     // Open once, then derive both the real byte count and the cached content
     // from that same handle. A bounded max+1 read detects a file that grew
     // after metadata inspection without ever allocating unbounded memory.
-    let allowed_bytes = MAX_IMAGE_ATTACHMENT_BYTES.min(remaining_image_bytes);
+    let per_file_limit = if is_image {
+        MAX_IMAGE_ATTACHMENT_BYTES
+    } else {
+        MAX_DOCUMENT_ATTACHMENT_BYTES
+    };
+    let allowed_bytes = if is_image {
+        per_file_limit
+            .min(remaining_attachment_bytes)
+            .min(remaining_image_bytes)
+    } else {
+        per_file_limit.min(remaining_attachment_bytes)
+    };
     let file = File::open(&path)
-        .map_err(|error| format!("Impossible de lire {}: {error}", path.display()))?;
+        .map_err(|error| format!("Impossible de lire la pièce jointe {name}: {error}"))?;
     let declared_size = file
         .metadata()
-        .map_err(|error| format!("Impossible d’inspecter {}: {error}", path.display()))?
+        .map_err(|error| format!("Impossible d’inspecter la pièce jointe {name}: {error}"))?
         .len();
     if declared_size > allowed_bytes {
         return Err(format!(
-            "L’image fait {declared_size} octets; elle dépasse le budget restant de {allowed_bytes} octets"
+            "La pièce jointe fait {declared_size} octets; elle dépasse le budget restant de {allowed_bytes} octets"
         ));
     }
     let mut bytes = Vec::with_capacity(declared_size.min(allowed_bytes) as usize);
     file.take(allowed_bytes + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| format!("Impossible de lire {}: {error}", path.display()))?;
+        .map_err(|error| format!("Impossible de lire la pièce jointe {name}: {error}"))?;
     if bytes.len() as u64 > allowed_bytes {
         return Err(format!(
-            "L’image dépasse le budget restant de {allowed_bytes} octets"
+            "La pièce jointe dépasse le budget restant de {allowed_bytes} octets"
         ));
     }
-    if !image_signature_matches(&mime_type, &bytes) {
+    if is_image && !image_signature_matches(&mime_type, &bytes) {
         return Err(format!(
-            "{} ne contient pas une image {} valide",
-            path.display(),
-            mime_type
+            "La pièce jointe {name} ne contient pas une image {mime_type} valide"
         ));
     }
-    let preview_data_url = image_preview_data_url(&mime_type, &bytes)?;
-    Ok(PreparedAttachment::Image(PreparedImage {
+    let preview_data_url = is_image
+        .then(|| image_preview_data_url(&mime_type, &bytes))
+        .transpose()?;
+    Ok(PreparedAttachment {
         name,
         mime_type,
         bytes,
         preview_data_url,
-    }))
+        is_image,
+    })
+}
+
+fn prepare_attachment_paths(
+    paths: Vec<PathBuf>,
+    remaining_count: usize,
+    remaining_attachment_bytes: u64,
+    remaining_image_bytes: u64,
+) -> Result<Vec<PreparedAttachment>, String> {
+    if remaining_count > MAX_ATTACHMENT_COUNT
+        || remaining_attachment_bytes > MAX_TOTAL_ATTACHMENT_BYTES
+        || remaining_image_bytes > MAX_TOTAL_IMAGE_BYTES
+    {
+        return Err("Le budget de pièces jointes demandé est invalide.".to_string());
+    }
+    if paths.len() > remaining_count {
+        return Err(format!(
+            "Vous pouvez encore joindre {remaining_count} fichier(s)."
+        ));
+    }
+
+    let mut prepared = Vec::with_capacity(paths.len());
+    let mut total_attachment_bytes = 0_u64;
+    let mut total_image_bytes = 0_u64;
+    for path in paths {
+        let available = remaining_attachment_bytes.saturating_sub(total_attachment_bytes);
+        let available_images = remaining_image_bytes.saturating_sub(total_image_bytes);
+        let attachment = read_selected_attachment(path, available, available_images)?;
+        total_attachment_bytes =
+            total_attachment_bytes.saturating_add(attachment.bytes.len() as u64);
+        if attachment.is_image {
+            total_image_bytes = total_image_bytes.saturating_add(attachment.bytes.len() as u64);
+        }
+        if total_attachment_bytes > remaining_attachment_bytes {
+            return Err(
+                "Le total des pièces jointes dépasse 40 Mio; réduisez leur taille ou leur nombre"
+                    .to_string(),
+            );
+        }
+        if total_image_bytes > remaining_image_bytes {
+            return Err("Le total des images jointes dépasse 10 Mio.".to_string());
+        }
+        prepared.push(attachment);
+    }
+    Ok(prepared)
 }
 
 fn purge_expired(inner: &mut AttachmentCacheInner, now: Instant) {
     let expired = inner
-        .images
+        .attachments
         .iter()
-        .filter(|(_, image)| {
-            !image.reserved && now.duration_since(image.inserted_at) >= CACHED_IMAGE_TTL
+        .filter(|(_, attachment)| {
+            !attachment.reserved
+                && now.duration_since(attachment.inserted_at) >= CACHED_ATTACHMENT_TTL
         })
         .map(|(handle, _)| handle.clone())
         .collect::<Vec<_>>();
     for handle in expired {
-        if let Some(image) = inner.images.remove(&handle) {
-            inner.total_bytes = inner.total_bytes.saturating_sub(image.bytes.len() as u64);
+        if let Some(attachment) = inner.attachments.remove(&handle) {
+            inner.total_bytes = inner
+                .total_bytes
+                .saturating_sub(attachment.bytes.len() as u64);
         }
     }
 }
@@ -316,94 +413,116 @@ impl AttachmentCache {
         owner: &str,
         prepared: Vec<PreparedAttachment>,
     ) -> Result<Vec<AttachmentData>, String> {
-        let new_count = prepared
-            .iter()
-            .filter(|attachment| matches!(attachment, PreparedAttachment::Image(_)))
-            .count();
-        let new_bytes = prepared
-            .iter()
-            .fold(0_u64, |total, attachment| match attachment {
-                PreparedAttachment::Image(image) => total.saturating_add(image.bytes.len() as u64),
-                PreparedAttachment::Document(_) => total,
-            });
+        let new_count = prepared.len();
+        let new_bytes = prepared.iter().fold(0_u64, |total, attachment| {
+            total.saturating_add(attachment.bytes.len() as u64)
+        });
         let now = Instant::now();
         let mut inner = self.0.lock();
         purge_expired(&mut inner, now);
-        if inner.images.len().saturating_add(new_count) > MAX_CACHED_IMAGE_COUNT
-            || inner.total_bytes.saturating_add(new_bytes) > MAX_CACHED_IMAGE_BYTES
+        let owner_count = inner
+            .attachments
+            .values()
+            .filter(|attachment| attachment.owner == owner)
+            .count();
+        let owner_bytes = inner
+            .attachments
+            .values()
+            .filter(|attachment| attachment.owner == owner)
+            .fold(0_u64, |total, attachment| {
+                total.saturating_add(attachment.bytes.len() as u64)
+            });
+        if owner_count.saturating_add(new_count) > MAX_OWNER_CACHED_ATTACHMENT_COUNT
+            || owner_bytes.saturating_add(new_bytes) > MAX_OWNER_CACHED_ATTACHMENT_BYTES
         {
             return Err(
-                "Le cache sécurisé des images est plein. Envoyez ou retirez des images avant d’en joindre d’autres."
+                "Le cache sécurisé de cette fenêtre est plein. Envoyez ou retirez des fichiers avant d’en joindre d’autres."
+                    .to_string(),
+            );
+        }
+        if inner.attachments.len().saturating_add(new_count) > MAX_CACHED_ATTACHMENT_COUNT
+            || inner.total_bytes.saturating_add(new_bytes) > MAX_CACHED_ATTACHMENT_BYTES
+        {
+            return Err(
+                "Le cache sécurisé des pièces jointes est plein. Envoyez ou retirez des fichiers avant d’en joindre d’autres."
                     .to_string(),
             );
         }
 
         let mut result = Vec::with_capacity(prepared.len());
         for attachment in prepared {
-            match attachment {
-                PreparedAttachment::Document(document) => result.push(document),
-                PreparedAttachment::Image(image) => {
-                    let size = image.bytes.len() as u64;
-                    let handle = Uuid::new_v4().to_string();
-                    result.push(AttachmentData {
-                        path: None,
-                        name: image.name,
-                        mime_type: image.mime_type.clone(),
-                        attachment_handle: Some(handle.clone()),
-                        preview_data_url: Some(image.preview_data_url),
-                        size,
-                        is_image: true,
-                    });
-                    inner.total_bytes = inner.total_bytes.saturating_add(size);
-                    inner.images.insert(
-                        handle,
-                        CachedImage {
-                            owner: owner.to_string(),
-                            mime_type: image.mime_type,
-                            bytes: image.bytes,
-                            inserted_at: now,
-                            reserved: false,
-                        },
-                    );
-                }
-            }
+            let size = attachment.bytes.len() as u64;
+            let handle = Uuid::new_v4().to_string();
+            result.push(AttachmentData {
+                name: attachment.name.clone(),
+                mime_type: attachment.mime_type.clone(),
+                attachment_handle: Some(handle.clone()),
+                preview_data_url: attachment.preview_data_url,
+                size,
+                is_image: attachment.is_image,
+            });
+            inner.total_bytes = inner.total_bytes.saturating_add(size);
+            inner.attachments.insert(
+                handle,
+                CachedAttachment {
+                    owner: owner.to_string(),
+                    name: attachment.name,
+                    mime_type: attachment.mime_type,
+                    bytes: attachment.bytes,
+                    is_image: attachment.is_image,
+                    inserted_at: now,
+                    reserved: false,
+                },
+            );
         }
         Ok(result)
     }
 
-    fn reserve_images(
+    fn reserve_attachments(
         &self,
         owner: &str,
         handles: &[String],
-    ) -> Result<Vec<(String, String, Vec<u8>)>, String> {
+    ) -> Result<Vec<ResolvedAttachment>, String> {
         let mut inner = self.0.lock();
         purge_expired(&mut inner, Instant::now());
         let mut total_bytes = 0_u64;
+        let mut total_image_bytes = 0_u64;
         for handle in handles {
-            let image = inner.images.get(handle).ok_or_else(|| {
-                "Une image jointe a expiré ou n’est plus disponible. Sélectionnez-la de nouveau."
+            let attachment = inner.attachments.get(handle).ok_or_else(|| {
+                "Une pièce jointe a expiré ou n’est plus disponible. Sélectionnez-la de nouveau."
                     .to_string()
             })?;
-            if image.owner != owner {
-                return Err("Cette image jointe appartient à une autre fenêtre.".to_string());
+            if attachment.owner != owner {
+                return Err("Cette pièce jointe appartient à une autre fenêtre.".to_string());
             }
-            if image.reserved {
-                return Err("Cette image jointe est déjà en cours d’envoi.".to_string());
+            if attachment.reserved {
+                return Err("Cette pièce jointe est déjà en cours d’envoi.".to_string());
             }
-            total_bytes = total_bytes.saturating_add(image.bytes.len() as u64);
+            total_bytes = total_bytes.saturating_add(attachment.bytes.len() as u64);
+            if attachment.is_image {
+                total_image_bytes = total_image_bytes.saturating_add(attachment.bytes.len() as u64);
+            }
         }
-        if total_bytes > MAX_TOTAL_IMAGE_BYTES {
+        if total_bytes > MAX_TOTAL_ATTACHMENT_BYTES {
+            return Err("Le total des pièces jointes dépasse 40 Mio.".to_string());
+        }
+        if total_image_bytes > MAX_TOTAL_IMAGE_BYTES {
             return Err("Le total des images jointes dépasse 10 Mio.".to_string());
         }
         let resolved = handles
             .iter()
             .map(|handle| {
-                let image = inner
-                    .images
+                let attachment = inner
+                    .attachments
                     .get_mut(handle)
-                    .expect("validated image handle");
-                image.reserved = true;
-                (handle.clone(), image.mime_type.clone(), image.bytes.clone())
+                    .expect("validated attachment handle");
+                attachment.reserved = true;
+                ResolvedAttachment {
+                    name: attachment.name.clone(),
+                    mime_type: attachment.mime_type.clone(),
+                    bytes: attachment.bytes.clone(),
+                    is_image: attachment.is_image,
+                }
             })
             .collect();
         Ok(resolved)
@@ -414,18 +533,19 @@ impl AttachmentCache {
         for handle in handles {
             if consume {
                 let removable = inner
-                    .images
+                    .attachments
                     .get(handle)
-                    .is_some_and(|image| image.owner == owner && image.reserved);
+                    .is_some_and(|attachment| attachment.owner == owner && attachment.reserved);
                 if removable {
-                    if let Some(image) = inner.images.remove(handle) {
-                        inner.total_bytes =
-                            inner.total_bytes.saturating_sub(image.bytes.len() as u64);
+                    if let Some(attachment) = inner.attachments.remove(handle) {
+                        inner.total_bytes = inner
+                            .total_bytes
+                            .saturating_sub(attachment.bytes.len() as u64);
                     }
                 }
-            } else if let Some(image) = inner.images.get_mut(handle) {
-                if image.owner == owner {
-                    image.reserved = false;
+            } else if let Some(attachment) = inner.attachments.get_mut(handle) {
+                if attachment.owner == owner {
+                    attachment.reserved = false;
                 }
             }
         }
@@ -435,12 +555,14 @@ impl AttachmentCache {
         let mut inner = self.0.lock();
         for handle in handles {
             let removable = inner
-                .images
+                .attachments
                 .get(handle)
-                .is_some_and(|image| image.owner == owner && !image.reserved);
+                .is_some_and(|attachment| attachment.owner == owner && !attachment.reserved);
             if removable {
-                if let Some(image) = inner.images.remove(handle) {
-                    inner.total_bytes = inner.total_bytes.saturating_sub(image.bytes.len() as u64);
+                if let Some(attachment) = inner.attachments.remove(handle) {
+                    inner.total_bytes = inner
+                        .total_bytes
+                        .saturating_sub(attachment.bytes.len() as u64);
                 }
             }
         }
@@ -449,74 +571,786 @@ impl AttachmentCache {
     fn release_owner(&self, owner: &str) {
         let mut inner = self.0.lock();
         let handles = inner
-            .images
+            .attachments
             .iter()
-            .filter(|(_, image)| image.owner == owner)
+            .filter(|(_, attachment)| attachment.owner == owner)
             .map(|(handle, _)| handle.clone())
             .collect::<Vec<_>>();
         for handle in handles {
-            if let Some(image) = inner.images.remove(&handle) {
-                inner.total_bytes = inner.total_bytes.saturating_sub(image.bytes.len() as u64);
+            if let Some(attachment) = inner.attachments.remove(&handle) {
+                inner.total_bytes = inner
+                    .total_bytes
+                    .saturating_sub(attachment.bytes.len() as u64);
             }
         }
     }
 }
 
-pub(crate) fn hydrate_prompt_images(
-    cache: AttachmentCache,
-    owner: &str,
-    payload: &mut Value,
-) -> Result<Option<ImageReservation>, String> {
-    if payload.get("images").is_some()
-        && payload.get("type").and_then(Value::as_str) != Some("prompt")
-    {
-        return Err("Les images ne sont acceptées que dans une requête prompt.".to_string());
-    }
-    let Some(images_value) = payload.get_mut("images") else {
-        return Ok(None);
-    };
-    let images = images_value
-        .as_array_mut()
-        .ok_or_else(|| "Le champ images doit être une liste.".to_string())?;
-    if images.len() > MAX_ATTACHMENT_COUNT {
-        return Err(format!(
-            "Vous pouvez joindre au maximum {MAX_ATTACHMENT_COUNT} images"
-        ));
-    }
-    if images.is_empty() {
-        return Ok(None);
-    }
+#[derive(Debug)]
+struct ResolvedAttachment {
+    name: String,
+    mime_type: String,
+    bytes: Vec<u8>,
+    is_image: bool,
+}
 
-    let mut unique = HashSet::with_capacity(images.len());
-    let mut handles = Vec::with_capacity(images.len());
-    for image in images.iter() {
-        let object = image
+fn parse_attachment_handles(
+    payload: &Value,
+    field: &str,
+    unique: &mut HashSet<String>,
+) -> Result<Vec<String>, String> {
+    let Some(value) = payload.get(field) else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| format!("Le champ {field} doit être une liste."))?;
+    let mut handles = Vec::with_capacity(items.len());
+    for item in items {
+        let handle = item
             .as_object()
-            .ok_or_else(|| "Chaque image jointe doit être un objet.".to_string())?;
-        let handle = object
-            .get("attachmentHandle")
+            .and_then(|object| object.get("attachmentHandle"))
             .and_then(Value::as_str)
-            .ok_or_else(|| "Une image jointe ne possède pas de handle sécurisé.".to_string())?;
+            .ok_or_else(|| "Une pièce jointe ne possède pas de handle sécurisé.".to_string())?;
         if Uuid::parse_str(handle).is_err() || !unique.insert(handle.to_string()) {
-            return Err("Un handle d’image jointe est invalide ou dupliqué.".to_string());
+            return Err("Un handle de pièce jointe est invalide ou dupliqué.".to_string());
         }
         handles.push(handle.to_string());
     }
+    Ok(handles)
+}
 
-    let resolved = cache.reserve_images(owner, &handles)?;
-    for (image, (_, mime_type, bytes)) in images.iter_mut().zip(resolved) {
-        *image = serde_json::json!({
-            "type": "image",
-            "data": STANDARD.encode(bytes),
-            "mimeType": mime_type,
+fn escape_file_name(name: &str) -> String {
+    name.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn utf8_index_at_utf16_offset(value: &str, wanted: usize) -> Option<usize> {
+    let mut offset = 0_usize;
+    for (index, character) in value.char_indices() {
+        if offset == wanted {
+            return Some(index);
+        }
+        offset = offset.checked_add(character.len_utf16())?;
+        if offset > wanted {
+            return None;
+        }
+    }
+    (offset == wanted).then_some(value.len())
+}
+
+fn valid_manifest_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_ATTACHMENT_NAME_BYTES
+        && !value.contains(['/', '\\'])
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_manifest_mime(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_ATTACHMENT_MIME_BYTES
+        && !value.chars().any(char::is_control)
+}
+
+fn attachment_fragments_match_manifest(
+    mut fragments: &str,
+    manifest: &[AttachmentManifestEntry],
+) -> bool {
+    for (index, attachment) in manifest.iter().enumerate() {
+        let opener = format!(
+            "<file name=\"{}\" content_utf16=\"",
+            escape_file_name(&attachment.name)
+        );
+        let Some(after_opener) = fragments.strip_prefix(&opener) else {
+            return false;
+        };
+        let Some((encoded_length, body)) = after_opener.split_once("\">\n") else {
+            return false;
+        };
+        let Ok(content_utf16) = encoded_length.parse::<usize>() else {
+            return false;
+        };
+        if content_utf16.to_string() != encoded_length || content_utf16 > crate::MAX_RPC_BYTES {
+            return false;
+        }
+        let Some(body_end) = utf8_index_at_utf16_offset(body, content_utf16) else {
+            return false;
+        };
+        let Some(after_fragment) = body
+            .get(body_end..)
+            .and_then(|value| value.strip_prefix("\n</file>"))
+        else {
+            return false;
+        };
+        if index + 1 == manifest.len() {
+            return after_fragment.is_empty();
+        }
+        let Some(next_fragment) = after_fragment.strip_prefix('\n') else {
+            return false;
+        };
+        fragments = next_fragment;
+    }
+    false
+}
+
+/// Parses the exact suffix emitted by `hydrate_prompt_attachments` and returns
+/// only renderer-safe data. The byte-heavy file fragments and native staging
+/// paths deliberately never appear in the result.
+pub(crate) fn parse_orbit_attachment_context(value: &str) -> Option<OrbitAttachmentContext> {
+    const BOUNDARY_PREFIX: &str = "<prime_orbit_ui_boundary v=\"1\" id=\"";
+    const VISIBLE_MARKER: &str = "\" visible_utf16=\"";
+    const CONTEXT_CLOSE: &str = "\n</prime_orbit_attachment_context>\n";
+    const MANIFEST_PREFIX: &str = "<prime_orbit_manifest encoding=\"base64url\">";
+    const MANIFEST_CLOSE: &str = "</prime_orbit_manifest>\n";
+
+    let boundary_start = value.rfind(BOUNDARY_PREFIX)?;
+    let boundary = &value[boundary_start..];
+    let boundary_fields = boundary.strip_prefix(BOUNDARY_PREFIX)?.strip_suffix("/>")?;
+    let (context_id, visible) = boundary_fields.split_once(VISIBLE_MARKER)?;
+    let visible = visible.strip_suffix('"')?;
+    let uuid = Uuid::parse_str(context_id).ok()?;
+    if uuid.get_version_num() != 4 || uuid.to_string() != context_id {
+        return None;
+    }
+    let visible_utf16 = visible.parse::<usize>().ok()?;
+    let visible_byte_index = utf8_index_at_utf16_offset(value, visible_utf16)?;
+    if visible_byte_index > boundary_start {
+        return None;
+    }
+    let expected_boundary =
+        format!("{BOUNDARY_PREFIX}{context_id}{VISIBLE_MARKER}{visible_utf16}\"/>");
+    if boundary != expected_boundary {
+        return None;
+    }
+
+    let separator = if visible_utf16 == 0 { "" } else { "\n\n" };
+    let opener =
+        format!("{separator}<prime_orbit_attachment_context v=\"1\" id=\"{context_id}\">\n");
+    let suffix = &value[visible_byte_index..];
+    if !suffix.starts_with(&opener) {
+        return None;
+    }
+    let context_body = value
+        .get(visible_byte_index + opener.len()..boundary_start)?
+        .strip_suffix(CONTEXT_CLOSE)?;
+    let manifest_and_fragments = context_body.strip_prefix(MANIFEST_PREFIX)?;
+    let manifest_end = manifest_and_fragments.find(MANIFEST_CLOSE)?;
+    let encoded_manifest = &manifest_and_fragments[..manifest_end];
+    if encoded_manifest.is_empty()
+        || encoded_manifest.len() > MAX_ORBIT_MANIFEST_ENCODED_CHARS
+        || !encoded_manifest
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    let fragments = &manifest_and_fragments[manifest_end + MANIFEST_CLOSE.len()..];
+
+    let manifest_bytes = URL_SAFE_NO_PAD.decode(encoded_manifest).ok()?;
+    if manifest_bytes.len() > MAX_ORBIT_MANIFEST_BYTES
+        || URL_SAFE_NO_PAD.encode(&manifest_bytes) != encoded_manifest
+    {
+        return None;
+    }
+    let manifest = serde_json::from_slice::<Vec<AttachmentManifestEntry>>(&manifest_bytes).ok()?;
+    if manifest.is_empty() || manifest.len() > MAX_ATTACHMENT_COUNT {
+        return None;
+    }
+    let manifest_total = manifest.iter().try_fold(0_u64, |total, attachment| {
+        total.checked_add(attachment.size)
+    })?;
+    if manifest_total > MAX_TOTAL_ATTACHMENT_BYTES {
+        return None;
+    }
+    if manifest.iter().any(|attachment| {
+        attachment.is_image
+            || attachment.size > MAX_DOCUMENT_ATTACHMENT_BYTES
+            || !valid_manifest_name(&attachment.name)
+            || !valid_manifest_mime(&attachment.mime_type)
+    }) || !attachment_fragments_match_manifest(fragments, &manifest)
+    {
+        return None;
+    }
+    let attachments = manifest
+        .into_iter()
+        .enumerate()
+        .map(|(index, attachment)| PublicAttachmentMetadata {
+            id: format!("orbit-attachment:{context_id}:{index}"),
+            name: attachment.name,
+            mime_type: attachment.mime_type,
+            size: attachment.size,
+            is_image: false,
+        })
+        .collect();
+
+    Some(OrbitAttachmentContext {
+        context_id: context_id.to_string(),
+        visible_text: value[..visible_byte_index].to_string(),
+        attachments,
+    })
+}
+
+fn neutral_staging_extension(name: &str) -> Option<String> {
+    let extension = Path::new(name).extension()?.to_str()?;
+    (!extension.is_empty()
+        && extension.len() <= 16
+        && extension
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()))
+    .then(|| extension.to_ascii_lowercase())
+}
+
+fn safe_artifact_component(value: &str) -> Option<String> {
+    (!value.is_empty()
+        && value.len() <= 160
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_')))
+    .then(|| value.to_string())
+}
+
+fn safe_session_id_from_header(session_path: &Path) -> Option<String> {
+    const MAX_SESSION_HEADER_BYTES: u64 = 64 * 1024;
+    let file = File::open(session_path).ok()?;
+    let mut reader = BufReader::new(file).take(MAX_SESSION_HEADER_BYTES + 1);
+    let mut first_line = String::new();
+    reader.read_line(&mut first_line).ok()?;
+    if first_line.len() as u64 > MAX_SESSION_HEADER_BYTES {
+        return None;
+    }
+    let header: Value = serde_json::from_str(first_line.trim_end()).ok()?;
+    if header.get("type").and_then(Value::as_str) != Some("session") {
+        return None;
+    }
+    safe_artifact_component(header.get("id").and_then(Value::as_str)?)
+}
+
+pub(crate) fn attachment_artifact_root(
+    session_path: Option<&str>,
+    session_id: Option<&str>,
+    app_data_dir: &Path,
+    conversation_id: &str,
+) -> PathBuf {
+    if let Some(session_path) = session_path.map(Path::new) {
+        let exact_session_id = session_id
+            .and_then(safe_artifact_component)
+            .or_else(|| safe_session_id_from_header(session_path));
+        if let (Some(session_id), Some(session_dir)) = (exact_session_id, session_path.parent()) {
+            if let Some(session_root) = session_dir.parent() {
+                return session_root
+                    .join("session-artifacts")
+                    .join(session_id)
+                    .join("prime-orbit-attachments");
+            }
+        }
+    }
+
+    // A new RPC session may not have published its file yet. Hash the renderer
+    // identifier before using it as a filesystem component and keep this
+    // fallback durable so paths already persisted in Prime Agent history stay
+    // valid across Orbit restarts.
+    cleanup_fallback_attachment_artifacts_throttled(app_data_dir);
+    let digest = Sha256::digest(conversation_id.as_bytes());
+    let key = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    app_data_dir
+        .join("session-attachments")
+        .join(key)
+        .join("prime-orbit-attachments")
+}
+
+#[derive(Debug)]
+struct FallbackArtifactCandidate {
+    path: PathBuf,
+    bytes: u64,
+    updated_at: SystemTime,
+}
+
+fn orbit_owned_directory_stats(root: &Path) -> Option<(u64, SystemTime)> {
+    let mut stack = vec![root.to_path_buf()];
+    let mut entries = 0_usize;
+    let mut bytes = 0_u64;
+    let mut updated_at = fs::symlink_metadata(root).ok()?.modified().ok()?;
+    while let Some(directory) = stack.pop() {
+        for entry in fs::read_dir(directory).ok()? {
+            let entry = entry.ok()?;
+            entries = entries.checked_add(1)?;
+            if entries > MAX_FALLBACK_ARTIFACT_ENTRIES {
+                return None;
+            }
+            let metadata = fs::symlink_metadata(entry.path()).ok()?;
+            if metadata.file_type().is_symlink() {
+                return None;
+            }
+            if let Ok(modified) = metadata.modified() {
+                updated_at = updated_at.max(modified);
+            }
+            if metadata.is_dir() {
+                stack.push(entry.path());
+            } else if metadata.is_file() {
+                bytes = bytes.checked_add(metadata.len())?;
+            } else {
+                return None;
+            }
+        }
+    }
+    Some((bytes, updated_at))
+}
+
+fn prune_fallback_attachment_artifacts(
+    app_data_dir: &Path,
+    now: SystemTime,
+    ttl: Duration,
+    active_grace: Duration,
+    max_bytes: u64,
+    max_conversations: usize,
+) -> Result<usize, String> {
+    let root = app_data_dir.join("session-attachments");
+    let metadata = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(format!(
+                "Impossible d’inspecter les pièces jointes Orbit obsolètes: {error}"
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("Le stockage de secours des pièces jointes Orbit n’est pas sûr.".to_string());
+    }
+    let root = canonicalize(&root)
+        .map_err(|error| format!("Impossible de sécuriser le stockage Orbit: {error}"))?;
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(&root)
+        .map_err(|error| format!("Impossible de lire le stockage Orbit: {error}"))?
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.len() != 64
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let Ok(path) = canonicalize(&path) else {
+            continue;
+        };
+        if path.parent() != Some(root.as_path()) {
+            continue;
+        }
+        let Some((bytes, updated_at)) = orbit_owned_directory_stats(&path) else {
+            continue;
+        };
+        candidates.push(FallbackArtifactCandidate {
+            path,
+            bytes,
+            updated_at,
         });
     }
-    Ok(Some(ImageReservation {
-        cache,
+    candidates.sort_by_key(|candidate| candidate.updated_at);
+    let mut total_bytes = candidates.iter().fold(0_u64, |total, candidate| {
+        total.saturating_add(candidate.bytes)
+    });
+    let mut retained = candidates.len();
+    let mut removed = 0_usize;
+    for candidate in candidates {
+        let age = now.duration_since(candidate.updated_at).unwrap_or_default();
+        let expired = age >= ttl;
+        let over_budget = total_bytes > max_bytes || retained > max_conversations;
+        if !expired && (!over_budget || age < active_grace) {
+            continue;
+        }
+        if fs::remove_dir_all(&candidate.path).is_ok() {
+            total_bytes = total_bytes.saturating_sub(candidate.bytes);
+            retained = retained.saturating_sub(1);
+            removed = removed.saturating_add(1);
+        }
+    }
+    Ok(removed)
+}
+
+pub(crate) fn cleanup_fallback_attachment_artifacts_throttled(app_data_dir: &Path) {
+    static LAST_CLEANUP: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    let now = Instant::now();
+    let cleanup = LAST_CLEANUP.get_or_init(|| Mutex::new(None));
+    {
+        let mut last = cleanup.lock();
+        if last.is_some_and(|last| now.duration_since(last) < FALLBACK_ARTIFACT_CLEANUP_INTERVAL) {
+            return;
+        }
+        *last = Some(now);
+    }
+    let _ = prune_fallback_attachment_artifacts(
+        app_data_dir,
+        SystemTime::now(),
+        FALLBACK_ARTIFACT_TTL,
+        FALLBACK_ARTIFACT_ACTIVE_GRACE,
+        MAX_FALLBACK_ARTIFACT_BYTES,
+        MAX_FALLBACK_ARTIFACT_CONVERSATIONS,
+    );
+}
+
+pub(crate) fn remove_staged_attachment_context(
+    artifact_root: &Path,
+    context_id: &str,
+) -> Result<(), String> {
+    let uuid = Uuid::parse_str(context_id)
+        .ok()
+        .filter(|uuid| uuid.get_version_num() == 4 && uuid.to_string() == context_id)
+        .ok_or_else(|| "Identifiant de contexte de pièce jointe invalide.".to_string())?;
+    let metadata = match fs::symlink_metadata(artifact_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "Impossible d’inspecter le stockage des pièces jointes: {error}"
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("Le stockage des pièces jointes n’est pas un dossier Orbit sûr.".to_string());
+    }
+    let root = canonicalize(artifact_root)
+        .map_err(|error| format!("Impossible de sécuriser le stockage Orbit: {error}"))?;
+    let target = root.join(uuid.to_string());
+    let metadata = match fs::symlink_metadata(&target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "Impossible d’inspecter le contexte de pièce jointe: {error}"
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("Le contexte de pièce jointe n’est pas un dossier Orbit sûr.".to_string());
+    }
+    let canonical_target = canonicalize(&target)
+        .map_err(|error| format!("Impossible de sécuriser le contexte Orbit: {error}"))?;
+    if canonical_target.parent() != Some(root.as_path())
+        || canonical_target
+            .file_name()
+            .and_then(|value| value.to_str())
+            != Some(context_id)
+    {
+        return Err("Le contexte de pièce jointe sort du stockage Orbit autorisé.".to_string());
+    }
+    fs::remove_dir_all(&canonical_target)
+        .map_err(|error| format!("Impossible de libérer le contexte de pièce jointe: {error}"))
+}
+
+fn materialize_binary_attachment(
+    staging_root: &Path,
+    attachment: &ResolvedAttachment,
+) -> Result<(PathBuf, PathBuf), String> {
+    let staging_root = ensure_non_symlink_directory(staging_root)?;
+    let directory = staging_root.join(Uuid::new_v4().to_string());
+    fs::create_dir(&directory)
+        .map_err(|error| format!("Impossible de préparer la pièce jointe binaire: {error}"))?;
+    let filename = neutral_staging_extension(&attachment.name)
+        .map(|extension| format!("attachment.{extension}"))
+        .unwrap_or_else(|| "attachment.bin".to_string());
+    let path = directory.join(filename);
+    if let Err(error) = fs::write(&path, &attachment.bytes) {
+        let _ = fs::remove_dir_all(&directory);
+        return Err(format!(
+            "Impossible de matérialiser la pièce jointe binaire: {error}"
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700));
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Ok((directory, path))
+}
+
+fn ensure_non_symlink_directory(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("Le stockage privé des pièces jointes doit être absolu.".to_string());
+    }
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    let existing = loop {
+        match fs::symlink_metadata(cursor) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(
+                        "Le stockage privé des pièces jointes contient un lien symbolique ou un fichier inattendu."
+                            .to_string(),
+                    );
+                }
+                break cursor;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = cursor.file_name().ok_or_else(|| {
+                    "Impossible de préparer le stockage privé des pièces jointes.".to_string()
+                })?;
+                missing.push(component.to_os_string());
+                cursor = cursor.parent().ok_or_else(|| {
+                    "Impossible de préparer le stockage privé des pièces jointes.".to_string()
+                })?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Impossible d’inspecter le stockage privé des pièces jointes: {error}"
+                ));
+            }
+        }
+    };
+
+    // Continue from the canonical existing ancestor. This prevents a newly
+    // created child from following an attacker-controlled link at any missing
+    // level in the artifact hierarchy.
+    let mut current = canonicalize(existing).map_err(|error| {
+        format!("Impossible de sécuriser le stockage privé des pièces jointes: {error}")
+    })?;
+    for component in missing.into_iter().rev() {
+        current.push(component);
+        match fs::create_dir(&current) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!(
+                    "Impossible de préparer le stockage privé des pièces jointes: {error}"
+                ));
+            }
+        }
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            format!("Impossible d’inspecter le stockage privé des pièces jointes: {error}")
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(
+                "Le stockage privé des pièces jointes contient un lien symbolique ou un fichier inattendu."
+                    .to_string(),
+            );
+        }
+    }
+    Ok(current)
+}
+
+fn document_prompt_fragment(name: &str, body: &str) -> String {
+    let name = escape_file_name(name);
+    let content_utf16 = body.encode_utf16().count();
+    format!("<file name=\"{name}\" content_utf16=\"{content_utf16}\">\n{body}\n</file>")
+}
+
+fn inline_document_prompt_fragment(attachment: &ResolvedAttachment) -> Option<String> {
+    if attachment.bytes.len() <= MAX_INLINE_DOCUMENT_BYTES {
+        if let Ok(content) = std::str::from_utf8(&attachment.bytes) {
+            return Some(document_prompt_fragment(&attachment.name, content));
+        }
+    }
+    None
+}
+
+fn staged_document_prompt_fragment(
+    staging_root: &Path,
+    attachment: &ResolvedAttachment,
+) -> Result<(String, PathBuf), String> {
+    let (directory, path) = materialize_binary_attachment(staging_root, attachment)?;
+    let serialized_path = serde_json::to_string(&path.to_string_lossy())
+        .map_err(|error| format!("Impossible de référencer la pièce jointe binaire: {error}"))?;
+    let body = format!(
+        "[Attachment staged by Prime Orbit at {serialized_path}. Read it with filesystem or Python tools when needed.]"
+    );
+    Ok((document_prompt_fragment(&attachment.name, &body), directory))
+}
+
+fn hydrated_attachment_message(
+    visible_message: &str,
+    context_id: &str,
+    encoded_manifest: &str,
+    fragments: &[String],
+) -> String {
+    let separator = if visible_message.is_empty() {
+        ""
+    } else {
+        "\n\n"
+    };
+    let visible_utf16 = visible_message.encode_utf16().count();
+    format!(
+        "{visible_message}{separator}<prime_orbit_attachment_context v=\"1\" id=\"{context_id}\">\n<prime_orbit_manifest encoding=\"base64url\">{encoded_manifest}</prime_orbit_manifest>\n{}\n</prime_orbit_attachment_context>\n<prime_orbit_ui_boundary v=\"1\" id=\"{context_id}\" visible_utf16=\"{visible_utf16}\"/>",
+        fragments.join("\n"),
+    )
+}
+
+fn payload_fits_rpc(payload: &Value) -> Result<bool, String> {
+    serde_json::to_vec(payload)
+        .map(|bytes| bytes.len() <= crate::MAX_RPC_BYTES)
+        .map_err(|error| format!("Impossible de sérialiser le payload RPC: {error}"))
+}
+
+pub(crate) fn hydrate_prompt_attachments(
+    cache: AttachmentCache,
+    owner: &str,
+    payload: &mut Value,
+    artifact_root: &Path,
+) -> Result<Option<AttachmentReservation>, String> {
+    if (payload.get("images").is_some() || payload.get("attachments").is_some())
+        && payload.get("type").and_then(Value::as_str) != Some("prompt")
+    {
+        return Err(
+            "Les pièces jointes ne sont acceptées que dans une requête prompt.".to_string(),
+        );
+    }
+    if payload.get("images").is_none() && payload.get("attachments").is_none() {
+        return Ok(None);
+    }
+    let mut unique = HashSet::new();
+    let image_handles = parse_attachment_handles(payload, "images", &mut unique)?;
+    let document_handles = parse_attachment_handles(payload, "attachments", &mut unique)?;
+    if image_handles.len().saturating_add(document_handles.len()) > MAX_ATTACHMENT_COUNT {
+        return Err(format!(
+            "Vous pouvez joindre au maximum {MAX_ATTACHMENT_COUNT} fichiers"
+        ));
+    }
+    if image_handles.is_empty() && document_handles.is_empty() {
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("attachments");
+        }
+        return Ok(None);
+    }
+    if !document_handles.is_empty() && payload.get("message").and_then(Value::as_str).is_none() {
+        return Err("Une requête prompt avec pièces jointes doit contenir un message.".to_string());
+    }
+
+    let mut handles = image_handles.clone();
+    handles.extend(document_handles.iter().cloned());
+    let resolved = cache.reserve_attachments(owner, &handles)?;
+    let mut reservation = AttachmentReservation {
+        cache: cache.clone(),
         owner: owner.to_string(),
         handles,
+        staged_directories: Vec::new(),
+        staging_context: None,
         committed: false,
-    }))
+    };
+    let (resolved_images, resolved_documents) = resolved.split_at(image_handles.len());
+    if resolved_images
+        .iter()
+        .any(|attachment| !attachment.is_image)
+        || resolved_documents
+            .iter()
+            .any(|attachment| attachment.is_image)
+    {
+        return Err(
+            "Le type d’une pièce jointe ne correspond pas au champ RPC utilisé.".to_string(),
+        );
+    }
+
+    if let Some(images) = payload.get_mut("images").and_then(Value::as_array_mut) {
+        for (image, attachment) in images.iter_mut().zip(resolved_images) {
+            *image = serde_json::json!({
+                "type": "image",
+                "data": STANDARD.encode(&attachment.bytes),
+                "mimeType": attachment.mime_type,
+            });
+        }
+    }
+
+    let manifest = resolved_documents
+        .iter()
+        .map(|attachment| {
+            serde_json::json!({
+                "name": attachment.name,
+                "mimeType": attachment.mime_type,
+                "size": attachment.bytes.len(),
+                "isImage": false,
+            })
+        })
+        .collect::<Vec<_>>();
+    let manifest = serde_json::to_vec(&manifest).map_err(|error| {
+        format!("Impossible de préparer le manifeste des pièces jointes: {error}")
+    })?;
+    if manifest.len() > MAX_ORBIT_MANIFEST_BYTES {
+        return Err("Le manifeste des pièces jointes dépasse la taille autorisée.".to_string());
+    }
+    let encoded_manifest = URL_SAFE_NO_PAD.encode(manifest);
+    let context_id = Uuid::new_v4().to_string();
+    let staging_context = artifact_root.join(&context_id);
+
+    let mut fragments = Vec::with_capacity(resolved_documents.len());
+    let mut inline_indices = Vec::new();
+    for (index, attachment) in resolved_documents.iter().enumerate() {
+        if let Some(fragment) = inline_document_prompt_fragment(attachment) {
+            fragments.push(fragment);
+            inline_indices.push(index);
+        } else {
+            let (fragment, directory) =
+                staged_document_prompt_fragment(&staging_context, attachment)?;
+            fragments.push(fragment);
+            reservation.staging_context = directory.parent().map(Path::to_path_buf);
+            reservation.staged_directories.push(directory);
+        }
+    }
+    if !fragments.is_empty() {
+        let visible_message = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .expect("validated prompt message")
+            .to_string();
+        payload["message"] = Value::String(hydrated_attachment_message(
+            &visible_message,
+            &context_id,
+            &encoded_manifest,
+            &fragments,
+        ));
+
+        // The image budget can consume most of Prime Agent's 16 MiB RPC
+        // frame after base64 expansion. Start with small UTF-8 documents
+        // inline, then stage the largest ones until the real serialized JSON
+        // fits; this accounts for JSON escaping instead of relying on a rough
+        // byte estimate.
+        inline_indices.sort_unstable_by_key(|index| std::cmp::Reverse(fragments[*index].len()));
+        for index in inline_indices {
+            if payload_fits_rpc(payload)? {
+                break;
+            }
+            let (fragment, directory) =
+                staged_document_prompt_fragment(&staging_context, &resolved_documents[index])?;
+            fragments[index] = fragment;
+            reservation.staging_context = directory.parent().map(Path::to_path_buf);
+            reservation.staged_directories.push(directory);
+            payload["message"] = Value::String(hydrated_attachment_message(
+                &visible_message,
+                &context_id,
+                &encoded_manifest,
+                &fragments,
+            ));
+        }
+    }
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("attachments");
+    }
+
+    if !payload_fits_rpc(payload)? {
+        return Err(format!(
+            "Le payload RPC dépasse la limite de {} octets, même après la matérialisation sécurisée des documents.",
+            crate::MAX_RPC_BYTES
+        ));
+    }
+
+    Ok(Some(reservation))
 }
 
 #[tauri::command]
@@ -524,9 +1358,13 @@ pub async fn pick_attachments(
     window: WebviewWindow,
     cache: tauri::State<'_, AttachmentCache>,
     remaining_count: usize,
+    remaining_attachment_bytes: u64,
     remaining_image_bytes: u64,
 ) -> Result<Vec<AttachmentData>, String> {
-    if remaining_count > MAX_ATTACHMENT_COUNT || remaining_image_bytes > MAX_TOTAL_IMAGE_BYTES {
+    if remaining_count > MAX_ATTACHMENT_COUNT
+        || remaining_attachment_bytes > MAX_TOTAL_ATTACHMENT_BYTES
+        || remaining_image_bytes > MAX_TOTAL_IMAGE_BYTES
+    {
         return Err("Le budget de pièces jointes demandé est invalide.".to_string());
     }
     let app = window.app_handle().clone();
@@ -543,38 +1381,167 @@ pub async fn pick_attachments(
             .add_filter(
                 "Images et documents",
                 &[
-                    "png", "jpg", "jpeg", "webp", "gif", "md", "txt", "json", "ts",
-                    "tsx", "js", "jsx", "py", "rs", "toml", "yaml", "yml", "pdf",
+                    "png", "jpg", "jpeg", "webp", "gif", "md", "txt", "json", "ts", "tsx", "js",
+                    "jsx", "py", "rs", "toml", "yaml", "yml", "pdf",
                 ],
             )
             .blocking_pick_files()
             .unwrap_or_default();
-        if selected.len() > remaining_count {
-            return Err(format!(
-                "Vous pouvez encore joindre {remaining_count} fichier(s)"
-            ));
-        }
-
-        let mut prepared = Vec::with_capacity(selected.len());
-        let mut total_image_bytes = 0_u64;
-        for selected_path in selected {
-            let path = selected_path
-                .into_path()
-                .map_err(|error| format!("Chemin de pièce jointe invalide: {error}"))?;
-            let available = remaining_image_bytes.saturating_sub(total_image_bytes);
-            let attachment = read_selected_attachment(path, available)?;
-            if let PreparedAttachment::Image(image) = &attachment {
-                total_image_bytes = total_image_bytes.saturating_add(image.bytes.len() as u64);
-                if total_image_bytes > remaining_image_bytes {
-                    return Err(
-                        "Le total des images jointes dépasse 10 Mio; réduisez leur taille ou leur nombre"
-                            .to_string(),
-                    );
-                }
-            }
-            prepared.push(attachment);
-        }
+        let paths = selected
+            .into_iter()
+            .map(|selected_path| {
+                selected_path
+                    .into_path()
+                    .map_err(|_| "La pièce jointe sélectionnée est invalide.".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let prepared = prepare_attachment_paths(
+            paths,
+            remaining_count,
+            remaining_attachment_bytes,
+            remaining_image_bytes,
+        )?;
         cache.insert_prepared(&owner, prepared)
+    })
+    .await
+}
+
+fn decoded_drop_header(headers: &tauri::http::HeaderMap, name: &str) -> Result<String, String> {
+    headers
+        .get(name)
+        .ok_or_else(|| format!("L’en-tête {name} est absent."))?
+        .to_str()
+        .map(str::to_string)
+        .map_err(|_| format!("L’en-tête {name} est invalide."))
+}
+
+fn decode_dropped_attachment_name(encoded: &str) -> Result<String, String> {
+    if encoded.len() > 2_048 {
+        return Err("Le nom de la pièce jointe déposée est trop long.".to_string());
+    }
+    let query = format!("name={encoded}");
+    let name = url::form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| key == "name")
+        .map(|(_, value)| value.into_owned())
+        .ok_or_else(|| "Le nom de la pièce jointe déposée est invalide.".to_string())?;
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\'])
+        || name.chars().any(char::is_control)
+    {
+        return Err("Le nom de la pièce jointe déposée est invalide.".to_string());
+    }
+    Ok(name)
+}
+
+fn prepare_dropped_attachment(
+    name: String,
+    declared_mime_type: String,
+    bytes: Vec<u8>,
+    remaining_attachment_bytes: u64,
+    remaining_image_bytes: u64,
+) -> Result<PreparedAttachment, String> {
+    if remaining_attachment_bytes > MAX_TOTAL_ATTACHMENT_BYTES
+        || remaining_image_bytes > MAX_TOTAL_IMAGE_BYTES
+    {
+        return Err("Le budget de pièces jointes demandé est invalide.".to_string());
+    }
+    if declared_mime_type.len() > 256
+        || declared_mime_type
+            .chars()
+            .any(|character| character.is_control())
+    {
+        return Err("Le type MIME de la pièce jointe est invalide.".to_string());
+    }
+    let mime_type = if declared_mime_type.trim().is_empty() {
+        mime_guess::from_path(&name)
+            .first_or_octet_stream()
+            .essence_str()
+            .to_string()
+    } else {
+        declared_mime_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+    };
+    let is_image = supported_inline_image(&mime_type);
+    let allowed_bytes = if is_image {
+        MAX_IMAGE_ATTACHMENT_BYTES
+            .min(remaining_attachment_bytes)
+            .min(remaining_image_bytes)
+    } else {
+        MAX_DOCUMENT_ATTACHMENT_BYTES.min(remaining_attachment_bytes)
+    };
+    if bytes.len() as u64 > allowed_bytes {
+        return Err(format!(
+            "La pièce jointe déposée dépasse le budget restant de {allowed_bytes} octets."
+        ));
+    }
+    if is_image && !image_signature_matches(&mime_type, &bytes) {
+        return Err(
+            "Le contenu du fichier ne correspond pas à son format d’image déclaré.".to_string(),
+        );
+    }
+    let preview_data_url = is_image
+        .then(|| image_preview_data_url(&mime_type, &bytes))
+        .transpose()?;
+    Ok(PreparedAttachment {
+        name,
+        mime_type,
+        bytes,
+        preview_data_url,
+        is_image,
+    })
+}
+
+#[tauri::command]
+pub async fn admit_dropped_attachment(
+    window: WebviewWindow,
+    cache: tauri::State<'_, AttachmentCache>,
+    request: Request<'_>,
+) -> Result<AttachmentData, String> {
+    let InvokeBody::Raw(bytes) = request.body() else {
+        return Err(
+            "Le contenu de la pièce jointe déposée doit utiliser le transport binaire natif."
+                .to_string(),
+        );
+    };
+    if bytes.len() as u64 > MAX_DOCUMENT_ATTACHMENT_BYTES {
+        return Err(format!(
+            "La pièce jointe déposée dépasse la limite de {MAX_DOCUMENT_ATTACHMENT_BYTES} octets."
+        ));
+    }
+    let encoded_name = decoded_drop_header(request.headers(), "x-prime-orbit-file-name")?;
+    let name = decode_dropped_attachment_name(&encoded_name)?;
+    let mime_type = decoded_drop_header(request.headers(), "x-prime-orbit-mime-type")?;
+    let remaining_attachment_bytes = decoded_drop_header(
+        request.headers(),
+        "x-prime-orbit-remaining-attachment-bytes",
+    )?
+    .parse::<u64>()
+    .map_err(|_| "Le budget restant des pièces jointes est invalide.".to_string())?;
+    let remaining_image_bytes =
+        decoded_drop_header(request.headers(), "x-prime-orbit-remaining-image-bytes")?
+            .parse::<u64>()
+            .map_err(|_| "Le budget restant des images est invalide.".to_string())?;
+    let owner = window.label().to_string();
+    let cache = cache.inner().clone();
+    let bytes = bytes.clone();
+    crate::run_blocking(move || {
+        let attachment = prepare_dropped_attachment(
+            name,
+            mime_type,
+            bytes,
+            remaining_attachment_bytes,
+            remaining_image_bytes,
+        )?;
+        cache
+            .insert_prepared(&owner, vec![attachment])?
+            .pop()
+            .ok_or_else(|| "La pièce jointe déposée n’a pas pu être préparée.".to_string())
     })
     .await
 }
@@ -585,12 +1552,12 @@ pub async fn release_attachment_handles(
     cache: tauri::State<'_, AttachmentCache>,
     handles: Vec<String>,
 ) -> Result<(), String> {
-    if handles.len() > MAX_CACHED_IMAGE_COUNT
+    if handles.len() > MAX_CACHED_ATTACHMENT_COUNT
         || handles
             .iter()
             .any(|handle| Uuid::parse_str(handle).is_err())
     {
-        return Err("La liste des handles d’images est invalide.".to_string());
+        return Err("La liste des handles de pièces jointes est invalide.".to_string());
     }
     cache.release(window.label(), &handles);
     Ok(())
@@ -687,55 +1654,144 @@ fn git_output(git: &Path, cwd: &Path, arguments: &[&str]) -> Result<Output, Stri
 #[cfg(test)]
 mod attachment_tests {
     use super::{
-        hydrate_prompt_images, read_selected_attachment, AttachmentCache, PreparedAttachment,
-        PreparedImage, CACHED_IMAGE_TTL, MAX_IMAGE_ATTACHMENT_BYTES,
+        attachment_artifact_root, decode_dropped_attachment_name, hydrate_prompt_attachments,
+        parse_orbit_attachment_context, prepare_dropped_attachment,
+        prune_fallback_attachment_artifacts, read_selected_attachment,
+        remove_staged_attachment_context, AttachmentCache, PreparedAttachment,
+        CACHED_ATTACHMENT_TTL, MAX_IMAGE_ATTACHMENT_BYTES, MAX_INLINE_DOCUMENT_BYTES,
+        MAX_TOTAL_ATTACHMENT_BYTES, MAX_TOTAL_IMAGE_BYTES,
     };
+    use image::{DynamicImage, ImageFormat};
     use serde_json::json;
-    use std::{fs, io::Write, time::Instant};
+    use std::{
+        fs,
+        io::Cursor,
+        io::Write,
+        path::Path,
+        time::{Duration, Instant, SystemTime},
+    };
 
     fn prepared_image(name: &str, bytes: &[u8]) -> PreparedAttachment {
-        PreparedAttachment::Image(PreparedImage {
+        PreparedAttachment {
             name: name.to_string(),
             mime_type: "image/png".to_string(),
             bytes: bytes.to_vec(),
-            preview_data_url: "data:image/png;base64,cHJldmlldw==".to_string(),
-        })
+            preview_data_url: Some("data:image/png;base64,cHJldmlldw==".to_string()),
+            is_image: true,
+        }
+    }
+
+    fn prepared_document(name: &str, mime_type: &str, bytes: &[u8]) -> PreparedAttachment {
+        PreparedAttachment {
+            name: name.to_string(),
+            mime_type: mime_type.to_string(),
+            bytes: bytes.to_vec(),
+            preview_data_url: None,
+            is_image: false,
+        }
+    }
+
+    fn valid_png() -> Vec<u8> {
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .expect("encode PNG fixture");
+        bytes.into_inner()
     }
 
     #[test]
-    fn keeps_explicit_external_document_as_a_path_without_copying_its_contents() {
+    fn dropped_attachment_transport_accepts_documents_and_validates_images() {
+        assert_eq!(
+            decode_dropped_attachment_name("capture%20%C3%A9cran.png").expect("decode name"),
+            "capture écran.png"
+        );
+        assert!(decode_dropped_attachment_name("..%2Fsecret.png").is_err());
+        assert!(decode_dropped_attachment_name("..%5Csecret.png").is_err());
+
+        let image = prepare_dropped_attachment(
+            "capture.png".to_string(),
+            "image/png".to_string(),
+            valid_png(),
+            MAX_TOTAL_ATTACHMENT_BYTES,
+            MAX_IMAGE_ATTACHMENT_BYTES,
+        )
+        .expect("admit valid dropped PNG");
+        assert_eq!(image.mime_type, "image/png");
+        assert!(image
+            .preview_data_url
+            .as_deref()
+            .is_some_and(|value| value.starts_with("data:image/png;base64,")));
+
+        let mismatch = prepare_dropped_attachment(
+            "capture.png".to_string(),
+            "image/jpeg".to_string(),
+            valid_png(),
+            MAX_TOTAL_ATTACHMENT_BYTES,
+            MAX_IMAGE_ATTACHMENT_BYTES,
+        )
+        .expect_err("reject MIME/signature mismatch");
+        assert!(mismatch.contains("format"));
+
+        let document = prepare_dropped_attachment(
+            "notes.txt".to_string(),
+            "text/plain".to_string(),
+            b"dropped document".to_vec(),
+            MAX_TOTAL_ATTACHMENT_BYTES,
+            MAX_TOTAL_IMAGE_BYTES,
+        )
+        .expect("admit dropped document");
+        assert!(!document.is_image);
+        assert!(document.preview_data_url.is_none());
+    }
+
+    #[test]
+    fn picker_caches_external_document_without_exposing_its_source_path() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("outside-project.txt");
         fs::write(&path, b"external document").expect("write fixture");
 
-        let PreparedAttachment::Document(attachment) =
-            read_selected_attachment(path, MAX_IMAGE_ATTACHMENT_BYTES)
-                .expect("read attachment metadata")
-        else {
-            panic!("expected document")
-        };
-        assert!(!attachment.is_image);
-        assert_eq!(attachment.size, 17);
-        assert!(attachment.attachment_handle.is_none());
-        assert!(attachment
-            .path
-            .as_deref()
-            .is_some_and(|path| path.ends_with("outside-project.txt")));
+        let prepared = read_selected_attachment(
+            path.clone(),
+            MAX_TOTAL_ATTACHMENT_BYTES,
+            MAX_TOTAL_IMAGE_BYTES,
+        )
+        .expect("read attachment bytes");
+        assert!(!prepared.is_image);
+        assert_eq!(prepared.bytes, b"external document");
+
+        let cache = AttachmentCache::default();
+        let attachment = cache
+            .insert_prepared("window-a", vec![prepared])
+            .expect("cache document")
+            .remove(0);
+        let value = serde_json::to_value(&attachment).expect("serialize attachment metadata");
+        assert_eq!(value.get("path"), None);
+        assert!(value
+            .get("attachmentHandle")
+            .and_then(|item| item.as_str())
+            .is_some());
+        assert!(!value
+            .to_string()
+            .contains(&path.to_string_lossy().to_string()));
     }
 
     #[test]
-    fn keeps_svg_as_a_path_instead_of_embedding_active_markup() {
+    fn svg_is_a_document_handle_without_active_preview_markup() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("diagram.svg");
         fs::write(&path, br#"<svg xmlns="http://www.w3.org/2000/svg"/>"#).expect("write fixture");
 
-        let PreparedAttachment::Document(attachment) =
-            read_selected_attachment(path, MAX_IMAGE_ATTACHMENT_BYTES).expect("read SVG metadata")
-        else {
-            panic!("expected document")
-        };
-        assert!(!attachment.is_image);
-        assert!(attachment.attachment_handle.is_none());
+        let prepared =
+            read_selected_attachment(path, MAX_TOTAL_ATTACHMENT_BYTES, MAX_TOTAL_IMAGE_BYTES)
+                .expect("read SVG");
+        assert!(!prepared.is_image);
+        assert!(prepared.preview_data_url.is_none());
+        let attachment = AttachmentCache::default()
+            .insert_prepared("window-a", vec![prepared])
+            .expect("cache SVG")
+            .remove(0);
+        assert!(attachment.attachment_handle.is_some());
+        assert!(attachment.preview_data_url.is_none());
     }
 
     #[test]
@@ -747,14 +1803,14 @@ mod attachment_tests {
         file.set_len(MAX_IMAGE_ATTACHMENT_BYTES + 1)
             .expect("extend sparse fixture");
 
-        let error = read_selected_attachment(path, MAX_IMAGE_ATTACHMENT_BYTES)
-            .err()
-            .expect("oversized image must be rejected");
+        let error =
+            read_selected_attachment(path, MAX_TOTAL_ATTACHMENT_BYTES, MAX_TOTAL_IMAGE_BYTES)
+                .expect_err("oversized image must be rejected");
         assert!(error.contains("budget restant"));
     }
 
     #[test]
-    fn exposes_only_an_opaque_handle_and_metadata_for_images() {
+    fn exposes_only_opaque_handles_and_bounded_metadata() {
         let cache = AttachmentCache::default();
         let attachments = cache
             .insert_prepared(
@@ -777,8 +1833,9 @@ mod attachment_tests {
     }
 
     #[test]
-    fn owner_scoped_reservation_is_retryable_until_a_successful_write() {
+    fn owner_scoped_image_reservation_is_retryable_until_a_successful_write() {
         let cache = AttachmentCache::default();
+        let artifacts = tempfile::tempdir().expect("artifact directory");
         let attachment = cache
             .insert_prepared(
                 "window-a",
@@ -796,16 +1853,25 @@ mod attachment_tests {
         };
 
         let mut foreign_payload = make_payload();
-        let foreign = hydrate_prompt_images(cache.clone(), "window-b", &mut foreign_payload)
-            .err()
-            .expect("foreign owner must be rejected");
+        let foreign = hydrate_prompt_attachments(
+            cache.clone(),
+            "window-b",
+            &mut foreign_payload,
+            artifacts.path(),
+        )
+        .err()
+        .expect("foreign owner must be rejected");
         assert!(foreign.contains("autre fenêtre"));
 
         let mut failed_write_payload = make_payload();
-        let reservation =
-            hydrate_prompt_images(cache.clone(), "window-a", &mut failed_write_payload)
-                .expect("reserve image")
-                .expect("reservation");
+        let reservation = hydrate_prompt_attachments(
+            cache.clone(),
+            "window-a",
+            &mut failed_write_payload,
+            artifacts.path(),
+        )
+        .expect("reserve image")
+        .expect("reservation");
         assert!(failed_write_payload["images"][0]["data"]
             .as_str()
             .is_some_and(|data| !data.is_empty()));
@@ -816,20 +1882,26 @@ mod attachment_tests {
         drop(reservation);
 
         let mut retry_payload = make_payload();
-        let reservation = hydrate_prompt_images(cache.clone(), "window-a", &mut retry_payload)
-            .expect("retry after failed write")
-            .expect("retry reservation");
+        let reservation = hydrate_prompt_attachments(
+            cache.clone(),
+            "window-a",
+            &mut retry_payload,
+            artifacts.path(),
+        )
+        .expect("retry after failed write")
+        .expect("retry reservation");
         reservation.commit();
 
         let mut consumed_payload = make_payload();
-        let consumed = hydrate_prompt_images(cache, "window-a", &mut consumed_payload)
-            .err()
-            .expect("successful write consumes the handle");
+        let consumed =
+            hydrate_prompt_attachments(cache, "window-a", &mut consumed_payload, artifacts.path())
+                .err()
+                .expect("successful write consumes the handle");
         assert!(consumed.contains("expiré") || consumed.contains("disponible"));
     }
 
     #[test]
-    fn cache_rejects_an_unbounded_number_of_pending_images() {
+    fn cache_rejects_an_unbounded_number_of_pending_attachments() {
         let cache = AttachmentCache::default();
         let prepared = (0..81)
             .map(|index| prepared_image(&format!("{index}.png"), b"\x89PNG\r\n\x1a\n"))
@@ -841,8 +1913,350 @@ mod attachment_tests {
     }
 
     #[test]
+    fn one_window_at_its_cache_limit_does_not_block_another_window() {
+        let cache = AttachmentCache::default();
+        let owner_a = (0..80)
+            .map(|index| prepared_document(&format!("{index}.txt"), "text/plain", b""))
+            .collect();
+        cache
+            .insert_prepared("window-a", owner_a)
+            .expect("fill first owner cache");
+        let owner_a_error = cache
+            .insert_prepared(
+                "window-a",
+                vec![prepared_document("extra.txt", "text/plain", b"")],
+            )
+            .expect_err("first owner remains bounded");
+        assert!(owner_a_error.contains("cette fenêtre"));
+
+        let owner_b = cache
+            .insert_prepared(
+                "window-b",
+                vec![prepared_document("other.txt", "text/plain", b"ok")],
+            )
+            .expect("second owner has an independent budget");
+        assert_eq!(owner_b.len(), 1);
+    }
+
+    #[test]
+    fn utf8_document_is_inlined_by_name_and_never_by_source_path() {
+        let cache = AttachmentCache::default();
+        let artifacts = tempfile::tempdir().expect("artifact directory");
+        let attachment = cache
+            .insert_prepared(
+                "window-a",
+                vec![prepared_document(
+                    "notes & plan.txt",
+                    "text/plain",
+                    b"hello from the selected file",
+                )],
+            )
+            .expect("cache document")
+            .remove(0);
+        let handle = attachment.attachment_handle.expect("opaque handle");
+        let mut payload = json!({
+            "type": "prompt",
+            "message": "inspect",
+            "attachments": [{"attachmentHandle": handle}]
+        });
+        let reservation =
+            hydrate_prompt_attachments(cache, "window-a", &mut payload, artifacts.path())
+                .expect("hydrate document")
+                .expect("reservation");
+        assert_eq!(payload.get("attachments"), None);
+        let message = payload["message"].as_str().expect("hydrated message");
+        assert!(message.contains("<file name=\"notes &amp; plan.txt\" content_utf16=\"28\">"));
+        assert!(message.contains("hello from the selected file"));
+        assert!(!message.contains("outside-project"));
+        assert!(message.ends_with(&format!(
+            "visible_utf16=\"{}\"/>",
+            "inspect".encode_utf16().count()
+        )));
+        let public = parse_orbit_attachment_context(message).expect("strict Orbit context");
+        assert_eq!(public.visible_text, "inspect");
+        assert_eq!(public.attachments.len(), 1);
+        assert_eq!(public.attachments[0].name, "notes & plan.txt");
+        assert_eq!(public.attachments[0].mime_type, "text/plain");
+        assert_eq!(public.attachments[0].size, 28);
+        assert!(!public.attachments[0].is_image);
+        assert!(!serde_json::to_string(&public.attachments)
+            .expect("public metadata")
+            .contains("hello from the selected file"));
+        reservation.commit();
+    }
+
+    #[test]
+    fn strict_attachment_parser_rejects_fragment_manifest_mismatches() {
+        let cache = AttachmentCache::default();
+        let artifacts = tempfile::tempdir().expect("artifact directory");
+        let attachment = cache
+            .insert_prepared(
+                "window-a",
+                vec![prepared_document("notes.txt", "text/plain", b"hello")],
+            )
+            .expect("cache document")
+            .remove(0);
+        let mut payload = json!({
+            "type": "prompt",
+            "message": "inspect",
+            "attachments": [{"attachmentHandle": attachment.attachment_handle.expect("handle")}]
+        });
+        let _reservation =
+            hydrate_prompt_attachments(cache, "window-a", &mut payload, artifacts.path())
+                .expect("hydrate document")
+                .expect("reservation");
+        let message = payload["message"].as_str().expect("hydrated message");
+        assert!(parse_orbit_attachment_context(message).is_some());
+
+        let wrong_name =
+            message.replacen("<file name=\"notes.txt\"", "<file name=\"other.txt\"", 1);
+        assert!(parse_orbit_attachment_context(&wrong_name).is_none());
+
+        let wrong_length = message.replacen("content_utf16=\"5\"", "content_utf16=\"4\"", 1);
+        assert!(parse_orbit_attachment_context(&wrong_length).is_none());
+    }
+
+    #[test]
+    fn stages_inline_text_when_images_and_json_escaping_would_overflow_rpc() {
+        let cache = AttachmentCache::default();
+        let artifacts = tempfile::tempdir().expect("artifact directory");
+        let mut first_image = vec![0_u8; 5 * 1024 * 1024];
+        first_image[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        let second_image = first_image.clone();
+        // NUL expands to six JSON bytes. It is valid UTF-8 and below the
+        // per-document inline threshold, but cannot coexist inline with the
+        // maximum image budget in a 16 MiB RPC record.
+        let escaped_text = vec![0_u8; MAX_INLINE_DOCUMENT_BYTES];
+        let attachments = cache
+            .insert_prepared(
+                "window-a",
+                vec![
+                    prepared_image("one.png", &first_image),
+                    prepared_image("two.png", &second_image),
+                    prepared_document("escaped.txt", "text/plain", &escaped_text),
+                ],
+            )
+            .expect("cache max-budget fixtures");
+        let mut payload = json!({
+            "type": "prompt",
+            "message": "inspect",
+            "images": [
+                {"attachmentHandle": attachments[0].attachment_handle.as_ref().expect("first handle")},
+                {"attachmentHandle": attachments[1].attachment_handle.as_ref().expect("second handle")}
+            ],
+            "attachments": [
+                {"attachmentHandle": attachments[2].attachment_handle.as_ref().expect("document handle")}
+            ]
+        });
+
+        let reservation =
+            hydrate_prompt_attachments(cache, "window-a", &mut payload, artifacts.path())
+                .expect("hydrate within real RPC budget")
+                .expect("reservation");
+        assert_eq!(reservation.staged_directories.len(), 1);
+        assert!(
+            serde_json::to_vec(&payload)
+                .expect("serialize payload")
+                .len()
+                <= crate::MAX_RPC_BYTES
+        );
+        assert!(!payload["message"].as_str().expect("message").contains('\0'));
+    }
+
+    #[test]
+    fn artifact_root_uses_the_exact_session_header_id_and_a_hashed_fallback() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let session_dir = directory.path().join("sessions").join("project-key");
+        fs::create_dir_all(&session_dir).expect("session directory");
+        let session_path = session_dir.join("misleading-stem.jsonl");
+        fs::write(
+            &session_path,
+            b"{\"type\":\"session\",\"id\":\"exact-header-id\",\"cwd\":\"C:/work\"}\n",
+        )
+        .expect("session header");
+        let app_data = directory.path().join("app-data");
+        let root = attachment_artifact_root(
+            session_path.to_str(),
+            None,
+            &app_data,
+            "renderer/conversation/identifier",
+        );
+        assert_eq!(
+            root,
+            directory
+                .path()
+                .join("sessions")
+                .join("session-artifacts")
+                .join("exact-header-id")
+                .join("prime-orbit-attachments")
+        );
+        assert!(!root.to_string_lossy().contains("misleading-stem"));
+
+        let missing_session_path = directory
+            .path()
+            .join("sessions")
+            .join("project-key")
+            .join("missing.jsonl");
+        let exact_state_root = attachment_artifact_root(
+            missing_session_path.to_str(),
+            Some("state-session-id"),
+            &app_data,
+            "renderer/conversation/identifier",
+        );
+        assert!(exact_state_root.ends_with(
+            Path::new("session-artifacts")
+                .join("state-session-id")
+                .join("prime-orbit-attachments")
+        ));
+
+        let fallback =
+            attachment_artifact_root(None, None, &app_data, "renderer/conversation/identifier");
+        assert!(fallback.starts_with(&app_data));
+        assert!(!fallback
+            .to_string_lossy()
+            .contains("renderer/conversation/identifier"));
+    }
+
+    #[test]
+    fn binary_document_staging_is_retryable_then_retained_after_commit() {
+        let cache = AttachmentCache::default();
+        let artifacts = tempfile::tempdir().expect("artifact directory");
+        let root = artifacts.path().to_path_buf();
+        let attachment = cache
+            .insert_prepared(
+                "window-a",
+                vec![prepared_document(
+                    "report.pdf",
+                    "application/pdf",
+                    &[0xff, 0, 1],
+                )],
+            )
+            .expect("cache binary document")
+            .remove(0);
+        let handle = attachment.attachment_handle.expect("opaque handle");
+        let make_payload = || {
+            json!({
+                "type": "prompt",
+                "message": "inspect",
+                "attachments": [{"attachmentHandle": handle}]
+            })
+        };
+
+        let mut failed_payload = make_payload();
+        let failed_reservation =
+            hydrate_prompt_attachments(cache.clone(), "window-a", &mut failed_payload, &root)
+                .expect("stage binary")
+                .expect("reservation");
+        let failed_directory = failed_reservation.staged_directories[0].clone();
+        assert!(failed_directory.join("attachment.pdf").is_file());
+        assert!(failed_payload["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Prime Orbit")));
+        drop(failed_reservation);
+        assert!(!failed_directory.exists());
+
+        let mut retry_payload = make_payload();
+        let reservation =
+            hydrate_prompt_attachments(cache.clone(), "window-a", &mut retry_payload, &root)
+                .expect("retry staging")
+                .expect("reservation");
+        let retained_directory = reservation.staged_directories[0].clone();
+        let context_id = parse_orbit_attachment_context(
+            retry_payload["message"].as_str().expect("hydrated message"),
+        )
+        .expect("strict attachment context")
+        .context_id;
+        let context_root = root.join(&context_id);
+        assert_eq!(retained_directory.parent(), Some(context_root.as_path()));
+        reservation.commit();
+        assert!(retained_directory.join("attachment.pdf").is_file());
+        drop(cache);
+        assert!(retained_directory.join("attachment.pdf").is_file());
+        remove_staged_attachment_context(&root, &context_id).expect("queue delete cleanup");
+        assert!(!retained_directory.exists());
+    }
+
+    #[test]
+    fn queue_cleanup_removes_only_the_exact_orbit_context_directory() {
+        let artifacts = tempfile::tempdir().expect("artifact directory");
+        let root = artifacts.path().join("prime-orbit-attachments");
+        let context_id = "550e8400-e29b-41d4-a716-446655440000";
+        let context = root.join(context_id);
+        let sibling = root.join("660e8400-e29b-41d4-a716-446655440000");
+        fs::create_dir_all(&context).expect("context");
+        fs::create_dir_all(&sibling).expect("sibling");
+        fs::write(context.join("attachment.pdf"), b"private").expect("context file");
+
+        remove_staged_attachment_context(&root, context_id).expect("safe cleanup");
+        assert!(!context.exists());
+        assert!(sibling.is_dir());
+        assert!(root.is_dir());
+        assert!(remove_staged_attachment_context(&root, "../outside").is_err());
+        assert!(sibling.is_dir());
+    }
+
+    #[test]
+    fn fallback_gc_is_bounded_to_orbit_owned_hashed_conversation_roots() {
+        let app_data = tempfile::tempdir().expect("app data");
+        let fallback = app_data.path().join("session-attachments");
+        let conversation = fallback.join("a".repeat(64));
+        let artifact = conversation
+            .join("prime-orbit-attachments")
+            .join("550e8400-e29b-41d4-a716-446655440000")
+            .join("child")
+            .join("attachment.pdf");
+        fs::create_dir_all(artifact.parent().expect("artifact parent")).expect("artifact tree");
+        fs::write(&artifact, b"private").expect("artifact");
+        let unrelated = fallback.join("user-named-folder");
+        fs::create_dir_all(&unrelated).expect("unrelated folder");
+        fs::write(unrelated.join("keep.txt"), b"keep").expect("unrelated file");
+
+        let removed = prune_fallback_attachment_artifacts(
+            app_data.path(),
+            SystemTime::now() + Duration::from_secs(2 * 24 * 60 * 60),
+            Duration::from_secs(24 * 60 * 60),
+            Duration::ZERO,
+            0,
+            0,
+        )
+        .expect("bounded fallback cleanup");
+        assert_eq!(removed, 1);
+        assert!(!conversation.exists());
+        assert!(unrelated.join("keep.txt").is_file());
+        assert!(app_data.path().is_dir());
+    }
+
+    #[test]
+    fn large_utf8_document_is_staged_instead_of_expanding_the_rpc_payload() {
+        let cache = AttachmentCache::default();
+        let artifacts = tempfile::tempdir().expect("artifact directory");
+        let bytes = vec![b'x'; MAX_INLINE_DOCUMENT_BYTES + 1];
+        let attachment = cache
+            .insert_prepared(
+                "window-a",
+                vec![prepared_document("large.txt", "text/plain", &bytes)],
+            )
+            .expect("cache large document")
+            .remove(0);
+        let mut payload = json!({
+            "type": "prompt",
+            "message": "inspect",
+            "attachments": [{"attachmentHandle": attachment.attachment_handle.expect("handle")}]
+        });
+        let reservation =
+            hydrate_prompt_attachments(cache, "window-a", &mut payload, artifacts.path())
+                .expect("hydrate large text")
+                .expect("reservation");
+        assert!(payload["message"]
+            .as_str()
+            .is_some_and(|message| message.len() < 2_000));
+        assert_eq!(reservation.staged_directories.len(), 1);
+    }
+
+    #[test]
     fn expired_handles_are_purged_before_rpc_hydration() {
         let cache = AttachmentCache::default();
+        let artifacts = tempfile::tempdir().expect("artifact directory");
         let attachment = cache
             .insert_prepared(
                 "window-a",
@@ -854,20 +2268,25 @@ mod attachment_tests {
         cache
             .0
             .lock()
-            .images
+            .attachments
             .get_mut(&handle)
-            .expect("cached image")
-            .inserted_at = Instant::now() - CACHED_IMAGE_TTL;
+            .expect("cached attachment")
+            .inserted_at = Instant::now() - CACHED_ATTACHMENT_TTL;
         let mut payload = json!({
             "type": "prompt",
             "images": [{"type": "image", "attachmentHandle": handle}]
         });
-        let error = match hydrate_prompt_images(cache.clone(), "window-a", &mut payload) {
+        let error = match hydrate_prompt_attachments(
+            cache.clone(),
+            "window-a",
+            &mut payload,
+            artifacts.path(),
+        ) {
             Err(error) => error,
             Ok(_) => panic!("expired handle accepted"),
         };
         assert!(error.contains("expiré"));
-        assert!(cache.0.lock().images.is_empty());
+        assert!(cache.0.lock().attachments.is_empty());
     }
 }
 

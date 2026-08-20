@@ -53,7 +53,9 @@ pub struct SessionCatalogEntry {
 
 fn catalog_text(value: &Value, limit: usize) -> Option<String> {
     let text = match value {
-        Value::String(text) => text.clone(),
+        Value::String(text) => crate::files::parse_orbit_attachment_context(text)
+            .map(|context| context.visible_text)
+            .unwrap_or_else(|| text.clone()),
         Value::Array(blocks) => blocks
             .iter()
             .filter_map(|block| {
@@ -69,6 +71,11 @@ fn catalog_text(value: &Value, limit: usize) -> Option<String> {
                         .and_then(Value::as_str)
                 })
                 .flatten()
+            })
+            .map(|text| {
+                crate::files::parse_orbit_attachment_context(text)
+                    .map(|context| context.visible_text)
+                    .unwrap_or_else(|| text.to_string())
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -222,7 +229,7 @@ fn list_session_catalog(
             }
         }
     }
-    sessions.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
     Ok(sessions)
 }
 
@@ -604,6 +611,9 @@ fn active_path(entries: &[ParsedEntry]) -> Result<Vec<usize>, String> {
 }
 
 fn truncate_text(value: &str, limit: usize, truncated: &mut bool) -> String {
+    let visible =
+        crate::files::parse_orbit_attachment_context(value).map(|context| context.visible_text);
+    let value = visible.as_deref().unwrap_or(value);
     if value.chars().count() <= limit {
         return value.to_string();
     }
@@ -704,27 +714,55 @@ fn sanitize_payload(value: &Value, truncated: &mut bool) -> Value {
     sanitized
 }
 
-fn sanitized_content(value: &Value, truncated: &mut bool) -> Value {
+fn sanitized_content(
+    value: &Value,
+    truncated: &mut bool,
+    orbit_attachments: &mut Vec<crate::files::PublicAttachmentMetadata>,
+    allow_orbit_context: bool,
+) -> Value {
     match value {
-        Value::String(text) => Value::String(truncate_text(
-            text,
-            MAX_SUMMARY_CHARS,
-            truncated,
-        )),
+        Value::String(text) => {
+            let visible = crate::files::parse_orbit_attachment_context(text).map(|context| {
+                if allow_orbit_context {
+                    orbit_attachments.extend(context.attachments);
+                }
+                context.visible_text
+            });
+            Value::String(truncate_text(
+                visible.as_deref().unwrap_or(text),
+                MAX_SUMMARY_CHARS,
+                truncated,
+            ))
+        }
         Value::Array(blocks) => Value::Array(
             blocks
                 .iter()
                 .filter_map(|block| {
                     let object = block.as_object()?;
                     match object.get("type").and_then(Value::as_str)? {
-                        "text" | "output_text" => Some(json!({
-                            "type": object.get("type").and_then(Value::as_str).unwrap_or("text"),
-                            "text": truncate_text(
-                                object.get("text").or_else(|| object.get("content")).and_then(Value::as_str).unwrap_or_default(),
-                                MAX_PUBLIC_TEXT_CHARS,
-                                truncated,
-                            ),
-                        })),
+                        "text" | "output_text" => {
+                            let text = object
+                                .get("text")
+                                .or_else(|| object.get("content"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            let visible = crate::files::parse_orbit_attachment_context(text).map(
+                                |context| {
+                                    if allow_orbit_context {
+                                        orbit_attachments.extend(context.attachments);
+                                    }
+                                    context.visible_text
+                                },
+                            );
+                            Some(json!({
+                                "type": object.get("type").and_then(Value::as_str).unwrap_or("text"),
+                                "text": truncate_text(
+                                    visible.as_deref().unwrap_or(text),
+                                    MAX_PUBLIC_TEXT_CHARS,
+                                    truncated,
+                                ),
+                            }))
+                        }
                         "toolCall" => Some(json!({
                             "type": "toolCall",
                             "id": object.get("id").and_then(Value::as_str).unwrap_or("tool"),
@@ -794,21 +832,20 @@ fn sanitized_message(entry: &ParsedEntry, truncated: &mut bool) -> Option<Value>
                 return None;
             }
             let mut public = Map::new();
+            let mut orbit_attachments = Vec::new();
             public.insert("id".to_string(), Value::String(entry.id.clone()));
             public.insert("role".to_string(), Value::String(role.to_string()));
             copy_timestamp(&mut public, &Value::Object(source.clone()), &entry.value);
             if let Some(content) = source.get("content") {
-                let content = if role == "toolResult" {
-                    match content {
-                        Value::String(text) => {
-                            Value::String(truncate_text(text, MAX_PUBLIC_TEXT_CHARS, truncated))
-                        }
-                        _ => sanitized_content(content, truncated),
-                    }
-                } else {
-                    sanitized_content(content, truncated)
-                };
+                let content =
+                    sanitized_content(content, truncated, &mut orbit_attachments, role == "user");
                 public.insert("content".to_string(), content);
+            }
+            if !orbit_attachments.is_empty() {
+                public.insert(
+                    "primeOrbitAttachments".to_string(),
+                    serde_json::to_value(orbit_attachments).ok()?,
+                );
             }
             if role == "assistant" {
                 if let Some(model) = source.get("model").and_then(Value::as_str) {
@@ -865,6 +902,7 @@ fn sanitized_message(entry: &ParsedEntry, truncated: &mut bool) -> Option<Value>
         }
         "custom_message" if entry.value.get("display").and_then(Value::as_bool) == Some(true) => {
             let mut public = Map::new();
+            let mut orbit_attachments = Vec::new();
             public.insert("id".to_string(), Value::String(entry.id.clone()));
             public.insert("role".to_string(), Value::String("custom".to_string()));
             public.insert("display".to_string(), Value::Bool(true));
@@ -877,8 +915,16 @@ fn sanitized_message(entry: &ParsedEntry, truncated: &mut bool) -> Option<Value>
                         .get("content")
                         .unwrap_or(&Value::String(String::new())),
                     truncated,
+                    &mut orbit_attachments,
+                    false,
                 ),
             );
+            if !orbit_attachments.is_empty() {
+                public.insert(
+                    "primeOrbitAttachments".to_string(),
+                    serde_json::to_value(orbit_attachments).ok()?,
+                );
+            }
             Some(Value::Object(public))
         }
         "branch_summary" => {
@@ -1069,6 +1115,7 @@ pub async fn load_session_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -1119,6 +1166,24 @@ mod tests {
         }
     }
 
+    fn wrapped_attachment_message(visible: &str, private_fragment: &str) -> String {
+        let context_id = "550e8400-e29b-41d4-a716-446655440000";
+        let manifest = serde_json::to_vec(&json!([{
+            "name": "report.pdf",
+            "mimeType": "application/pdf",
+            "size": 42,
+            "isImage": false,
+        }]))
+        .expect("manifest");
+        let encoded = URL_SAFE_NO_PAD.encode(manifest);
+        let separator = if visible.is_empty() { "" } else { "\n\n" };
+        let content_utf16 = private_fragment.encode_utf16().count();
+        format!(
+            "{visible}{separator}<prime_orbit_attachment_context v=\"1\" id=\"{context_id}\">\n<prime_orbit_manifest encoding=\"base64url\">{encoded}</prime_orbit_manifest>\n<file name=\"report.pdf\" content_utf16=\"{content_utf16}\">\n{private_fragment}\n</file>\n</prime_orbit_attachment_context>\n<prime_orbit_ui_boundary v=\"1\" id=\"{context_id}\" visible_utf16=\"{}\"/>",
+            visible.encode_utf16().count()
+        )
+    }
+
     #[test]
     fn reconstructs_only_the_active_branch() {
         let fixture = Fixture::new(&[
@@ -1134,6 +1199,68 @@ mod tests {
         assert!(!serialized.contains("branche abandonnée"));
         assert!(!serialized.contains("secret interne"));
         assert!(history.read_only);
+    }
+
+    #[test]
+    fn strips_large_attachment_context_before_history_truncation() {
+        let staged_path = r#"C:\Users\example\AppData\Roaming\Prime Orbit\session-attachments\private\prime-orbit-attachments\uuid\attachment.pdf"#;
+        let private_fragment = format!(
+            "[Attachment staged by Prime Orbit at {staged_path}]{}",
+            "PRIVATE_DOCUMENT_CONTENT".repeat(4_000)
+        );
+        assert!(private_fragment.len() > MAX_SUMMARY_CHARS);
+        let wrapped = wrapped_attachment_message("visible question", &private_fragment);
+        let fixture = Fixture::new(&[json!({
+            "type":"message",
+            "id":"one",
+            "parentId":null,
+            "message":{"role":"user","content":wrapped}
+        })]);
+
+        let history = fixture.load().expect("load sanitized history");
+        let serialized =
+            serde_json::to_string(&history.messages).expect("serialize public history");
+        assert!(serialized.contains("visible question"));
+        assert!(serialized.contains("primeOrbitAttachments"));
+        assert!(serialized.contains("report.pdf"));
+        assert!(!serialized.contains("PRIVATE_DOCUMENT_CONTENT"));
+        assert!(!serialized.contains("session-attachments"));
+        assert!(!serialized.contains("prime_orbit_attachment_context"));
+        assert!(!serialized.contains("prime_orbit_ui_boundary"));
+        assert_eq!(history.messages[0]["content"], "visible question");
+        assert_eq!(
+            history.messages[0]["primeOrbitAttachments"][0]["mimeType"],
+            "application/pdf"
+        );
+    }
+
+    #[test]
+    fn assistant_and_tool_wrappers_are_stripped_without_attachment_sidecars() {
+        let private = r#"PRIVATE_TOOL_BODY C:\Users\example\session-attachments\secret.pdf"#;
+        let assistant = wrapped_attachment_message("assistant visible", private);
+        let tool = wrapped_attachment_message("tool visible", private);
+        let fixture = Fixture::new(&[
+            json!({
+                "type":"message",
+                "id":"assistant",
+                "parentId":null,
+                "message":{"role":"assistant","content":assistant}
+            }),
+            json!({
+                "type":"message",
+                "id":"tool",
+                "parentId":"assistant",
+                "message":{"role":"toolResult","content":[{"type":"text","text":tool}]}
+            }),
+        ]);
+
+        let history = fixture.load().expect("load sanitized history");
+        let serialized = serde_json::to_string(&history.messages).expect("public history");
+        assert!(!serialized.contains("PRIVATE_TOOL_BODY"));
+        assert!(!serialized.contains("session-attachments"));
+        assert!(!serialized.contains("primeOrbitAttachments"));
+        assert_eq!(history.messages[0]["content"], "assistant visible");
+        assert_eq!(history.messages[1]["content"][0]["text"], "tool visible");
     }
 
     #[test]
