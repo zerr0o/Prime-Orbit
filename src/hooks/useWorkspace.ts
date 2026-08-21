@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type SetStateAction } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { defaultAppState } from "../lib/demo";
 import { latestProjectConversation } from "../lib/project-navigation";
 import type { RlmDelegationSnapshot } from "../lib/rlm-preferences";
@@ -10,6 +11,7 @@ import {
   type AppStateSnapshot,
 } from "../lib/bridge";
 import type { AppView, Conversation, PersistedAppState, PrimeAgentSessionSummary, Project } from "../types";
+import { normalizeFavoriteModelRefs } from "../lib/model-favorites";
 
 const PROJECT_COLORS = ["#7c6cff", "#45c6d8", "#2ecf8f", "#f3b65b", "#f56b79", "#b26cff"];
 const SAVE_DEBOUNCE_MS = 260;
@@ -267,9 +269,21 @@ export function useWorkspace() {
   useEffect(() => {
     const root = document.documentElement;
     const requested = state.preferences.theme;
-    const resolved = requested === "system" ? (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark") : requested;
-    root.dataset.theme = resolved;
+    const systemTheme = window.matchMedia("(prefers-color-scheme: light)");
+    const applyResolvedTheme = () => {
+      root.dataset.theme = requested === "system" ? (systemTheme.matches ? "light" : "dark") : requested;
+    };
+    applyResolvedTheme();
     root.dataset.motion = state.preferences.reduceMotion ? "reduced" : "full";
+
+    // Keep the window chrome and other OS-owned surfaces on the same resolved
+    // light/dark scheme as the renderer.
+    if ("__TAURI_INTERNALS__" in window) {
+      void getCurrentWindow().setTheme(requested === "system" ? null : requested).catch(() => undefined);
+    }
+    if (requested !== "system") return;
+    systemTheme.addEventListener("change", applyResolvedTheme);
+    return () => systemTheme.removeEventListener("change", applyResolvedTheme);
   }, [state.preferences.reduceMotion, state.preferences.theme]);
 
   const selectedProject = useMemo(
@@ -699,6 +713,7 @@ export function rebaseWorkspaceState(
     mergeConversation,
   ).filter((conversation) => projectIds.has(conversation.projectId));
 
+  const preferences = mergeChangedFields(base.preferences, local.preferences, remote.preferences);
   return {
     version: Math.max(base.version, local.version, remote.version),
     projects,
@@ -708,8 +723,33 @@ export function rebaseWorkspaceState(
     // the current one or trigger a selection-only save ping-pong.
     selectedProjectId: local.selectedProjectId,
     selectedConversationId: local.selectedConversationId,
-    preferences: mergeChangedFields(base.preferences, local.preferences, remote.preferences),
+    preferences: {
+      ...preferences,
+      favoriteModels: mergeFavoriteModelRefs(
+        base.preferences.favoriteModels,
+        local.preferences.favoriteModels,
+        remote.preferences.favoriteModels,
+      ),
+    },
   };
+}
+
+/** Favorites are shared durable state. Concurrent additions from two windows
+ * are unioned, while removing an existing favorite in either window acts as a
+ * tombstone so a stale save cannot resurrect it. Durable order wins first and
+ * newly-local additions are appended in their local order. */
+export function mergeFavoriteModelRefs(base: unknown, local: unknown, remote: unknown): string[] {
+  const baseRefs = normalizeFavoriteModelRefs(base);
+  const localRefs = normalizeFavoriteModelRefs(local);
+  const remoteRefs = normalizeFavoriteModelRefs(remote);
+  const baseSet = new Set(baseRefs);
+  const localSet = new Set(localRefs);
+  const remoteSet = new Set(remoteRefs);
+  const removed = new Set(baseRefs.filter((ref) => !localSet.has(ref) || !remoteSet.has(ref)));
+  return normalizeFavoriteModelRefs([
+    ...remoteRefs.filter((ref) => !removed.has(ref)),
+    ...localRefs.filter((ref) => !removed.has(ref) && (!baseSet.has(ref) || remoteSet.has(ref))),
+  ]);
 }
 
 function mergeEntityCollection<T extends { id: string }>(
@@ -888,7 +928,11 @@ function normalizeWorkspaceState(state: PersistedAppState): PersistedAppState {
     conversations,
     selectedProjectId,
     selectedConversationId,
-    preferences: { ...defaultAppState.preferences, ...state.preferences },
+    preferences: {
+      ...defaultAppState.preferences,
+      ...state.preferences,
+      favoriteModels: normalizeFavoriteModelRefs(state.preferences?.favoriteModels),
+    },
   };
 }
 

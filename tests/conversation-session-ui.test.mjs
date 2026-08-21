@@ -23,14 +23,69 @@ const {
   buildToolSequenceSegments,
   buildContextUsageSnapshot,
   buildSessionPanelSummary,
+  clampRefinementContextMenuPosition,
   continueComposerMarkdownList,
   agentMessageRelationshipLabel,
   initialAgentMessageNoticeExpanded,
   initialPythonExecutionGroupExpanded,
   initialToolCardExpanded,
+  harnessConfirmationPhrase,
+  isConversationMaintenanceBlocked,
+  isConversationTurnActive,
   isGoalPanelBusy,
   isRefineControlBusy,
+  normalizeLegacyActivity,
 } = compiledModule.exports;
+
+test("clamps memory and refinement menus inside the visible desktop viewport", () => {
+  assert.deepEqual(clampRefinementContextMenuPosition(980, 740, 240, 160, 1024, 768), { x: 776, y: 600 });
+  assert.deepEqual(clampRefinementContextMenuPosition(-20, -10, 240, 160, 1024, 768), { x: 8, y: 8 });
+});
+
+test("requires an explicit stable phrase only for destructive global harness changes", () => {
+  assert.equal(harnessConfirmationPhrase({ id: "local-note", title: "Local note", scope: "local" }), "");
+  assert.equal(harnessConfirmationPhrase({ id: "global-note", title: "Shared decision", scope: "global" }), "Shared decision");
+  assert.equal(harnessConfirmationPhrase({ id: "global-note", title: "x".repeat(81), scope: "global" }), "global-note");
+  assert.equal(harnessConfirmationPhrase({ id: "unknown-note", title: "Unknown", scope: "unknown" }), "");
+});
+
+test("connection startup is not presented to the composer as an active turn", () => {
+  assert.equal(isConversationTurnActive("starting"), false);
+  assert.equal(isConversationTurnActive("idle"), false);
+  assert.equal(isConversationTurnActive("streaming"), true);
+  assert.equal(isConversationTurnActive("tool"), true);
+  assert.equal(isConversationTurnActive("queued"), true);
+});
+
+test("maintenance stays unavailable while connecting or while a real turn is active", () => {
+  assert.equal(isConversationMaintenanceBlocked("starting"), true);
+  assert.equal(isConversationMaintenanceBlocked("streaming"), true);
+  assert.equal(isConversationMaintenanceBlocked("tool"), true);
+  assert.equal(isConversationMaintenanceBlocked("queued"), true);
+  assert.equal(isConversationMaintenanceBlocked("idle"), false);
+});
+
+test("legacy child activities preserve a parent-managed closure as neutral", () => {
+  const normalized = normalizeLegacyActivity({
+    id: "rlm-child:reviewer",
+    type: "rlm_child_update",
+    title: "legacy",
+    createdAt: "2026-08-21T12:00:00.000Z",
+    status: "warning",
+    raw: {
+      child: {
+        id: "reviewer",
+        label: "reviewer",
+        status: "cancelled",
+        error: "Deleted by parent orchestrator",
+        recap: "Review delivered",
+      },
+    },
+  }, "fr");
+  assert.equal(normalized.status, "info");
+  assert.equal(normalized.title, "Sous-agent « reviewer » fermé par l’agent principal");
+  assert.equal(normalized.detail, "Review delivered");
+});
 
 test("continues and exits Markdown lists without replacing the textarea", () => {
   assert.deepEqual(continueComposerMarkdownList("- premier", 9, 9), {

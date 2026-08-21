@@ -30,6 +30,7 @@ export const defaultAppState: PersistedAppState = {
     inspectorOpen: true,
     bottomDockOpen: false,
     telemetry: false,
+    favoriteModels: [],
     defaultThinking: "high",
     defaultPermissionPreset: "standard",
     reduceMotion: false,

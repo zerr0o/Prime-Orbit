@@ -1,4 +1,7 @@
-use crate::paths::canonicalize;
+use crate::{
+    harness::{read_harness_inventory, HarnessInventory},
+    paths::canonicalize,
+};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -21,13 +24,72 @@ const MAX_MESSAGES: usize = 5_000;
 const MAX_PUBLIC_TEXT_CHARS: usize = 16_000;
 const MAX_SUMMARY_CHARS: usize = 64_000;
 const MAX_IPC_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TRANSCRIPT_IPC_BYTES: usize = 6 * 1024 * 1024;
+const MAX_REFINEMENT_IPC_BYTES: usize = 1024 * 1024;
 const MAX_PUBLIC_AGENT_MESSAGE_ID_SUFFIX_CHARS: usize = 200;
 const MAX_PUBLIC_AGENT_NAME_CHARS: usize = 160;
+const MAX_REFINEMENT_RECORDS: usize = 48;
+const MAX_REFINEMENT_EDITS: usize = 64;
+const MAX_OBSERVED_HARNESS_ENTRIES: usize = 128;
+const MAX_REFINEMENT_ID_CHARS: usize = 200;
+const MAX_REFINEMENT_SUMMARY_CHARS: usize = 480;
+const MAX_REFINEMENT_DETAIL_CHARS: usize = 1_200;
+const MAX_REFINEMENT_CONTENT_CHARS: usize = 4_000;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRefinementEdit {
+    pub action: String,
+    pub kind: String,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    pub applied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRefinementRecord {
+    pub id: String,
+    pub timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_of: Option<String>,
+    pub applied_edits: Vec<SessionRefinementEdit>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionHarnessEntry {
+    pub key: String,
+    pub id: String,
+    pub kind: String,
+    pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    pub refinement_id: String,
+    pub updated_at: String,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionHistoryResult {
     pub messages: Vec<Value>,
+    pub refinements: Vec<SessionRefinementRecord>,
+    pub harness_entries: Vec<SessionHarnessEntry>,
     pub read_only: bool,
     pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -625,6 +687,354 @@ fn truncate_text(value: &str, limit: usize, truncated: &mut bool) -> String {
     text
 }
 
+fn refinement_id(value: Option<&str>, truncated: &mut bool) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return None;
+    }
+    if value.chars().count() > MAX_REFINEMENT_ID_CHARS {
+        *truncated = true;
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn refinement_text(value: Option<&str>, limit: usize, truncated: &mut bool) -> Option<String> {
+    let value = value?.trim();
+    (!value.is_empty()).then(|| truncate_text(value, limit, truncated))
+}
+
+fn refinement_scope(record: &Map<String, Value>, snapshot: Option<&Map<String, Value>>) -> String {
+    snapshot
+        .and_then(|entry| entry.get("scope"))
+        .and_then(Value::as_str)
+        .or_else(|| record.get("scope").and_then(Value::as_str))
+        .filter(|scope| matches!(*scope, "local" | "global"))
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn public_harness_entries(
+    entries: &[ParsedEntry],
+    truncated: &mut bool,
+) -> Vec<SessionHarnessEntry> {
+    // This projection is folded independently from the bounded audit rows.
+    // Every edit in the validated session file is considered, so an update or
+    // delete after the visible 64-edit limit cannot leave a stale active item.
+    let mut observed = HashMap::<String, (u64, SessionHarnessEntry)>::new();
+    let mut sequence = 0_u64;
+    for entry in entries {
+        let value = &entry.value;
+        if string_field(value, "type") != Some("custom")
+            || string_field(value, "customType") != Some("prime-agent.refinement")
+        {
+            continue;
+        }
+        let Some(timestamp) = refinement_text(
+            string_field(value, "timestamp"),
+            MAX_REFINEMENT_ID_CHARS,
+            truncated,
+        ) else {
+            continue;
+        };
+        let Some(data) = value.get("data").and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(record_refinement_id) =
+            refinement_id(data.get("id").and_then(Value::as_str), truncated)
+        else {
+            continue;
+        };
+        let Some(edits) = data.get("appliedEdits").and_then(Value::as_array) else {
+            continue;
+        };
+        for edit in edits {
+            let Some(edit) = edit.as_object() else {
+                continue;
+            };
+            if edit.get("applied").and_then(Value::as_bool) != Some(true) {
+                continue;
+            }
+            let Some(action) = edit.get("action").and_then(Value::as_str) else {
+                continue;
+            };
+            if !matches!(action, "create" | "update" | "delete") {
+                continue;
+            }
+            let Some(kind) = edit.get("kind").and_then(Value::as_str) else {
+                continue;
+            };
+            if !matches!(kind, "prompt" | "memory" | "skill" | "subagent") {
+                continue;
+            }
+            let Some(id) = refinement_id(edit.get("id").and_then(Value::as_str), truncated) else {
+                continue;
+            };
+            let snapshot = if action == "delete" {
+                edit.get("before").and_then(Value::as_object)
+            } else {
+                edit.get("after").and_then(Value::as_object)
+            };
+            let scope = refinement_scope(data, snapshot);
+            let key = format!("{scope}:{kind}:{id}");
+            sequence = sequence.saturating_add(1);
+            if action == "delete" {
+                observed.remove(&key);
+                continue;
+            }
+
+            let previous = observed.remove(&key).map(|(_, entry)| entry);
+            if previous.is_none() && observed.len() >= MAX_OBSERVED_HARNESS_ENTRIES {
+                if let Some(oldest) = observed
+                    .iter()
+                    .min_by_key(|(_, (ordinal, _))| *ordinal)
+                    .map(|(key, _)| key.clone())
+                {
+                    observed.remove(&oldest);
+                    *truncated = true;
+                }
+            }
+            let title = refinement_text(
+                snapshot
+                    .and_then(|entry| entry.get("title"))
+                    .or_else(|| edit.get("title"))
+                    .and_then(Value::as_str),
+                MAX_REFINEMENT_SUMMARY_CHARS,
+                truncated,
+            )
+            .or_else(|| previous.as_ref().and_then(|entry| entry.title.clone()));
+            let content = refinement_text(
+                snapshot
+                    .and_then(|entry| entry.get("content"))
+                    .or_else(|| edit.get("content"))
+                    .and_then(Value::as_str),
+                MAX_REFINEMENT_CONTENT_CHARS,
+                truncated,
+            )
+            .or_else(|| previous.as_ref().and_then(|entry| entry.content.clone()));
+            observed.insert(
+                key.clone(),
+                (
+                    sequence,
+                    SessionHarnessEntry {
+                        key,
+                        id,
+                        kind: kind.to_string(),
+                        scope,
+                        title,
+                        content,
+                        refinement_id: record_refinement_id.clone(),
+                        updated_at: timestamp.clone(),
+                    },
+                ),
+            );
+        }
+    }
+
+    let mut harness_entries = observed.into_values().collect::<Vec<_>>();
+    harness_entries.sort_by_key(|(ordinal, _)| std::cmp::Reverse(*ordinal));
+    harness_entries
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .collect()
+}
+
+fn refinement_output_size(
+    records: &[SessionRefinementRecord],
+    harness_entries: &[SessionHarnessEntry],
+) -> usize {
+    serde_json::to_vec(&(records, harness_entries)).map_or(usize::MAX, |value| value.len())
+}
+
+fn bound_refinement_output(
+    records: &mut Vec<SessionRefinementRecord>,
+    harness_entries: &mut Vec<SessionHarnessEntry>,
+    truncated: &mut bool,
+) {
+    // Drop old audit rows before current entries. The snapshot is the useful
+    // state, while audit rows are supplementary context.
+    while records.len() > 1
+        && refinement_output_size(records, harness_entries) > MAX_REFINEMENT_IPC_BYTES
+    {
+        records.remove(0);
+        *truncated = true;
+    }
+    while harness_entries.len() > 1
+        && refinement_output_size(records, harness_entries) > MAX_REFINEMENT_IPC_BYTES
+    {
+        harness_entries.pop();
+        *truncated = true;
+    }
+    if refinement_output_size(records, harness_entries) > MAX_REFINEMENT_IPC_BYTES {
+        records.clear();
+        harness_entries.clear();
+        *truncated = true;
+    }
+}
+
+fn overlay_harness_inventory(
+    harness_entries: &mut Vec<SessionHarnessEntry>,
+    inventory: HarnessInventory,
+    truncated: &mut bool,
+) {
+    let previous = harness_entries
+        .iter()
+        .map(|entry| (entry.key.clone(), entry.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut merged = harness_entries
+        .drain(..)
+        .filter(|entry| match entry.scope.as_str() {
+            "local" => !inventory.local_available,
+            "global" => !inventory.global_available,
+            _ => true,
+        })
+        .collect::<Vec<_>>();
+
+    for entry in inventory.entries {
+        let key = format!("{}:{}:{}", entry.scope, entry.kind, entry.id);
+        let audit_entry = previous.get(&key);
+        merged.push(SessionHarnessEntry {
+            key,
+            id: entry.id,
+            kind: entry.kind,
+            scope: entry.scope,
+            title: entry.title,
+            content: entry.content,
+            refinement_id: audit_entry
+                .map(|entry| entry.refinement_id.clone())
+                .unwrap_or_default(),
+            updated_at: entry
+                .updated_at
+                .or_else(|| audit_entry.map(|entry| entry.updated_at.clone()))
+                .unwrap_or_default(),
+        });
+    }
+
+    // The native inventory is already ordered by recency. Sorting once more
+    // keeps reconstructed fallbacks deterministic when one store is absent.
+    merged.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.scope.cmp(&right.scope))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    merged.dedup_by(|left, right| left.key == right.key);
+    *harness_entries = merged;
+    *truncated |= inventory.truncated;
+}
+
+fn public_refinement_records(
+    entries: &[ParsedEntry],
+) -> (Vec<SessionRefinementRecord>, Vec<SessionHarnessEntry>, bool) {
+    let mut truncated = false;
+    let harness_entries = public_harness_entries(entries, &mut truncated);
+    let mut records = entries
+        .iter()
+        .filter_map(|entry| {
+            let value = &entry.value;
+            if string_field(value, "type") != Some("custom")
+                || string_field(value, "customType") != Some("prime-agent.refinement")
+            {
+                return None;
+            }
+            let timestamp = refinement_text(
+                string_field(value, "timestamp"),
+                MAX_REFINEMENT_ID_CHARS,
+                &mut truncated,
+            )?;
+            let data = value.get("data")?.as_object()?;
+            let id = refinement_id(data.get("id").and_then(Value::as_str), &mut truncated)?;
+            let edits = data.get("appliedEdits")?.as_array()?;
+            if edits.len() > MAX_REFINEMENT_EDITS {
+                truncated = true;
+            }
+            let applied_edits = edits
+                .iter()
+                .take(MAX_REFINEMENT_EDITS)
+                .filter_map(|edit| {
+                    let edit = edit.as_object()?;
+                    let action = edit.get("action").and_then(Value::as_str)?;
+                    if !matches!(action, "create" | "update" | "delete") {
+                        return None;
+                    }
+                    let kind = edit.get("kind").and_then(Value::as_str)?;
+                    if !matches!(kind, "prompt" | "memory" | "skill" | "subagent") {
+                        return None;
+                    }
+                    let id = refinement_id(edit.get("id").and_then(Value::as_str), &mut truncated)?;
+                    let snapshot = if action == "delete" {
+                        edit.get("before").and_then(Value::as_object)
+                    } else {
+                        edit.get("after").and_then(Value::as_object)
+                    };
+                    let title = refinement_text(
+                        snapshot
+                            .and_then(|entry| entry.get("title"))
+                            .or_else(|| edit.get("title"))
+                            .and_then(Value::as_str),
+                        MAX_REFINEMENT_SUMMARY_CHARS,
+                        &mut truncated,
+                    );
+                    Some(SessionRefinementEdit {
+                        action: action.to_string(),
+                        kind: kind.to_string(),
+                        id,
+                        title,
+                        content: None,
+                        applied: edit
+                            .get("applied")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        error: refinement_text(
+                            edit.get("error").and_then(Value::as_str),
+                            MAX_REFINEMENT_SUMMARY_CHARS,
+                            &mut truncated,
+                        ),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let scope = data
+                .get("scope")
+                .and_then(Value::as_str)
+                .filter(|scope| matches!(*scope, "local" | "global"))
+                .map(str::to_string);
+            Some(SessionRefinementRecord {
+                id,
+                timestamp,
+                summary: refinement_text(
+                    data.get("summary").and_then(Value::as_str),
+                    MAX_REFINEMENT_SUMMARY_CHARS,
+                    &mut truncated,
+                ),
+                rationale: refinement_text(
+                    data.get("rationale").and_then(Value::as_str),
+                    MAX_REFINEMENT_DETAIL_CHARS,
+                    &mut truncated,
+                ),
+                expected_outcome: refinement_text(
+                    data.get("expectedOutcome").and_then(Value::as_str),
+                    MAX_REFINEMENT_DETAIL_CHARS,
+                    &mut truncated,
+                ),
+                scope,
+                rollback_of: refinement_id(
+                    data.get("rollbackOf").and_then(Value::as_str),
+                    &mut truncated,
+                ),
+                applied_edits,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if records.len() > MAX_REFINEMENT_RECORDS {
+        truncated = true;
+        records.drain(..records.len() - MAX_REFINEMENT_RECORDS);
+    }
+    (records, harness_entries, truncated)
+}
+
 fn is_sensitive_payload_key(key: &str) -> bool {
     let normalized = key
         .chars()
@@ -1113,12 +1523,12 @@ fn build_public_messages(entries: &[ParsedEntry]) -> Result<(Vec<Value>, bool), 
         .iter()
         .map(|message| serde_json::to_vec(message).map_or(0, |value| value.len()))
         .sum::<usize>();
-    while messages.len() > 1 && size > MAX_IPC_BYTES {
+    while messages.len() > 1 && size > MAX_TRANSCRIPT_IPC_BYTES {
         truncated = true;
         size = size.saturating_sub(serde_json::to_vec(&messages[0]).map_or(0, |value| value.len()));
         messages.remove(0);
     }
-    if size > MAX_IPC_BYTES {
+    if size > MAX_TRANSCRIPT_IPC_BYTES {
         return Err("Un message public dépasse le budget d’affichage de l’historique".to_string());
     }
     Ok((messages, truncated))
@@ -1147,7 +1557,43 @@ fn load_once(
         project_path,
         home,
     )?;
-    let (messages, output_truncated) = build_public_messages(&parsed.entries)?;
+    let (messages, message_output_truncated) = build_public_messages(&parsed.entries)?;
+    let (mut refinements, mut harness_entries, mut refinement_output_truncated) =
+        public_refinement_records(&parsed.entries);
+    let header_id = string_field(&parsed.header, "id")
+        .expect("validate_header accepted a session without an id");
+    let inventory_warning = match read_harness_inventory(
+        home,
+        &path.to_string_lossy(),
+        header_id,
+        &project_path.to_string_lossy(),
+    ) {
+        Ok(inventory) => {
+            overlay_harness_inventory(
+                &mut harness_entries,
+                inventory,
+                &mut refinement_output_truncated,
+            );
+            false
+        }
+        Err(_) => true,
+    };
+    bound_refinement_output(
+        &mut refinements,
+        &mut harness_entries,
+        &mut refinement_output_truncated,
+    );
+    let projected_ipc_bytes = serde_json::to_vec(&(
+        messages.as_slice(),
+        refinements.as_slice(),
+        harness_entries.as_slice(),
+    ))
+    .map_err(|error| format!("Impossible de préparer l’historique public: {error}"))?
+    .len();
+    if projected_ipc_bytes > MAX_IPC_BYTES {
+        return Err("L’historique public dépasse le budget IPC de sécurité".to_string());
+    }
+    let output_truncated = message_output_truncated || refinement_output_truncated;
     let after = fs::metadata(path)
         .map(|metadata| FileStamp::from_metadata(&metadata))
         .map_err(|error| format!("Impossible de réinspecter la session: {error}"))?;
@@ -1165,9 +1611,22 @@ fn load_once(
         ),
         (None, false, false) => None,
     };
+    let warning = if inventory_warning {
+        Some(match warning {
+            Some(warning) => format!(
+                "{warning} L’inventaire réel du harness n’a pas pu être relu; les entrées affichées proviennent du journal de raffinements."
+            ),
+            None => "L’inventaire réel du harness n’a pas pu être relu; les entrées affichées proviennent du journal de raffinements."
+                .to_string(),
+        })
+    } else {
+        warning
+    };
     Ok((
         SessionHistoryResult {
             messages,
+            refinements,
+            harness_entries,
             read_only: true,
             truncated,
             warning,
@@ -1269,6 +1728,35 @@ mod tests {
                 self.home.clone(),
             )
         }
+
+        fn write_harness_state(&self, scope: &str, memory_entries: Value) {
+            let directory = if scope == "global" {
+                self.home.join(".prime").join("agent").join("harness")
+            } else {
+                self.home
+                    .join(".prime")
+                    .join("agent")
+                    .join("session-artifacts")
+                    .join(&self.session_id)
+                    .join("harness")
+            };
+            fs::create_dir_all(&directory).expect("harness directory");
+            fs::write(
+                directory.join("harness_state.json"),
+                serde_json::to_vec_pretty(&json!({
+                    "schema": 1,
+                    "entries": {
+                        "prompt": {},
+                        "memory": memory_entries,
+                        "skill": {},
+                        "subagent": {}
+                    },
+                    "refinements": []
+                }))
+                .expect("harness state"),
+            )
+            .expect("write harness state");
+        }
     }
 
     fn wrapped_attachment_message(visible: &str, private_fragment: &str) -> String {
@@ -1304,6 +1792,236 @@ mod tests {
         assert!(!serialized.contains("branche abandonnée"));
         assert!(!serialized.contains("secret interne"));
         assert!(history.read_only);
+    }
+
+    #[test]
+    fn exposes_only_sanitized_refinement_history_and_current_observed_entries() {
+        let fixture = Fixture::new(&[
+            json!({
+                "type":"custom","customType":"prime-agent.refinement","id":"custom-create","parentId":null,"timestamp":"2026-08-21T10:00:00Z",
+                "data":{"id":"refine-create","summary":"Create memory","scope":"local","harnessStatePath":"C:\\private\\harness_state.json","appliedEdits":[{
+                    "action":"create","kind":"memory","id":"decision","title":"Initial decision","content":"old","path":"C:\\private\\memory.md","applied":true,
+                    "after":{"title":"Initial decision","content":"old","path":"C:\\private\\memory.md","metadata":{"token":"SECRET"}}
+                }]}
+            }),
+            json!({
+                "type":"custom","customType":"prime-agent.refinement","id":"custom-update","parentId":"custom-create","timestamp":"2026-08-21T10:01:00Z",
+                "data":{"id":"refine-update","summary":"Update memory","scope":"local","appliedEdits":[{
+                    "action":"update","kind":"memory","id":"decision","applied":true,
+                    "before":{"title":"Initial decision","content":"old"},
+                    "after":{"title":"Final decision","content":"new","reference":{"secret":"REFERENCE_SECRET"}}
+                },{
+                    "action":"create","kind":"skill","id":"validator","applied":true,
+                    "after":{"title":"Validation skill","content":"Run validation safely","path":"C:\\private\\skill.py"}
+                }]}
+            }),
+            json!({
+                "type":"custom","customType":"prime-agent.refinement","id":"custom-delete","parentId":"custom-update","timestamp":"2026-08-21T10:02:00Z",
+                "data":{"id":"refine-delete","summary":"Delete memory","scope":"local","appliedEdits":[{
+                    "action":"delete","kind":"memory","id":"decision","applied":true,
+                    "before":{"title":"Final decision","content":"new","path":"C:\\private\\memory.md"}
+                }]}
+            }),
+        ]);
+
+        let history = fixture.load().expect("load refinements");
+        assert_eq!(history.refinements.len(), 3);
+        assert_eq!(history.harness_entries.len(), 1);
+        assert_eq!(history.harness_entries[0].kind, "skill");
+        assert_eq!(
+            history.harness_entries[0].title.as_deref(),
+            Some("Validation skill")
+        );
+        let serialized = serde_json::to_string(&(history.refinements, history.harness_entries))
+            .expect("public refinements");
+        for private in [
+            "harnessStatePath",
+            "C:\\\\private",
+            "REFERENCE_SECRET",
+            "SECRET",
+            "metadata",
+            "reference",
+            "before",
+            "after",
+        ] {
+            assert!(!serialized.contains(private), "leaked {private}");
+        }
+    }
+
+    #[test]
+    fn overlays_real_harness_state_and_treats_present_empty_as_authoritative() {
+        let fixture = Fixture::new(&[
+            json!({
+                "type":"custom","customType":"prime-agent.refinement","id":"custom-local","parentId":null,"timestamp":"2026-08-21T10:00:00Z",
+                "data":{"id":"refine-local","scope":"local","appliedEdits":[{
+                    "action":"create","kind":"memory","id":"stale-local","applied":true,
+                    "after":{"title":"Stale local","content":"must disappear"}
+                }]}
+            }),
+            json!({
+                "type":"custom","customType":"prime-agent.refinement","id":"custom-global","parentId":"custom-local","timestamp":"2026-08-21T10:01:00Z",
+                "data":{"id":"refine-global","scope":"global","appliedEdits":[{
+                    "action":"create","kind":"memory","id":"stale-global","applied":true,
+                    "after":{"title":"Stale global","content":"must be replaced"}
+                }]}
+            }),
+        ]);
+        fixture.write_harness_state("local", json!({}));
+        fixture.write_harness_state(
+            "global",
+            json!({
+                "direct-python-entry": {
+                    "id":"direct-python-entry",
+                    "kind":"memory",
+                    "scope":"global",
+                    "title":"Real global memory",
+                    "content":"visible current state",
+                    "path":"C:\\private\\memory.md",
+                    "reference":{"token":"REFERENCE_SECRET"},
+                    "arguments":{"secret":"ARGUMENT_SECRET"},
+                    "metadata":{"secret":"METADATA_SECRET"},
+                    "updated_at":"2026-08-21T11:00:00Z",
+                    "version":1
+                }
+            }),
+        );
+
+        let history = fixture.load().expect("load real harness inventory");
+        assert_eq!(history.harness_entries.len(), 1);
+        let entry = &history.harness_entries[0];
+        assert_eq!(entry.id, "direct-python-entry");
+        assert_eq!(entry.scope, "global");
+        assert_eq!(entry.title.as_deref(), Some("Real global memory"));
+        assert_eq!(entry.content.as_deref(), Some("visible current state"));
+        assert!(entry.refinement_id.is_empty());
+        let serialized = serde_json::to_string(&history.harness_entries).expect("inventory IPC");
+        for forbidden in [
+            "stale-local",
+            "stale-global",
+            "C:\\\\private",
+            "REFERENCE_SECRET",
+            "ARGUMENT_SECRET",
+            "METADATA_SECRET",
+            "metadata",
+            "reference",
+            "arguments",
+            "path",
+        ] {
+            assert!(!serialized.contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn bounds_refinement_audit_rows_after_folding_all_records_into_the_snapshot() {
+        let lines = (0..MAX_REFINEMENT_RECORDS + 5)
+            .map(|index| json!({
+                "type":"custom","customType":"prime-agent.refinement","id":format!("custom-{index}"),"parentId":null,"timestamp":format!("2026-08-21T10:{:02}:00Z", index % 60),
+                "data":{"id":format!("refine-{index}"),"summary":format!("Create {index}"),"scope":"local","appliedEdits":[{
+                    "action":"create","kind":"memory","id":format!("memory-{index}"),"applied":true,
+                    "after":{"title":format!("Memory {index}"),"content":"bounded"}
+                }]}
+            }))
+            .collect::<Vec<_>>();
+        let fixture = Fixture::new(&lines);
+
+        let history = fixture.load().expect("load bounded refinements");
+        assert_eq!(history.refinements.len(), MAX_REFINEMENT_RECORDS);
+        assert_eq!(history.harness_entries.len(), MAX_REFINEMENT_RECORDS + 5);
+        assert!(history
+            .harness_entries
+            .iter()
+            .any(|entry| entry.id == "memory-0"));
+        assert!(history.truncated);
+    }
+
+    #[test]
+    fn folds_edits_after_the_visible_per_record_limit() {
+        let mut edits = vec![json!({
+            "action":"create","kind":"memory","id":"victim","applied":true,
+            "after":{"title":"Victim","content":"must be deleted","scope":"local"}
+        })];
+        edits.extend((1..MAX_REFINEMENT_EDITS).map(|index| {
+            json!({
+                "action":"create","kind":"memory","id":format!("memory-{index}"),"applied":true,
+                "after":{"title":format!("Memory {index}"),"content":"kept","scope":"local"}
+            })
+        }));
+        edits.push(json!({
+            "action":"delete","kind":"memory","id":"victim","applied":true,
+            "before":{"title":"Victim","content":"must be deleted","scope":"local"}
+        }));
+        let fixture = Fixture::new(&[json!({
+            "type":"custom","customType":"prime-agent.refinement","id":"custom-many-edits","parentId":null,"timestamp":"2026-08-21T10:00:00Z",
+            "data":{"id":"refine-many-edits","scope":"local","appliedEdits":edits}
+        })]);
+
+        let history = fixture.load().expect("load all refinement edits");
+        assert_eq!(
+            history.refinements[0].applied_edits.len(),
+            MAX_REFINEMENT_EDITS
+        );
+        assert!(!history
+            .harness_entries
+            .iter()
+            .any(|entry| entry.id == "victim"));
+        assert_eq!(history.harness_entries.len(), MAX_REFINEMENT_EDITS - 1);
+        assert!(history.truncated);
+    }
+
+    #[test]
+    fn rejects_oversized_ids_instead_of_folding_colliding_prefixes() {
+        let common = "x".repeat(MAX_REFINEMENT_ID_CHARS);
+        let fixture = Fixture::new(&[json!({
+            "type":"custom","customType":"prime-agent.refinement","id":"custom-long-ids","parentId":null,"timestamp":"2026-08-21T10:00:00Z",
+            "data":{"id":"refine-long-ids","scope":"local","appliedEdits":[
+                {"action":"create","kind":"memory","id":format!("{common}a"),"applied":true,"after":{"title":"A","content":"one","scope":"local"}},
+                {"action":"create","kind":"memory","id":format!("{common}b"),"applied":true,"after":{"title":"B","content":"two","scope":"local"}}
+            ]}
+        })]);
+
+        let history = fixture.load().expect("load oversized ids safely");
+        assert!(history.harness_entries.is_empty());
+        assert!(history.refinements[0].applied_edits.is_empty());
+        assert!(history.truncated);
+    }
+
+    #[test]
+    fn keeps_refinement_projection_inside_its_ipc_budget() {
+        let detail = "d".repeat(MAX_REFINEMENT_SUMMARY_CHARS);
+        let lines = (0..MAX_REFINEMENT_RECORDS)
+            .map(|record| {
+                let edits = (0..MAX_REFINEMENT_EDITS)
+                    .map(|edit| json!({
+                        "action":"create","kind":"memory","id":format!("memory-{record}-{edit}"),
+                        "title":detail,"applied":false,"error":detail
+                    }))
+                    .collect::<Vec<_>>();
+                json!({
+                    "type":"custom","customType":"prime-agent.refinement","id":format!("custom-budget-{record}"),"parentId":null,"timestamp":"2026-08-21T10:00:00Z",
+                    "data":{"id":format!("refine-budget-{record}"),"summary":detail,"scope":"local","appliedEdits":edits}
+                })
+            })
+            .collect::<Vec<_>>();
+        let fixture = Fixture::new(&lines);
+
+        let history = fixture.load().expect("load bounded refinement projection");
+        let refinement_bytes = serde_json::to_vec(&(
+            history.refinements.as_slice(),
+            history.harness_entries.as_slice(),
+        ))
+        .expect("serialize refinement projection")
+        .len();
+        let combined_bytes = serde_json::to_vec(&(
+            history.messages.as_slice(),
+            history.refinements.as_slice(),
+            history.harness_entries.as_slice(),
+        ))
+        .expect("serialize combined projection")
+        .len();
+        assert!(refinement_bytes <= MAX_REFINEMENT_IPC_BYTES);
+        assert!(combined_bytes <= MAX_IPC_BYTES);
+        assert!(history.refinements.len() < MAX_REFINEMENT_RECORDS);
+        assert!(history.truncated);
     }
 
     #[test]

@@ -10,16 +10,29 @@ import {
   Pencil,
   Pin,
   PinOff,
+  Redo2,
   Scissors,
+  SpellCheck2,
   TextSelect,
   Trash2,
+  Undo2,
 } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { orderedConversationSiblings } from "../lib/conversation-context";
+import {
+  getSpellingSuggestions,
+  installWebviewContextMenu,
+  listenToWebviewContextMenus,
+  resolveWebviewContextMenu,
+  type WebviewContextMenuItem,
+} from "../lib/bridge";
 import { useI18n } from "../i18n";
 import type { Conversation, Project } from "../types";
 
 const VIEWPORT_MARGIN = 8;
+const NATIVE_CONTEXT_MENU_UI_TIMEOUT_MS = 29_000;
+const SPELLING_LOOKUP_MAX_AGE_MS = 1_500;
+const SPELLING_WORD_PATTERN = /[\p{L}\p{M}]+(?:['\u2019\u02bc\-\u2010\u2011][\p{L}\p{M}]+)*/gu;
 
 type TextControl = HTMLInputElement | HTMLTextAreaElement;
 
@@ -43,6 +56,28 @@ interface ContextTarget {
   link?: {
     href: string;
   };
+  native?: {
+    requestId: string;
+    items: WebviewContextMenuItem[];
+    spelling?: {
+      word: string;
+      replacement: EditableContext;
+      suggestions: string[];
+    };
+  };
+}
+
+interface SpellingWordRange {
+  word: string;
+  start: number;
+  end: number;
+}
+
+interface PendingSpellingLookup {
+  capturedAt: number;
+  word: string;
+  replacement: EditableContext;
+  suggestions: Promise<string[]>;
 }
 
 interface MenuAction {
@@ -51,7 +86,7 @@ interface MenuAction {
   shortcut?: string;
   icon: typeof Copy;
   disabled?: boolean;
-  group: "edit" | "selection" | "link" | "project" | "location" | "archive" | "danger";
+  group: "spelling" | "edit" | "selection" | "link" | "project" | "location" | "archive" | "danger";
   tone?: "default" | "danger";
   run: () => void | Promise<void>;
 }
@@ -192,12 +227,45 @@ async function openExternalLink(href: string) {
 }
 
 /**
- * WebView2 owns spelling suggestions. The app delegates only explicitly
- * opted-in text controls to that native menu and keeps its custom menu for all
- * project, conversation, link, and other editing surfaces.
+ * Windows supplies spelling suggestions while WebView2 keeps ownership of its
+ * exact editing commands. Only opted-in controls use this combined menu.
  */
 export function shouldUseNativeSpellcheckMenu(target: Pick<Element, "closest">) {
   return Boolean(target.closest('[data-native-spellcheck-menu="true"]'));
+}
+
+/** Finds the complete Unicode word around a control's UTF-16 selection. Internal
+ * French apostrophes and hyphens remain part of the replacement range. */
+export function extractSpellingWord(
+  value: string,
+  selectionStart: number,
+  selectionEnd = selectionStart,
+): SpellingWordRange | undefined {
+  const boundedStart = Math.max(0, Math.min(value.length, Math.trunc(selectionStart)));
+  const boundedEnd = Math.max(0, Math.min(value.length, Math.trunc(selectionEnd)));
+  const start = Math.min(boundedStart, boundedEnd);
+  const end = Math.max(boundedStart, boundedEnd);
+
+  for (const match of value.matchAll(SPELLING_WORD_PATTERN)) {
+    const matchStart = match.index;
+    const matchEnd = matchStart + match[0].length;
+    const containsSelection = start === end
+      ? start >= matchStart && start <= matchEnd
+      : start >= matchStart && end <= matchEnd;
+    if (containsSelection) return { word: match[0], start: matchStart, end: matchEnd };
+  }
+  return undefined;
+}
+
+function nativeContextMenuIcon(item: WebviewContextMenuItem) {
+  if (item.group === "spelling") return SpellCheck2;
+  if (item.name === "undo") return Undo2;
+  if (item.name === "redo") return Redo2;
+  if (item.name === "cut") return Scissors;
+  if (item.name === "copy") return Copy;
+  if (item.name === "paste" || item.name === "pasteAndMatchStyle") return ClipboardPaste;
+  if (item.name === "delete") return Trash2;
+  return TextSelect;
 }
 
 /**
@@ -218,24 +286,150 @@ export function AppContextMenu({
   onRenameConversation,
   onArchiveConversation,
 }: AppContextMenuProps = {}) {
-  const { t } = useI18n();
+  const { language, t } = useI18n();
   const [context, setContext] = useState<ContextTarget>();
   const [position, setPosition] = useState({ x: 0, y: 0 });
   const menuRef = useRef<HTMLDivElement>(null);
   const restoreFocusRef = useRef<HTMLElement | undefined>(undefined);
+  const nativePositionRef = useRef<{ x: number; y: number; capturedAt: number } | undefined>(undefined);
+  const nativeRequestIdRef = useRef<string | undefined>(undefined);
+  const nativeBridgeReadyRef = useRef(false);
+  const pendingSpellingLookupRef = useRef<PendingSpellingLookup | undefined>(undefined);
 
   const close = useCallback((restoreFocus = false) => {
+    const requestId = nativeRequestIdRef.current;
+    nativeRequestIdRef.current = undefined;
+    if (requestId) void resolveWebviewContextMenu(requestId).catch(() => undefined);
     setContext(undefined);
     if (restoreFocus) restoreFocusRef.current?.focus({ preventScroll: true });
   }, []);
+
+  const ensureNativeContextMenu = useCallback(async () => {
+    if (nativeBridgeReadyRef.current) return;
+    await installWebviewContextMenu();
+    nativeBridgeReadyRef.current = true;
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      unlisten = await listenToWebviewContextMenus((request) => {
+        if (!active) {
+          void resolveWebviewContextMenu(request.requestId).catch(() => undefined);
+          return;
+        }
+        if (request.items.length === 0) {
+          void resolveWebviewContextMenu(request.requestId).catch(() => undefined);
+          return;
+        }
+        const captured = nativePositionRef.current;
+        const useCapturedPosition = captured && performance.now() - captured.capturedAt < 1_500;
+        const spellingLookup = pendingSpellingLookupRef.current;
+        const useSpellingLookup = spellingLookup
+          && performance.now() - spellingLookup.capturedAt < SPELLING_LOOKUP_MAX_AGE_MS;
+        const x = useCapturedPosition ? captured.x : request.x;
+        const y = useCapturedPosition ? captured.y : request.y;
+        nativePositionRef.current = undefined;
+        pendingSpellingLookupRef.current = undefined;
+        nativeRequestIdRef.current = request.requestId;
+        setPosition({ x, y });
+        setContext({
+          x,
+          y,
+          native: {
+            requestId: request.requestId,
+            items: request.items,
+            spelling: useSpellingLookup ? {
+              word: spellingLookup.word,
+              replacement: spellingLookup.replacement,
+              suggestions: [],
+            } : undefined,
+          },
+        });
+        if (useSpellingLookup) {
+          void spellingLookup.suggestions.then((suggestions) => {
+            if (!active) return;
+            setContext((current) => {
+              if (!current?.native?.spelling || current.native.requestId !== request.requestId) return current;
+              return {
+                ...current,
+                native: {
+                  ...current.native,
+                  spelling: { ...current.native.spelling, suggestions },
+                },
+              };
+            });
+          });
+        }
+      });
+      if (!active) {
+        unlisten?.();
+        return;
+      }
+      await ensureNativeContextMenu();
+    })().catch(() => undefined);
+    return () => {
+      active = false;
+      unlisten?.();
+      const requestId = nativeRequestIdRef.current;
+      nativeRequestIdRef.current = undefined;
+      if (requestId) void resolveWebviewContextMenu(requestId).catch(() => undefined);
+    };
+  }, [ensureNativeContextMenu]);
 
   useEffect(() => {
     const handleContextMenu = (event: MouseEvent) => {
       const target = event.target;
       if (target instanceof Element && shouldUseNativeSpellcheckMenu(target)) {
+        if (!nativeBridgeReadyRef.current) {
+          void ensureNativeContextMenu().catch(() => undefined);
+        }
+        const rect = target.getBoundingClientRect();
+        nativePositionRef.current = {
+          x: event.clientX || rect.left,
+          y: event.clientY || rect.bottom,
+          capturedAt: performance.now(),
+        };
+        restoreFocusRef.current = target.closest<HTMLElement>("textarea, input, [contenteditable]") ?? undefined;
+        pendingSpellingLookupRef.current = undefined;
+        const control = target.closest("input, textarea");
+        if (
+          control
+          && isTextControl(control)
+          && !control.readOnly
+          && !control.disabled
+          && !(control instanceof HTMLInputElement && control.type === "password")
+        ) {
+          const range = extractSpellingWord(
+            control.value,
+            control.selectionStart ?? 0,
+            control.selectionEnd ?? control.selectionStart ?? 0,
+          );
+          if (range) {
+            const spellingLanguage = control.lang || navigator.language || language;
+            pendingSpellingLookupRef.current = {
+              capturedAt: performance.now(),
+              word: range.word,
+              replacement: {
+                element: control,
+                kind: "control",
+                readOnly: false,
+                secret: control instanceof HTMLInputElement && control.type === "password",
+                selectionStart: range.start,
+                selectionEnd: range.end,
+              },
+              suggestions: getSpellingSuggestions(range.word, spellingLanguage).catch(() => []),
+            };
+          }
+        }
         setContext(undefined);
         return;
       }
+      pendingSpellingLookupRef.current = undefined;
+      const nativeRequestId = nativeRequestIdRef.current;
+      nativeRequestIdRef.current = undefined;
+      if (nativeRequestId) void resolveWebviewContextMenu(nativeRequestId).catch(() => undefined);
       event.preventDefault();
       if (!(target instanceof Element)) {
         setContext(undefined);
@@ -300,7 +494,7 @@ export function AppContextMenu({
 
     document.addEventListener("contextmenu", handleContextMenu, true);
     return () => document.removeEventListener("contextmenu", handleContextMenu, true);
-  }, []);
+  }, [ensureNativeContextMenu, language]);
 
   useEffect(() => {
     if (!context) return;
@@ -322,16 +516,53 @@ export function AppContextMenu({
     document.addEventListener("keydown", handleKeyDown, true);
     document.addEventListener("scroll", dismiss, true);
     window.addEventListener("resize", dismiss);
+    const nativeTimeout = context.native
+      ? window.setTimeout(() => close(true), NATIVE_CONTEXT_MENU_UI_TIMEOUT_MS)
+      : undefined;
     return () => {
       document.removeEventListener("pointerdown", handlePointerDown, true);
       document.removeEventListener("keydown", handleKeyDown, true);
       document.removeEventListener("scroll", dismiss, true);
       window.removeEventListener("resize", dismiss);
+      window.clearTimeout(nativeTimeout);
     };
   }, [close, context]);
 
   const actions = useMemo<MenuAction[]>(() => {
     if (!context) return [];
+    if (context.native) {
+      const native = context.native;
+      const spellingActions: MenuAction[] = (native.spelling?.suggestions ?? []).map((suggestion, index) => ({
+        id: `spelling-suggestion-${index}`,
+        label: suggestion,
+        icon: SpellCheck2,
+        group: "spelling",
+        run: async () => {
+          await resolveWebviewContextMenu(native.requestId).catch(() => undefined);
+          const spelling = native.spelling;
+          if (!spelling) return;
+          const control = spelling.replacement.element;
+          if (control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement) {
+            const currentWord = control.value.slice(
+              spelling.replacement.selectionStart,
+              spelling.replacement.selectionEnd,
+            );
+            if (currentWord !== spelling.word) return;
+          }
+          replaceEditableSelection(spelling.replacement, suggestion, "insertReplacementText");
+        },
+      }));
+      const nativeActions: MenuAction[] = native.items.map((item) => ({
+        id: `native-${item.commandId}`,
+        label: item.label,
+        shortcut: item.shortcut || undefined,
+        icon: nativeContextMenuIcon(item),
+        disabled: !item.enabled,
+        group: item.group,
+        run: () => resolveWebviewContextMenu(native.requestId, item.commandId).catch(() => undefined),
+      }));
+      return [...spellingActions, ...nativeActions];
+    }
     if (context.conversationId) {
       const conversation = conversations.find((item) => item.id === context.conversationId);
       if (!conversation) return [];
@@ -559,11 +790,18 @@ export function AppContextMenu({
           <div key={action.id}>
             {previous && previous.group !== action.group ? <div className="app-context-separator" role="separator" /> : null}
             <button
-              className={`app-context-item ${action.tone === "danger" ? "is-danger" : ""}`}
+              className={`app-context-item ${action.tone === "danger" ? "is-danger" : ""} ${action.group === "spelling" ? "is-spelling" : ""}`}
               type="button"
               role="menuitem"
               disabled={action.disabled}
               onClick={() => {
+                if (context.native) {
+                  nativeRequestIdRef.current = undefined;
+                  setContext(undefined);
+                  restoreFocusRef.current?.focus({ preventScroll: true });
+                  void action.run();
+                  return;
+                }
                 close(true);
                 void action.run();
               }}

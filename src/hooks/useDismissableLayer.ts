@@ -17,9 +17,13 @@ export function useDismissableLayer(activeLayer: string | null, onDismiss: () =>
 
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key !== "Escape") return;
+      const trigger = Array.from(document.querySelectorAll<HTMLElement>("[data-dismissable-layer]"))
+        .find((element) => element.dataset.dismissableLayer === activeLayer)
+        ?.querySelector<HTMLElement>('[aria-expanded="true"]');
       event.preventDefault();
       event.stopPropagation();
       onDismiss();
+      requestAnimationFrame(() => trigger?.focus());
     };
 
     document.addEventListener("pointerdown", handlePointerDown, true);

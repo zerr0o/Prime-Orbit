@@ -52,6 +52,7 @@ import {
   stopAgent,
 } from "./lib/bridge";
 import { redactText } from "./lib/redaction";
+import { toggleFavoriteModelRef } from "./lib/model-favorites";
 import { loadRlmPreferences, snapshotRlmPreferences } from "./lib/rlm-preferences";
 import { runtimeNoticeToast, type RuntimeNoticeToast } from "./lib/runtime-notices";
 import { printShortcutDisposition } from "./lib/app-shortcuts";
@@ -369,15 +370,19 @@ function App() {
     if (path) addProject(path, globalDefaultModel, snapshotRlmPreferences(loadRlmPreferences(), detection?.version));
   }, [addProject, detection?.version, globalDefaultModel]);
 
-  const newConversation = useCallback(() => {
-    if (state.selectedProjectId) createConversation(
-      undefined,
+  const newConversationInProject = useCallback((projectId: string) => {
+    createConversation(
+      projectId,
       undefined,
       globalDefaultModel,
       snapshotRlmPreferences(loadRlmPreferences(), detection?.version),
     );
+  }, [createConversation, detection?.version, globalDefaultModel]);
+
+  const newConversation = useCallback(() => {
+    if (state.selectedProjectId) newConversationInProject(state.selectedProjectId);
     else void openProject();
-  }, [createConversation, detection?.version, globalDefaultModel, openProject, state.selectedProjectId]);
+  }, [newConversationInProject, openProject, state.selectedProjectId]);
 
   const resumeProject = useCallback((projectId: string) => {
     openProjectConversation(
@@ -418,6 +423,16 @@ function App() {
 
   const toggleInspector = useCallback(() => {
     updateState((current) => ({ ...current, preferences: { ...current.preferences, inspectorOpen: !current.preferences.inspectorOpen } }));
+  }, [updateState]);
+
+  const toggleFavoriteModel = useCallback((ref: string) => {
+    updateState((current) => ({
+      ...current,
+      preferences: {
+        ...current.preferences,
+        favoriteModels: toggleFavoriteModelRef(current.preferences.favoriteModels, ref),
+      },
+    }));
   }, [updateState]);
 
   const openSetup = useCallback((kind: "provider" | "mcp") => {
@@ -566,6 +581,7 @@ function App() {
           onSelectProject={selectProject}
           onSelectConversation={selectConversation}
           onNewConversation={newConversation}
+          onNewConversationForProject={newConversationInProject}
           onPinConversation={(id, pinned) => updateConversation(id, { pinned })}
           onArchiveConversation={archiveConversationAndStop}
           onRenameConversation={(id, title) => {
@@ -587,12 +603,15 @@ function App() {
             project={selectedProject}
             conversation={selectedConversation}
             models={agent.models}
+            favoriteModels={state.preferences.favoriteModels}
             commands={agent.commands}
             stats={agent.stats}
             sessionState={agent.sessionState}
             goalMutation={agent.goalMutation}
             isCompacting={agent.isCompacting}
             isRefining={agent.isRefining}
+            refinements={agent.refinements}
+            harnessEntries={agent.harnessEntries}
             schedules={agent.schedules}
             heartbeat={agent.heartbeat}
             heartbeats={agent.heartbeats}
@@ -608,6 +627,7 @@ function App() {
             onRetryMessage={agent.retryMessage}
             onAbort={agent.abort}
             onModel={agent.chooseModel}
+            onToggleFavoriteModel={toggleFavoriteModel}
             onThinking={agent.setThinking}
             onRunCommand={agent.runCommand}
             onObserveSubagent={agent.observeSubagent}

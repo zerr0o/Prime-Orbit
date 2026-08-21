@@ -34,21 +34,62 @@ const {
   isAuthoritativeIdleSessionSnapshot,
   mapAgentMessages,
   mergeHistoricalAttachmentPreviews,
+  normalizeConnectingPromptDelivery,
   promptAttachmentPayload,
   reconcileQueuedMessages,
   rollbackPromptTransaction,
   selectForkEntryId,
   shouldApplyHistoryResponse,
+  shouldEnterLocalHistoryLoading,
   shouldClearPromptRunAfterQueueDeletion,
   shouldConsumeConversationResponse,
   shouldReloadQueuedTranscript,
+  shouldRecoverIdleSessionState,
   shouldApplySessionStateResponse,
   shouldScheduleTerminalStateReconciliation,
   isCompactDaemonAcknowledgementTimeout,
   isRefineDaemonAcknowledgementTimeout,
   refineLifecycleDisposition,
   refinementResultPresentation,
+  rlmChildPresentation,
 } = compiledModule.exports;
+
+test("an empty RPC history cannot be relatched into local-history loading", () => {
+  const hydratedEmptyConversation = conversation({
+    status: "idle",
+    sessionPath: "C:/safe/session.jsonl",
+    messages: [],
+  });
+  assert.equal(shouldEnterLocalHistoryLoading(hydratedEmptyConversation, true), false);
+  assert.equal(
+    shouldEnterLocalHistoryLoading({ ...hydratedEmptyConversation, status: "offline" }, true),
+    false,
+    "the synchronous RPC marker wins even if React still exposes the previous offline render",
+  );
+  assert.equal(
+    shouldEnterLocalHistoryLoading({ ...hydratedEmptyConversation, status: "offline" }, false),
+    true,
+    "a persisted saved conversation may show loading before either history source finishes",
+  );
+  assert.equal(
+    shouldEnterLocalHistoryLoading({ ...hydratedEmptyConversation, status: "streaming" }, false),
+    false,
+    "local history never overwrites a live runtime state",
+  );
+});
+
+test("an idle bootstrap snapshot cannot erase a prompt admission still in progress", () => {
+  assert.equal(shouldRecoverIdleSessionState(true, false, true), false);
+  assert.equal(shouldRecoverIdleSessionState(true, false, false), true);
+  assert.equal(shouldRecoverIdleSessionState(true, true, false), false);
+});
+
+test("a prompt submitted while only connecting starts normally instead of entering follow-up", () => {
+  assert.equal(normalizeConnectingPromptDelivery("starting", "follow_up", false), undefined);
+  assert.equal(normalizeConnectingPromptDelivery("starting", "steer", false), undefined);
+  assert.equal(normalizeConnectingPromptDelivery("starting", "follow_up", true), "follow_up");
+  assert.equal(normalizeConnectingPromptDelivery("streaming", "steer", true), "steer");
+});
 
 const idleSessionSnapshot = (overrides = {}) => ({
   isStreaming: false,
@@ -445,6 +486,29 @@ test("does not drop a sanitized live message_start whose visible text is empty",
   assert.equal(current.messages[0].id, "live-document-message");
   assert.equal(current.messages[0].content, "Fichier joint");
   assert.deepEqual(current.messages[0].attachments, [document]);
+});
+
+test("distinguishes a parent-managed subagent closure from a real cancellation", () => {
+  assert.deepEqual(rlmChildPresentation({
+    label: "reviewer",
+    status: "cancelled",
+    error: "Deleted by parent orchestrator",
+    recap: "Review delivered",
+  }, "cancelled"), {
+    title: "Sous-agent « reviewer » fermé par l’agent principal",
+    detail: "Review delivered",
+    status: "info",
+  });
+  assert.deepEqual(rlmChildPresentation({
+    label: "reviewer",
+    status: "cancelled",
+    error: "Cancelled by user",
+  }, "cancelled"), {
+    title: "Sous-agent « reviewer » annulé",
+    detail: "Cancelled by user",
+    status: "warning",
+  });
+  assert.equal(rlmChildPresentation({ label: "reviewer", error: "Provider unavailable" }, "error").status, "error");
 });
 
 test("renders a live agent message once with only its useful structured body", () => {

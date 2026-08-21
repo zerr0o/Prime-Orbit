@@ -274,6 +274,8 @@ export interface Preferences {
   inspectorOpen: boolean;
   bottomDockOpen: boolean;
   telemetry: boolean;
+  /** Fully-qualified Prime Agent model references pinned by the user. */
+  favoriteModels: string[];
   defaultThinking: ThinkingLevel;
   defaultPermissionPreset: PermissionPreset;
   reduceMotion: boolean;
@@ -437,8 +439,50 @@ export interface AgentExitPayload {
 }
 
 /** Sanitized, read-only transcript reconstructed from a Prime Agent JSONL session. */
+export type SessionRefinementKind = "prompt" | "memory" | "skill" | "subagent";
+export type SessionRefinementAction = "create" | "update" | "delete";
+
+/** Bounded public projection of one applied edit. Native history loading never
+ * exposes harness paths, references, arguments, metadata, or raw snapshots. */
+export interface SessionRefinementEdit {
+  action: SessionRefinementAction;
+  kind: SessionRefinementKind;
+  id: string;
+  title?: string;
+  content?: string;
+  applied: boolean;
+  error?: string;
+}
+
+export interface SessionRefinementRecord {
+  id: string;
+  timestamp: string;
+  summary?: string;
+  rationale?: string;
+  expectedOutcome?: string;
+  scope?: "local" | "global";
+  rollbackOf?: string;
+  appliedEdits: SessionRefinementEdit[];
+}
+
+/** Latest state proven by folding every sanitized refinement edit in the
+ * validated session file, then bounding the returned snapshot. It is not a
+ * complete filesystem-level harness inventory. */
+export interface SessionHarnessEntry {
+  key: string;
+  id: string;
+  kind: SessionRefinementKind;
+  scope: "local" | "global" | "unknown";
+  title?: string;
+  content?: string;
+  refinementId: string;
+  updatedAt: string;
+}
+
 export interface SessionHistoryResult {
   messages: unknown[];
+  refinements: SessionRefinementRecord[];
+  harnessEntries: SessionHarnessEntry[];
   readOnly: true;
   truncated: boolean;
   warning?: string;

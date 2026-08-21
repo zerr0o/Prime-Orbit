@@ -22,6 +22,7 @@ const {
   applyConversationPatch,
   createPreservedConversationReference,
   jsonValuesEqual,
+  mergeFavoriteModelRefs,
   rebaseWorkspaceState,
   resolveNewConversationModel,
   workspaceStatesEqual,
@@ -76,6 +77,7 @@ function state(overrides = {}) {
       inspectorOpen: true,
       bottomDockOpen: false,
       telemetry: false,
+      favoriteModels: [],
       defaultThinking: "high",
       defaultPermissionPreset: "standard",
       reduceMotion: false,
@@ -109,6 +111,29 @@ test("a self-save rebase of a newly-created entity settles instead of writing fo
   // key order differs from serde_json, but it is not a new durable mutation.
   assert.notEqual(JSON.stringify(rebased), JSON.stringify(nativeSnapshot));
   assert.equal(workspaceStatesEqual(rebased, nativeSnapshot), true);
+});
+
+test("concurrent model favorites are merged without resurrecting removals", () => {
+  assert.deepEqual(
+    mergeFavoriteModelRefs([], ["openai/gpt-5.6"], ["anthropic/claude-5"]),
+    ["anthropic/claude-5", "openai/gpt-5.6"],
+  );
+  assert.deepEqual(
+    mergeFavoriteModelRefs(
+      ["openai/gpt-5.6"],
+      [],
+      ["openai/gpt-5.6", "anthropic/claude-5"],
+    ),
+    ["anthropic/claude-5"],
+  );
+  assert.deepEqual(
+    mergeFavoriteModelRefs(
+      ["openai/gpt-5.6", "anthropic/claude-5"],
+      ["anthropic/claude-5"],
+      ["openai/gpt-5.6", "ollama/qwen3:latest"],
+    ),
+    ["ollama/qwen3:latest"],
+  );
 });
 
 test("still detects real durable workspace changes while ignoring window selection", () => {

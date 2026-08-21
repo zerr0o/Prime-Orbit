@@ -7,10 +7,16 @@ process.env.PRIME_ORBIT_BRIDGE_TEST = "1";
 const {
   RELOAD_REQUEST_TIMEOUT_MS,
   SUPPORTED_PROTOCOL_VERSION,
+  bindOwnedClientIdentity,
   busyReason,
+  createOwnedRequestIdSeed,
+  daemonDescriptorKey,
   reloadAgentResources,
   resolveDaemonSocketPath,
   selectSession,
+  selectOwnedClientDescriptor,
+  validOwnedClientDescriptor,
+  validOwnedRequestIdSeed,
   validRequest,
 } = require("../src-tauri/assets/prime-agent-session-control-bridge.cjs");
 delete process.env.PRIME_ORBIT_BRIDGE_TEST;
@@ -21,6 +27,18 @@ const request = {
   sessionId: "session-active",
 };
 const hello = { protocol: { version: SUPPORTED_PROTOCOL_VERSION } };
+const generationSocket = "\\\\.\\pipe\\prime-orbit-daemon-prime-agent-v0.7.4-4a6f213a1ed44889a0f0b40ea4774f3d";
+const ownerClientId = "daemon-client:11111111-2222-4333-8444-555555555555";
+
+const ownedDescriptor = {
+  version: 1,
+  pid: 4242,
+  lifecycle: "ready",
+  supervisorSocketPath: generationSocket,
+  sessionFile: request.sessionFile,
+  rootSessionId: request.sessionId,
+  ownerClientId,
+};
 
 test("uses only a strictly bounded generation socket and otherwise keeps the upstream default", () => {
   const fallback = () => "/upstream/default.sock";
@@ -42,6 +60,81 @@ test("uses only a strictly bounded generation socket and otherwise keeps the ups
     () => resolveDaemonSocketPath(`${unix}${"x".repeat(101)}`, fallback, "linux"),
     /invalide ou trop long/u,
   );
+});
+
+test("derives the same bounded descriptor namespace as the Prime Agent supervisor", () => {
+  assert.equal(daemonDescriptorKey(generationSocket), "283616240b01");
+});
+
+test("selects only the ready client-owned worker for the exact daemon and session", () => {
+  assert.equal(validOwnedClientDescriptor(ownedDescriptor, generationSocket), true);
+  assert.equal(
+    selectOwnedClientDescriptor([
+      { ...ownedDescriptor, supervisorSocketPath: "\\\\.\\pipe\\other" },
+      { ...ownedDescriptor, lifecycle: "recovering" },
+      { ...ownedDescriptor, ownerClientId: undefined },
+      ownedDescriptor,
+    ], request, generationSocket),
+    ownedDescriptor,
+  );
+  assert.equal(
+    selectOwnedClientDescriptor([{ ...ownedDescriptor, rootSessionId: "new-session-id" }], request, generationSocket)?.ownerClientId,
+    ownerClientId,
+    "the exact session file remains authoritative after a runtime session id replacement",
+  );
+  assert.throws(
+    () => selectOwnedClientDescriptor([ownedDescriptor, { ...ownedDescriptor, pid: 4243 }], request, generationSocket),
+    /Plusieurs sessions Prime Agent propriétaires/u,
+  );
+});
+
+test("reuses the RPC owner's protocol identity instead of listing its worker as inactive", async () => {
+  const requestIdSeed = createOwnedRequestIdSeed(Buffer.alloc(16, 0x11));
+  const client = {
+    protocolClientId: "daemon-client:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    requestId: 0,
+    async request(command) {
+      if (command.type === "list") {
+        return this.protocolClientId === ownerClientId
+          ? { success: true, data: { sessions: [{ ...request, activeSessionId: "owned-active" }] } }
+          : { success: true, data: { sessions: [{ ...request, isSessionActive: false }] } };
+      }
+      if (command.type === "get_state") return { success: true, data: {} };
+      if (command.type === "reload") return { success: true };
+      throw new Error(`unexpected command ${command.type}`);
+    },
+  };
+
+  assert.equal(bindOwnedClientIdentity(client, ownedDescriptor, requestIdSeed), true);
+  assert.equal(client.protocolClientId, ownerClientId);
+  assert.equal(client.requestId, requestIdSeed);
+  assert.deepEqual(await reloadAgentResources(client, request, hello), {
+    status: "reloaded",
+    supported: true,
+  });
+});
+
+test("allocates a disjoint command namespace before impersonating an RPC owner", () => {
+  const staleCommandId = "daemon_3";
+  const staleJournal = new Map([
+    [JSON.stringify([ownerClientId, staleCommandId]), { status: "complete", response: "stale reload" }],
+  ]);
+  const client = {
+    protocolClientId: "daemon-client:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    requestId: 0,
+  };
+  const requestIdSeed = createOwnedRequestIdSeed(Buffer.from("0123456789abcdeffedcba9876543210", "hex"));
+
+  assert.equal(validOwnedRequestIdSeed(requestIdSeed), true);
+  assert.equal(bindOwnedClientIdentity(client, ownedDescriptor, requestIdSeed), true);
+  const reloadCommandId = `daemon_${++client.requestId}`;
+  const journalKey = JSON.stringify([client.protocolClientId, reloadCommandId]);
+
+  assert.notEqual(reloadCommandId, staleCommandId);
+  assert.equal(staleJournal.has(journalKey), false, "a stale owner command result must not be replayed");
+  assert.match(reloadCommandId, /^daemon_\d{39}$/u);
+  assert.equal(validOwnedRequestIdSeed(1n), false);
+  assert.throws(() => createOwnedRequestIdSeed(Buffer.alloc(8)), /Entropie d’identifiant/u);
 });
 
 test("accepts only the bounded native reload action", () => {

@@ -5,6 +5,7 @@ import {
   Blocks,
   Bot,
   Check,
+  ChevronDown,
   ChevronRight,
   Clock3,
   Cloud,
@@ -43,11 +44,14 @@ import {
 import { deleteMcpServer, inspectPrimeAgentConnections, openPrimeAgentTerminal, readModelsJson, saveMcpServer, saveModelsJson, savePrimeAgentDefaults } from "../lib/bridge";
 import { appUpdateProgressPercent } from "../lib/app-updater";
 import { isCompleteModelReference, loadRlmPreferences, patchRlmPreferences, RLM_PREFERENCES_STORAGE_KEY, supportsRlmThinking, type RlmPreferences, type RlmThinkingPreference } from "../lib/rlm-preferences";
+import { modelReference, toggleFavoriteModelRef } from "../lib/model-favorites";
+import { useDismissableLayer } from "../hooks/useDismissableLayer";
 import { useI18n } from "../i18n";
 import packageMetadata from "../../package.json";
 import type { AppUpdateState, AppView, Conversation, McpAuthKind, McpScope, McpServerSummary, ModelInfo, OllamaHealth, PersistedAppState, PrimeAgentConnections, PrimeAgentDefaults, Project, RuntimeDetection, SettingsSectionId, ThinkingLevel } from "../types";
 import { Badge, Button, EmptyState, Modal, Switch } from "./Ui";
 import { ReleaseNotesMarkdown } from "./ReleaseNotesMarkdown";
+import { ModelPickerPopover } from "./ModelPickerPopover";
 
 interface HomeViewProps {
   projects: Project[];
@@ -439,7 +443,7 @@ export function SettingsView({ section, onSectionChange, state, setState, detect
           <SettingsGroup title={t("settings.prerequisites")}>{(detection?.prerequisites ?? []).map((item) => <SettingRow key={item.name} title={item.name} description={item.path ?? t("common.systemComponent")}><Badge tone={item.found ? "success" : "danger"}>{item.found ? item.version ?? t("common.detected") : t("common.missing")}</Badge></SettingRow>)}</SettingsGroup>
           <div className="warning-card"><ShieldAlert size={19} /><div><strong>{t("settings.notSandbox")}</strong><p>{t("settings.notSandboxText")}</p></div></div>
         </SettingsSection> : null}
-        {section === "models" ? <SettingsSection title={t("settings.models")} description={t("settings.modelsDescription")}><AgentDefaultsSettings models={models} defaults={primeAgentDefaults} loading={primeAgentDefaultsLoading} loadError={primeAgentDefaultsError} runtimeVersion={detection?.version} runtimeInstalled={Boolean(detection?.installed)} localThinking={prefs.defaultThinking} onLocalThinkingChange={(defaultThinking) => patchPreferences({ defaultThinking })} onDefaultsChange={onPrimeAgentDefaultsChange} onUpdatePrimeAgent={onInstall} /><div className="settings-callout"><FileJson2 size={22} /><div><h3>{t("settings.customCatalog")}</h3><p>{t("settings.customCatalogText")}</p></div><Button variant="secondary" onClick={() => void openModels()}><FileJson2 size={15} />{t("settings.openEditor")}</Button></div></SettingsSection> : null}
+        {section === "models" ? <SettingsSection title={t("settings.models")} description={t("settings.modelsDescription")}><AgentDefaultsSettings models={models} favorites={prefs.favoriteModels} defaults={primeAgentDefaults} loading={primeAgentDefaultsLoading} loadError={primeAgentDefaultsError} runtimeVersion={detection?.version} runtimeInstalled={Boolean(detection?.installed)} localThinking={prefs.defaultThinking} onLocalThinkingChange={(defaultThinking) => patchPreferences({ defaultThinking })} onToggleFavorite={(ref) => setState((current) => ({ ...current, preferences: { ...current.preferences, favoriteModels: toggleFavoriteModelRef(current.preferences.favoriteModels, ref) } }))} onDefaultsChange={onPrimeAgentDefaultsChange} onUpdatePrimeAgent={onInstall} /><div className="settings-callout"><FileJson2 size={22} /><div><h3>{t("settings.customCatalog")}</h3><p>{t("settings.customCatalogText")}</p></div><Button variant="secondary" onClick={() => void openModels()}><FileJson2 size={15} />{t("settings.openEditor")}</Button></div></SettingsSection> : null}
         {section === "security" ? <SettingsSection title={t("settings.security")} description={t("settings.securityDescription")}><div className="security-principles"><SecurityPrinciple icon={<Folder size={18} />} title={t("settings.visibleFolder")} text={t("settings.visibleFolderText")} /><SecurityPrinciple icon={<Terminal size={18} />} title={t("settings.inspectableCommands")} text={t("settings.inspectableCommandsText")} /><SecurityPrinciple icon={<ShieldAlert size={18} />} title={t("settings.noImplicitIsolation")} text={t("settings.noImplicitIsolationText")} /></div><div className="warning-card"><Info size={19} /><div><strong>{t("settings.realIsolation")}</strong><p>{t("settings.realIsolationText")}</p></div></div></SettingsSection> : null}
         {section === "about" ? <SettingsSection title={t("settings.about")} description={t("settings.aboutDescription")}><SettingsGroup title={t("settings.updates")}><AppUpdatePanel state={appUpdate} onCheck={onCheckAppUpdate} onDownload={onDownloadAppUpdate} onInstall={onInstallAppUpdate} /><SettingRow title={t("settings.autoUpdateChecks")} description={t("settings.autoUpdateChecksText")}><Switch checked={prefs.automaticUpdateChecks} onChange={(automaticUpdateChecks) => patchPreferences({ automaticUpdateChecks })} label={t("settings.autoUpdateChecks")} /></SettingRow></SettingsGroup><div className="about-card"><span className="about-orbit"><span /></span><h2>Prime Orbit</h2><p>{t("settings.aboutText")}</p><Badge tone="accent">Version {packageMetadata.version} · Preview</Badge><div><a href="https://github.com/PrimeIntellect-ai/prime-agent" target="_blank" rel="noreferrer"><Code2 size={15} />Prime Agent<ExternalLink size={12} /></a><a href="https://github.com/PrimeIntellect-ai/prime-agent/blob/main/LICENSE" target="_blank" rel="noreferrer"><Globe2 size={15} />{t("settings.licenses")}<ExternalLink size={12} /></a></div></div></SettingsSection> : null}
       </main>
@@ -458,8 +462,9 @@ const THINKING_LEVELS: Array<{ value: ThinkingLevel; label: "settings.thinkingOf
   { value: "max", label: "settings.thinkingMax" },
 ];
 
-function AgentDefaultsSettings({ models, defaults, loading, loadError, runtimeVersion, runtimeInstalled, localThinking, onLocalThinkingChange, onDefaultsChange, onUpdatePrimeAgent }: {
+function AgentDefaultsSettings({ models, favorites, defaults, loading, loadError, runtimeVersion, runtimeInstalled, localThinking, onLocalThinkingChange, onToggleFavorite, onDefaultsChange, onUpdatePrimeAgent }: {
   models: ModelInfo[];
+  favorites: string[];
   defaults?: PrimeAgentDefaults;
   loading: boolean;
   loadError?: string;
@@ -467,6 +472,7 @@ function AgentDefaultsSettings({ models, defaults, loading, loadError, runtimeVe
   runtimeInstalled: boolean;
   localThinking: ThinkingLevel;
   onLocalThinkingChange: (thinking: ThinkingLevel) => void;
+  onToggleFavorite: (ref: string) => void;
   onDefaultsChange: (defaults: PrimeAgentDefaults) => void;
   onUpdatePrimeAgent: () => Promise<void>;
 }) {
@@ -478,6 +484,9 @@ function AgentDefaultsSettings({ models, defaults, loading, loadError, runtimeVe
   const [saveError, setSaveError] = useState<string>();
   const [rlmPreferences, setRlmPreferences] = useState<RlmPreferences>(() => loadRlmPreferences());
   const [updatingRuntime, setUpdatingRuntime] = useState(false);
+  const [openModelPicker, setOpenModelPicker] = useState<"main" | "subagent">();
+  const dismissModelPicker = useCallback(() => setOpenModelPicker(undefined), []);
+  useDismissableLayer(openModelPicker ? `settings-model-${openModelPicker}` : null, dismissModelPicker);
   const rlmThinkingAvailable = supportsRlmThinking(runtimeVersion);
   const rlmModelInvalid = Boolean(rlmPreferences.preferredModel && !isCompleteModelReference(rlmPreferences.preferredModel));
 
@@ -511,7 +520,9 @@ function AgentDefaultsSettings({ models, defaults, loading, loadError, runtimeVe
       entries.sort((left, right) => (left.name ?? left.id).localeCompare(right.name ?? right.id)),
     ] as const).sort(([left], [right]) => left.localeCompare(right));
   }, [models]);
-  const knownModelRefs = useMemo(() => new Set(modelGroups.flatMap(([, entries]) => entries.map((model) => model.ref))), [modelGroups]);
+  const catalogModels = useMemo(() => modelGroups.flatMap(([, entries]) => entries), [modelGroups]);
+  const mainModelLabel = catalogModels.find((model) => model.ref === mainModel)?.name ?? mainModel ?? t("settings.inheritPrimeAgent");
+  const subagentModelLabel = catalogModels.find((model) => model.ref === rlmPreferences.preferredModel)?.name ?? rlmPreferences.preferredModel ?? t("settings.inheritMainAgent");
 
   const changeMainModel = (value: string) => {
     setMainModel(value || undefined);
@@ -569,11 +580,10 @@ function AgentDefaultsSettings({ models, defaults, loading, loadError, runtimeVe
       <SettingsGroup title={t("settings.mainAgent")}>
         <div className="settings-group-intro"><Bot size={16} /><span>{t("settings.mainAgentText")}</span></div>
         <SettingRow title={t("settings.defaultModel")} description={t("settings.defaultModelText")}>
-          {modelGroups.length > 0 ? <select aria-label={t("settings.defaultModel")} value={mainModel ?? ""} disabled={loading || saveState === "saving" || !runtimeInstalled} onChange={(event) => changeMainModel(event.target.value)}>
-              <option value="">{t("settings.inheritPrimeAgent")}</option>
-              {mainModel && !knownModelRefs.has(mainModel) ? <option value={mainModel}>{mainModel}</option> : null}
-              {modelGroups.map(([provider, entries]) => <optgroup key={provider} label={provider}>{entries.map((model) => <option key={model.ref} value={model.ref}>{model.name ?? model.id}</option>)}</optgroup>)}
-            </select>
+          {modelGroups.length > 0 ? <div className={`settings-model-picker ${openModelPicker === "main" ? "is-open" : ""}`} data-dismissable-layer="settings-model-main">
+              <button type="button" className="settings-model-trigger" aria-label={t("settings.defaultModel")} aria-haspopup="dialog" aria-expanded={openModelPicker === "main"} disabled={loading || saveState === "saving" || !runtimeInstalled} onClick={() => setOpenModelPicker((current) => current === "main" ? undefined : "main")}><span>{mainModelLabel}</span><ChevronDown size={14} /></button>
+              {openModelPicker === "main" ? <ModelPickerPopover models={catalogModels} active={mainModel} favorites={favorites} onChoose={(model) => { changeMainModel(modelReference(model)); dismissModelPicker(); }} onToggleFavorite={onToggleFavorite} align="right" emptyChoice={{ label: t("settings.inheritPrimeAgent"), onChoose: () => { changeMainModel(""); dismissModelPicker(); } }} loadingWhenEmpty={false} /> : null}
+            </div>
             : <input aria-label={t("settings.defaultModel")} value={mainModel ?? ""} placeholder={t("settings.modelReferencePlaceholder")} disabled={loading || saveState === "saving" || !runtimeInstalled} spellCheck={false} onChange={(event) => changeMainModel(event.target.value)} />}
         </SettingRow>
         <SettingRow title={t("settings.defaultReasoning")} description={t("settings.defaultReasoningText")}>
@@ -591,11 +601,10 @@ function AgentDefaultsSettings({ models, defaults, loading, loadError, runtimeVe
       <SettingsGroup title={t("settings.subagents")}>
         <div className="settings-group-intro"><Blocks size={16} /><span>{t("settings.subagentsText")}</span></div>
         <SettingRow title={t("settings.subagentModel")} description={t("settings.subagentModelText")}>
-          {modelGroups.length > 0 ? <select aria-label={t("settings.subagentModel")} value={rlmPreferences.preferredModel ?? ""} onChange={(event) => changeRlmPreferences({ preferredModel: event.target.value || undefined })}>
-              <option value="">{t("settings.inheritMainAgent")}</option>
-              {rlmPreferences.preferredModel && !knownModelRefs.has(rlmPreferences.preferredModel) ? <option value={rlmPreferences.preferredModel}>{rlmPreferences.preferredModel}</option> : null}
-              {modelGroups.map(([provider, entries]) => <optgroup key={provider} label={provider}>{entries.map((model) => <option key={model.ref} value={model.ref}>{model.name ?? model.id}</option>)}</optgroup>)}
-            </select>
+          {modelGroups.length > 0 ? <div className={`settings-model-picker ${openModelPicker === "subagent" ? "is-open" : ""}`} data-dismissable-layer="settings-model-subagent">
+              <button type="button" className="settings-model-trigger" aria-label={t("settings.subagentModel")} aria-haspopup="dialog" aria-expanded={openModelPicker === "subagent"} onClick={() => setOpenModelPicker((current) => current === "subagent" ? undefined : "subagent")}><span>{subagentModelLabel}</span><ChevronDown size={14} /></button>
+              {openModelPicker === "subagent" ? <ModelPickerPopover models={catalogModels} active={rlmPreferences.preferredModel} favorites={favorites} onChoose={(model) => { changeRlmPreferences({ preferredModel: modelReference(model) }); dismissModelPicker(); }} onToggleFavorite={onToggleFavorite} align="right" emptyChoice={{ label: t("settings.inheritMainAgent"), onChoose: () => { changeRlmPreferences({ preferredModel: undefined }); dismissModelPicker(); } }} loadingWhenEmpty={false} /> : null}
+            </div>
             : <input aria-label={t("settings.subagentModel")} value={rlmPreferences.preferredModel ?? ""} placeholder={t("settings.modelReferencePlaceholder")} spellCheck={false} onChange={(event) => changeRlmPreferences({ preferredModel: event.target.value || undefined })} />}
         </SettingRow>
         <SettingRow title={t("settings.subagentThinking")} description={t("settings.subagentThinkingText")}>

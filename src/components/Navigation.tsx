@@ -92,6 +92,7 @@ interface ProjectSidebarProps {
   onSelectProject: (id: string) => void;
   onSelectConversation: (id: string) => void;
   onNewConversation: () => void;
+  onNewConversationForProject: (projectId: string) => void;
   onPinConversation: (id: string, pinned: boolean) => void;
   onArchiveConversation: (id: string) => void;
   onRenameConversation: (id: string, title: string) => void;
@@ -118,6 +119,7 @@ export function ProjectSidebar(props: ProjectSidebarProps) {
     onSelectProject,
     onSelectConversation,
     onNewConversation,
+    onNewConversationForProject,
     onPinConversation,
     onArchiveConversation,
     onRenameConversation,
@@ -372,6 +374,15 @@ export function ProjectSidebar(props: ProjectSidebarProps) {
                   <span>{section.project.name}</span>
                   {section.project.pinned ? <Pin size={11} aria-label={t("nav.pinnedProject")} /> : null}
                 </button>
+                <button
+                  type="button"
+                  className="project-new-conversation"
+                  onClick={() => onNewConversationForProject(section.project.id)}
+                  aria-label={t("nav.newConversationInProject", { name: section.project.name })}
+                  title={t("nav.newConversationInProject", { name: section.project.name })}
+                >
+                  <Plus size={13} />
+                </button>
                 <span className="project-conversation-count" aria-label={t(section.conversations.length === 1 ? "nav.conversationCount.one" : "nav.conversationCount.other", { count: section.conversations.length })}>{section.conversations.length}</span>
                 <span className="project-order-actions">
                   <IconButton label={t("nav.moveProjectUp", { name: section.project.name })} disabled={reorderDisabled || projectIndex <= 0} onClick={() => moveProjectByKeyboard(section.project.id, -1)}><ArrowUp size={12} /></IconButton>
@@ -554,6 +565,7 @@ const NAV_COPY = {
   "nav.main": ["Navigation principale", "Main navigation"],
   "nav.brandHome": ["Prime Orbit — Accueil", "Prime Orbit — Home"],
   "nav.newConversation": ["Nouvelle conversation", "New conversation"],
+  "nav.newConversationInProject": ["Nouvelle conversation dans {name}", "New conversation in {name}"],
   "nav.openFolder": ["Ouvrir un dossier", "Open folder"],
   "nav.commandPalette": ["Palette de commandes", "Command palette"],
   "nav.commandPaletteShortcut": ["Palette de commandes (Ctrl+K)", "Command palette (Ctrl+K)"],

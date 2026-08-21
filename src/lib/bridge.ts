@@ -121,6 +121,7 @@ export interface AgentResourcesReloadedEvent {
 
 let detectionInFlight: Promise<RuntimeDetection> | undefined;
 let ollamaHealthInFlight: Promise<OllamaHealth> | undefined;
+let contextMenuInstallInFlight: Promise<void> | undefined;
 
 function mapDetection(raw: NativeDetection, items: NativePrerequisite[] = []): RuntimeDetection {
   return {
@@ -342,12 +343,62 @@ export async function loadSessionHistory(
   expectedSessionId: string | undefined,
   projectPath: string,
 ): Promise<SessionHistoryResult> {
-  if (!isNative()) return { messages: [], readOnly: true, truncated: false };
+  if (!isNative()) return { messages: [], refinements: [], harnessEntries: [], readOnly: true, truncated: false };
   return invoke<SessionHistoryResult>("load_session_history", {
     sessionPath,
     expectedSessionId: expectedSessionId ?? null,
     projectPath,
   });
+}
+
+export type HarnessScope = "local" | "global";
+export type HarnessKind = "prompt" | "memory" | "skill" | "subagent";
+export type HarnessOpenTarget = "file" | "folder";
+
+export interface HarnessTargetInput {
+  sessionPath: string;
+  expectedSessionId?: string;
+  projectPath: string;
+  scope: HarnessScope;
+  target: HarnessOpenTarget;
+}
+
+export interface DeleteHarnessEntryInput {
+  sessionPath: string;
+  expectedSessionId?: string;
+  projectPath: string;
+  scope: HarnessScope;
+  kind: HarnessKind;
+  id: string;
+}
+
+export interface DeleteHarnessEntryResult {
+  deleted: boolean;
+  backupCreated: boolean;
+}
+
+/** Opens only the harness state path derived and attested by the native layer. */
+export async function openHarnessState(input: HarnessTargetInput): Promise<void> {
+  if (!isNative()) return;
+  if (!input.expectedSessionId) throw new Error("La session Prime Agent sélectionnée n’a pas d’identifiant vérifiable.");
+  await invoke("open_harness_state", { input });
+}
+
+/** Opens the session JSONL for local refinements or Prime Agent's global journal. */
+export async function openRefinementJournal(input: HarnessTargetInput): Promise<void> {
+  if (!isNative()) return;
+  if (!input.expectedSessionId) throw new Error("La session Prime Agent sélectionnée n’a pas d’identifiant vérifiable.");
+  await invoke("open_refinement_journal", { input });
+}
+
+/** Deletes one exact state-map entry. Native code derives all filesystem paths,
+ * creates an exact .bak, and performs a compare-before-atomic-replace write. */
+export async function deleteHarnessEntry(
+  input: DeleteHarnessEntryInput,
+): Promise<DeleteHarnessEntryResult> {
+  if (!isNative()) return { deleted: true, backupCreated: false };
+  if (!input.expectedSessionId) throw new Error("La session Prime Agent sélectionnée n’a pas d’identifiant vérifiable.");
+  return invoke<DeleteHarnessEntryResult>("delete_harness_entry", { input });
 }
 
 export async function listPrimeAgentSessions(projectPaths: string[]): Promise<PrimeAgentSessionSummary[]> {
@@ -567,6 +618,71 @@ export async function checkOllamaHealth(): Promise<OllamaHealth> {
   } finally {
     if (ollamaHealthInFlight === request) ollamaHealthInFlight = undefined;
   }
+}
+
+export interface WebviewContextMenuItem {
+  commandId: number;
+  name: string;
+  label: string;
+  shortcut: string;
+  enabled: boolean;
+  group: "spelling" | "edit";
+}
+
+export interface WebviewContextMenuRequest {
+  requestId: string;
+  x: number;
+  y: number;
+  items: WebviewContextMenuItem[];
+}
+
+/** Returns bounded operating-system spelling suggestions for one captured word.
+ * The native command owns dictionary access; browser previews simply keep the
+ * regular editing menu without offering synthetic corrections. */
+export async function getSpellingSuggestions(word: string, language: string): Promise<string[]> {
+  if (!isNative()) return [];
+  const result = await invoke<{ suggestions: string[] }>("get_spelling_suggestions", {
+    input: { word, language },
+  });
+  return result.suggestions;
+}
+
+/** Installs the WebView2 spellcheck bridge for this renderer's own WebView.
+ * Each workspace window has an independent WebView2 instance. */
+export async function installWebviewContextMenu(): Promise<void> {
+  if (!isNative()) return;
+  if (!contextMenuInstallInFlight) {
+    contextMenuInstallInFlight = invoke<void>("install_webview_context_menu");
+  }
+  const request = contextMenuInstallInFlight;
+  try {
+    await request;
+  } catch (error) {
+    if (contextMenuInstallInFlight === request) contextMenuInstallInFlight = undefined;
+    throw error;
+  }
+}
+
+export async function listenToWebviewContextMenus(
+  handler: (request: WebviewContextMenuRequest) => void,
+): Promise<UnlistenFn> {
+  if (!isNative()) return () => undefined;
+  return listen<WebviewContextMenuRequest>("prime-orbit://webview-context-menu", (event) => {
+    handler(event.payload);
+  });
+}
+
+/** Completes WebView2's pending context-menu deferral. Passing no command id
+ * dismisses the menu; passing one executes the exact native spell/edit action. */
+export async function resolveWebviewContextMenu(
+  requestId: string,
+  commandId?: number,
+): Promise<void> {
+  if (!isNative()) return;
+  await invoke<void>("resolve_webview_context_menu", {
+    requestId,
+    commandId: commandId ?? null,
+  });
 }
 
 export async function saveMcpServer(cwd: string | undefined, scope: McpScope, server: McpServerInput): Promise<{ path: string; backupPath: string | null; server: McpServerSummary }> {

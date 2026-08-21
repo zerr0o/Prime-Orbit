@@ -4,6 +4,31 @@ All notable changes to Prime Orbit are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-08-21
+
+### Session memory and controls
+
+- Loaded the active session's existing memory entries and refinement history into the inspector, with bounded refreshes after refinement completes.
+- Added accessible contextual actions to open a memory or refinement journal, reveal its folder, delete an exact memory entry with confirmation and backup, or append a safe rollback for an applied refinement.
+- Reworked **Reload resources** to target the exact active daemon session and reuse its owning RPC identity without submitting a chat prompt or replaying an earlier command.
+
+### Models and conversation workflow
+
+- Added persistent model favorites, shown first in every shared model picker and merged safely across concurrent windows.
+- Added search to the default-model and preferred-subagent-model selectors in Settings.
+- Added a direct, keyboard-accessible new-conversation action for each project in the workspace sidebar.
+
+### Native editing and runtime resilience
+
+- Restored Windows dictionary suggestions inside Prime Orbit's themed composer context menu, including Unicode words and exact replacement ranges.
+- Prevented a connecting session from treating its first prompt as a follow-up, stopped stale local-history loading from relatching a ready conversation, and kept newer prompt admissions safe from older idle snapshots.
+- Presented parent-managed subagent shutdowns as normal closures and refreshed session memory after completed refinements.
+
+### Validation
+
+- Added coverage for exact resource-reload ownership, session inspector reconstruction and actions, model favorite ordering and persistence, project-scoped conversation creation, native spelling suggestions, and session lifecycle races.
+- Revalidated the frontend production build, complete frontend and Rust test suites, formatting, strict Clippy, Rust 1.88 compatibility, and signed Windows release gates.
+
 ## [0.1.18] - 2026-08-21
 
 ### Reliable runtime recovery
@@ -250,6 +275,7 @@ All notable changes to Prime Orbit are documented in this file.
 - TypeScript build and checks.
 - Strict Rust Clippy validation with warnings denied.
 
+[0.1.19]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.19
 [0.1.18]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.18
 [0.1.17]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.17
 [0.1.16]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.16

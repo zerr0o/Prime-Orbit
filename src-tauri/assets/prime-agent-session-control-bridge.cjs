@@ -1,6 +1,7 @@
 "use strict";
 
 const fs = require("node:fs");
+const { createHash, randomBytes } = require("node:crypto");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 
@@ -12,6 +13,10 @@ const MAX_WINDOWS_DAEMON_SOCKET_BYTES = 240;
 const MAX_UNIX_DAEMON_SOCKET_BYTES = 100;
 const WINDOWS_GENERATION_SOCKET = /^\\\\\.\\pipe\\prime-orbit-daemon-prime-agent-v\d{1,10}\.\d{1,10}\.\d{1,10}-[0-9a-f]{32}$/u;
 const UNIX_GENERATION_SOCKET = /^\/tmp\/prime-orbit-daemon-prime-agent-v\d{1,10}\.\d{1,10}\.\d{1,10}-[0-9a-f]{32}\.sock$/u;
+const OWNED_CLIENT_ID = /^daemon-client:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const OWNED_REQUEST_ID_BYTES = 16;
+const OWNED_REQUEST_ID_HIGH_BIT = 1n << 127n;
+const OWNED_REQUEST_ID_MAX = (1n << 128n) - 1n;
 
 function fail(message) {
   process.stderr.write(`${message}\n`);
@@ -29,14 +34,109 @@ function findDaemonModules(cliPath) {
   for (let depth = 0; depth < 6; depth += 1) {
     const daemonClient = path.join(cursor, "modes", "daemon", "daemon-client.js");
     const daemonSocket = path.join(cursor, "modes", "daemon", "daemon-socket.js");
-    if (fs.existsSync(daemonClient) && fs.existsSync(daemonSocket)) {
-      return { daemonClient, daemonSocket };
+    const config = path.join(cursor, "config.js");
+    if (fs.existsSync(daemonClient) && fs.existsSync(daemonSocket) && fs.existsSync(config)) {
+      return { config, daemonClient, daemonSocket };
     }
     const parent = path.dirname(cursor);
     if (parent === cursor) break;
     cursor = parent;
   }
   throw new Error("Les modules daemon de Prime Agent sont introuvables dans ce runtime.");
+}
+
+function daemonDescriptorKey(socketPath) {
+  return createHash("sha256").update(socketPath).digest("hex").slice(0, 12);
+}
+
+function validOwnedClientDescriptor(descriptor, socketPath) {
+  return descriptor
+    && typeof descriptor === "object"
+    && !Array.isArray(descriptor)
+    && descriptor.version === 1
+    && descriptor.supervisorSocketPath === socketPath
+    && descriptor.lifecycle === "ready"
+    && Number.isInteger(descriptor.pid)
+    && descriptor.pid > 0
+    && typeof descriptor.sessionFile === "string"
+    && descriptor.sessionFile.length > 0
+    && descriptor.sessionFile.length <= 32_768
+    && (descriptor.rootSessionId === undefined
+      || (typeof descriptor.rootSessionId === "string" && descriptor.rootSessionId.length > 0 && descriptor.rootSessionId.length <= 512))
+    && typeof descriptor.ownerClientId === "string"
+    && OWNED_CLIENT_ID.test(descriptor.ownerClientId);
+}
+
+function selectOwnedClientDescriptor(descriptors, request, socketPath) {
+  const expectedFile = normalizedFile(request.sessionFile);
+  if (!expectedFile) return undefined;
+  const matches = descriptors.filter((descriptor) => {
+    if (!validOwnedClientDescriptor(descriptor, socketPath)) return false;
+    return normalizedFile(descriptor.sessionFile) === expectedFile;
+  });
+  if (matches.length > 1) {
+    throw new Error("Plusieurs sessions Prime Agent propriétaires correspondent à ce fichier.");
+  }
+  return matches[0];
+}
+
+function readOwnedClientDescriptor(agentDir, socketPath, request) {
+  const descriptorDir = path.join(agentDir, "daemon-workers", daemonDescriptorKey(socketPath));
+  let names;
+  try {
+    names = fs.readdirSync(descriptorDir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return undefined;
+    throw error;
+  }
+  const descriptors = [];
+  for (const entry of names) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    try {
+      const content = fs.readFileSync(path.join(descriptorDir, entry.name), "utf8");
+      if (Buffer.byteLength(content, "utf8") > MAX_REQUEST_BYTES) continue;
+      descriptors.push(JSON.parse(content));
+    } catch {
+      // Descriptors are atomically replaced by the daemon. Ignore stale or
+      // partially removed entries and rely only on a complete exact match.
+    }
+  }
+  return selectOwnedClientDescriptor(descriptors, request, socketPath);
+}
+
+function createOwnedRequestIdSeed(entropy = randomBytes(OWNED_REQUEST_ID_BYTES)) {
+  if (!Buffer.isBuffer(entropy) || entropy.length !== OWNED_REQUEST_ID_BYTES) {
+    throw new Error("Entropie d’identifiant de commande Prime Agent invalide.");
+  }
+  return BigInt(`0x${entropy.toString("hex")}`) | OWNED_REQUEST_ID_HIGH_BIT;
+}
+
+function validOwnedRequestIdSeed(seed) {
+  return typeof seed === "bigint" && seed >= OWNED_REQUEST_ID_HIGH_BIT && seed <= OWNED_REQUEST_ID_MAX;
+}
+
+function bindOwnedClientIdentity(client, descriptor, requestIdSeed = createOwnedRequestIdSeed()) {
+  if (!descriptor) return false;
+  const current = client?.protocolClientId;
+  if (typeof current !== "string"
+    || !OWNED_CLIENT_ID.test(current)
+    || !Number.isSafeInteger(client?.requestId)
+    || client.requestId < 0
+    || !validOwnedRequestIdSeed(requestIdSeed)) {
+    throw new Error("Ce runtime Prime Agent ne permet pas de réassocier le contrôle à la session RPC propriétaire.");
+  }
+  // Daemon mutations are recovered by (clientId, commandId). Reusing the
+  // owner's identity with DaemonClient's default counter would emit daemon_1,
+  // daemon_2, ... again and could replay an old journaled result. Give this
+  // one-shot bridge a random 128-bit namespace before the first request. A
+  // bigint remains exact through DaemonClient's ++ and becomes only the
+  // string suffix serialized on the wire.
+  client.requestId = requestIdSeed;
+  client.protocolClientId = descriptor.ownerClientId;
+  if (client.protocolClientId !== descriptor.ownerClientId || client.requestId !== requestIdSeed) {
+    throw new Error("La réassociation à la session Prime Agent propriétaire a échoué.");
+  }
+  return true;
 }
 
 function resolveDaemonSocketPath(explicitSocketPath, defaultDaemonSocketPath, platform = process.platform) {
@@ -164,7 +264,8 @@ async function main() {
   if (!cliPath) throw new Error("Runtime Prime Agent incomplet.");
   const request = await readRequest();
   const modules = findDaemonModules(cliPath);
-  const [{ DaemonClient }, { defaultDaemonSocketPath }] = await Promise.all([
+  const [{ getAgentDir }, { DaemonClient }, { defaultDaemonSocketPath }] = await Promise.all([
+    import(pathToFileURL(modules.config).href),
     import(pathToFileURL(modules.daemonClient).href),
     import(pathToFileURL(modules.daemonSocket).href),
   ]);
@@ -174,6 +275,8 @@ async function main() {
     defaultDaemonSocketPath,
   );
   const client = new DaemonClient(socketPath);
+  const ownedDescriptor = readOwnedClientDescriptor(getAgentDir(), socketPath, request);
+  bindOwnedClientIdentity(client, ownedDescriptor);
   try {
     await client.connect(3_000);
     const hello = await client.waitForHello(3_000);
@@ -187,11 +290,18 @@ async function main() {
 module.exports = {
   RELOAD_REQUEST_TIMEOUT_MS,
   SUPPORTED_PROTOCOL_VERSION,
+  bindOwnedClientIdentity,
   busyReason,
+  createOwnedRequestIdSeed,
+  daemonDescriptorKey,
   isReloadResponseTimeout,
+  readOwnedClientDescriptor,
   reloadAgentResources,
   resolveDaemonSocketPath,
   selectSession,
+  selectOwnedClientDescriptor,
+  validOwnedClientDescriptor,
+  validOwnedRequestIdSeed,
   validRequest,
 };
 

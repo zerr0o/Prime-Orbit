@@ -33,6 +33,7 @@ import {
   type GoalMutationRuntimeState,
 } from "../lib/goal-control";
 import type { RuntimeNotice } from "../lib/runtime-notices";
+import { isParentManagedSubagentClosure } from "../lib/session-inspector";
 import type {
   ActivityItem,
   AgentRlmChild,
@@ -49,6 +50,8 @@ import type {
   Project,
   RpcEnvelope,
   RuntimeDetection,
+  SessionHarnessEntry,
+  SessionRefinementRecord,
   SessionStats,
   SessionActionSnapshot,
   SlashCommand,
@@ -74,6 +77,8 @@ interface ConversationRuntime {
     error?: string;
   };
   goalMutation?: GoalMutationRuntimeState;
+  refinements?: SessionRefinementRecord[];
+  harnessEntries?: SessionHarnessEntry[];
   logs: Array<{ id: string; stream: "rpc" | "stderr"; text: string; createdAt: string }>;
 }
 
@@ -191,6 +196,32 @@ const localHistoryIdentity = (conversation: Pick<Conversation, "id" | "sessionPa
 );
 const localHistoryConversationPrefix = (conversationId: string) => `${conversationId}\0`;
 
+/** Local history may advertise the initial loading state only while the
+ * persisted conversation is still offline. Once an RPC history response has
+ * made the conversation ready (including a valid empty history), a later
+ * session-path render must not latch it back into `starting`. */
+export function shouldEnterLocalHistoryLoading(
+  conversation: Pick<Conversation, "messages" | "sessionPath" | "status">,
+  rpcHistoryLoaded: boolean,
+): boolean {
+  return Boolean(conversation.sessionPath)
+    && conversation.messages.length === 0
+    && conversation.status === "offline"
+    && !rpcHistoryLoaded;
+}
+
+/** The composer can render while a new RPC process is connecting. `starting`
+ * alone is not an active agent turn, so UI-supplied follow-up/steer delivery
+ * must be ignored until a real lifecycle or local operation proves work is in
+ * progress. The prompt then waits for bootstrap and starts normally. */
+export function normalizeConnectingPromptDelivery(
+  status: Conversation["status"],
+  requestedDelivery: "steer" | "follow_up" | undefined,
+  hasTrackedWork: boolean,
+): "steer" | "follow_up" | undefined {
+  return status === "starting" && !hasTrackedWork ? undefined : requestedDelivery;
+}
+
 /** A successful get_state snapshot is the recovery boundary when renderer
  * event delivery was interrupted between message_end and agent_end. */
 export function isAuthoritativeIdleSessionSnapshot(
@@ -203,6 +234,16 @@ export function isAuthoritativeIdleSessionSnapshot(
     && actions.queuedCount <= 0
     && actions.steering.length === 0
     && actions.followUps.length === 0;
+}
+
+/** An idle daemon snapshot may repair a missed terminal event, but it must not
+ * erase a prompt that the renderer has admitted and is still bootstrapping. */
+export function shouldRecoverIdleSessionState(
+  snapshotIsIdle: boolean,
+  localOperationBlocksRecovery: boolean,
+  promptAdmissionPending: boolean,
+): boolean {
+  return snapshotIsIdle && !localOperationBlocksRecovery && !promptAdmissionPending;
 }
 
 /** State snapshots are point-in-time observations. A lifecycle or local prompt
@@ -921,6 +962,7 @@ export function useAgentRuntime(options: {
   // process-local marker closes that gap so the second prompt is represented
   // as queued even when both handlers crossed ensureStarted concurrently.
   const activePromptRuns = useRef(new Set<string>());
+  const pendingPromptAdmissions = useRef(new Set<string>());
   // Keep the real agent lifecycle separate from optimistic/queued prompts.
   // Otherwise deleting the last follow-up during Compact can leave a phantom
   // run, while clearing it blindly could hide a genuinely running agent.
@@ -1163,6 +1205,17 @@ export function useAgentRuntime(options: {
         const currentMetadata = getConversationRef.current(conversation.id);
         if (!currentMetadata || localHistoryIdentity(currentMetadata) !== identity) return;
         localHistoryLoaded.current.add(identity);
+        setRuntimes((current) => {
+          const runtime = current[conversation.id] ?? { models: [], commands: [], logs: [] };
+          return {
+            ...current,
+            [conversation.id]: {
+              ...runtime,
+              refinements: history.refinements ?? [],
+              harnessEntries: history.harnessEntries ?? [],
+            },
+          };
+        });
         const mapped = mapAgentMessages(history.messages);
         updateConversation(conversation.id, (current) => {
           // RPC text remains authoritative, but the bounded local-history
@@ -1194,6 +1247,32 @@ export function useAgentRuntime(options: {
     localHistoryInFlight.current.set(identity, load);
     return load;
   }, [isCurrentSelection, updateConversation]);
+
+  const refreshLocalRefinements = useCallback(async (conversationId: string, generation: number) => {
+    if (!isCurrentSelection(conversationId, generation)) return Promise.resolve();
+    const initialConversation = getConversationRef.current(conversationId);
+    if (!initialConversation?.sessionPath) return;
+    const identity = localHistoryIdentity(initialConversation);
+
+    // A refine_complete event can arrive while the first local-history read is
+    // still in flight. Reusing that promise would apply the pre-refinement
+    // snapshot and mark it loaded forever. Let it settle, then deliberately
+    // perform a second disk read for the post-refinement state.
+    const pending = localHistoryInFlight.current.get(identity);
+    if (pending) {
+      try {
+        await pending;
+      } catch {
+        // The forced read below is also the retry for a failed initial load.
+      }
+    }
+    if (!isCurrentSelection(conversationId, generation)) return;
+    const conversation = getConversationRef.current(conversationId);
+    const project = conversation ? getProjectRef.current(conversation.projectId) : undefined;
+    if (!conversation?.sessionPath || !project || localHistoryIdentity(conversation) !== identity) return;
+    localHistoryLoaded.current.delete(identity);
+    await loadLocalConversationHistory(conversation, project, generation);
+  }, [isCurrentSelection, loadLocalConversationHistory]);
 
   const ensureRuntime = useCallback((conversationId: string) => {
     setRuntimes((current) => {
@@ -1387,7 +1466,11 @@ export function useAgentRuntime(options: {
       || activeBashActivities.current.has(conversationId)
       || directRefinementActivities.current.has(conversationId)
       || uncertainRefinementConversations.current.has(conversationId);
-    const shouldRecoverIdle = snapshotIsIdle && !localOperationBlocksIdleRecovery;
+    const shouldRecoverIdle = shouldRecoverIdleSessionState(
+      snapshotIsIdle,
+      localOperationBlocksIdleRecovery,
+      pendingPromptAdmissions.current.has(conversationId),
+    );
     if (shouldRecoverIdle) {
       // get_state is the daemon's authoritative answer after a renderer
       // listener gap. Purging both refs is essential: conversation.status alone
@@ -1695,6 +1778,14 @@ export function useAgentRuntime(options: {
           sessionPath: undefined,
           sessionId: undefined,
         });
+        setRuntimes((current) => {
+          const runtime = current[conversationId];
+          if (!runtime) return current;
+          return {
+            ...current,
+            [conversationId]: { ...runtime, refinements: undefined, harnessEntries: undefined },
+          };
+        });
         historyLoaded.current.delete(conversationId);
         localHistoryApplied.current.delete(conversationId);
         const localPrefix = localHistoryConversationPrefix(conversationId);
@@ -1900,6 +1991,7 @@ export function useAgentRuntime(options: {
         const token = activeSelection.current;
         if (token.conversationId === conversationId && isCurrentSelection(conversationId, token.generation)) {
           void sendSelectionRequest(conversationId, token.generation, "get_state").catch(() => undefined);
+          void refreshLocalRefinements(conversationId, token.generation).catch(() => undefined);
         }
         return;
       }
@@ -1988,6 +2080,7 @@ export function useAgentRuntime(options: {
         });
         if (child && textValue(child.id)) {
           const snapshot = redactValue(child) as unknown as AgentRlmChild;
+          const parentManagedClosure = isParentManagedSubagentClosure(snapshot);
           setRuntimes((current) => {
             const runtime = current[conversationId] ?? { models: [], commands: [], logs: [] };
             const children = runtime.subagents ?? [];
@@ -1995,7 +2088,12 @@ export function useAgentRuntime(options: {
             const subagents = [...children];
             if (index >= 0) subagents[index] = { ...subagents[index], ...snapshot };
             else subagents.push(snapshot);
-            return { ...current, [conversationId]: { ...runtime, subagents } };
+            const observedSubagent = parentManagedClosure
+              && snapshot.activeSessionId
+              && runtime.observedSubagent?.activeSessionId === snapshot.activeSessionId
+              ? undefined
+              : runtime.observedSubagent;
+            return { ...current, [conversationId]: { ...runtime, subagents, observedSubagent } };
           });
         }
         return;
@@ -2219,7 +2317,7 @@ export function useAgentRuntime(options: {
         addActivity(conversationId, { type: eventType, title: humanizeEvent(eventType), status: "info", raw: event });
       }
     },
-    [addActivity, cancelTerminalStateReconciliation, handleResponse, invalidateCompactionHistory, isCurrentSelection, recentCompactionEnd, refreshAfterCompaction, reloadDeliveredQueueTranscript, removeActivity, scheduleTerminalStateReconciliation, sendSelectionRequest, setGoalMutationState, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation],
+    [addActivity, cancelTerminalStateReconciliation, handleResponse, invalidateCompactionHistory, isCurrentSelection, recentCompactionEnd, refreshAfterCompaction, refreshLocalRefinements, reloadDeliveredQueueTranscript, removeActivity, scheduleTerminalStateReconciliation, sendSelectionRequest, setGoalMutationState, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation],
   );
 
   useEffect(() => {
@@ -2601,10 +2699,13 @@ export function useAgentRuntime(options: {
     if (!active || !selectedConversation || !selectedProject) return;
     const token = activeSelection.current;
     if (token.conversationId !== selectedConversation.id) return;
-    if (selectedConversation.sessionPath && selectedConversation.messages.length === 0) {
+    if (shouldEnterLocalHistoryLoading(
+      selectedConversation,
+      historyLoaded.current.has(selectedConversation.id),
+    )) {
       updateConversation(selectedConversation.id, (conversation) => ({
         ...conversation,
-        status: conversation.status === "error" ? "error" : "starting",
+        status: conversation.status === "offline" ? "starting" : conversation.status,
       }));
     }
     void loadLocalConversationHistory(selectedConversation, selectedProject, token.generation).catch(() => undefined);
@@ -2661,10 +2762,17 @@ export function useAgentRuntime(options: {
         throw new Error("Attachment handle unavailable; select the file again.");
       }
       const beforeStart = getConversationRef.current(conversationId) ?? selectedConversation;
-      const forceQueued = requestedDelivery !== undefined
-        || activePromptRuns.current.has(conversationId)
+      const hasTrackedWork = activePromptRuns.current.has(conversationId)
+        || activeAgentLifecycles.current.has(conversationId)
         || pendingCompactions.current.has(conversationId)
-        || compactingConversations.current.has(conversationId)
+        || compactingConversations.current.has(conversationId);
+      const effectiveDelivery = normalizeConnectingPromptDelivery(
+        beforeStart.status,
+        requestedDelivery,
+        hasTrackedWork,
+      );
+      const forceQueued = effectiveDelivery !== undefined
+        || hasTrackedWork
         || beforeStart.status === "streaming"
         || beforeStart.status === "tool"
         || beforeStart.status === "queued";
@@ -2675,11 +2783,14 @@ export function useAgentRuntime(options: {
       stateEpoch.current.set(conversationId, (stateEpoch.current.get(conversationId) ?? 0) + 1);
       transcriptEpoch.current.set(conversationId, (transcriptEpoch.current.get(conversationId) ?? 0) + 1);
       activePromptRuns.current.add(conversationId);
+      pendingPromptAdmissions.current.add(conversationId);
       try {
         await ensureStarted(selectedConversation, selectedProject);
       } catch (error) {
         if (!forceQueued) activePromptRuns.current.delete(conversationId);
         throw error;
+      } finally {
+        pendingPromptAdmissions.current.delete(conversationId);
       }
       const content = trimmed;
       const preparation: { value?: ReturnType<typeof beginPromptTransaction> } = {};
@@ -2697,7 +2808,7 @@ export function useAgentRuntime(options: {
           createdAt,
           queuedPayload: content,
           forceQueued,
-          queuedDelivery: requestedDelivery,
+          queuedDelivery: effectiveDelivery,
         });
         preparation.value = prepared;
         return prepared.conversation;
@@ -2740,7 +2851,7 @@ export function useAgentRuntime(options: {
           message: content,
           ...attachmentPayload,
           ...(forceQueued
-            ? { streamingBehavior: requestedDelivery === "steer" ? "steer" : "followUp" }
+            ? { streamingBehavior: effectiveDelivery === "steer" ? "steer" : "followUp" }
             : {}),
         });
         updateConversation(conversationId, (conversation) => commitPromptTransaction(conversation, prepared.transaction));
@@ -3032,6 +3143,11 @@ export function useAgentRuntime(options: {
   const runCommand = useCallback(
     async (type: string, fields: Record<string, unknown> = {}) => {
       if (!selectedConversation || !selectedProject) return;
+      if (type === "get_refinements") {
+        const token = activeSelection.current;
+        await refreshLocalRefinements(selectedConversation.id, token.generation);
+        return;
+      }
       if (type === "restart_agent") {
         if (!isNative()) throw new Error("Le redémarrage d’urgence est uniquement disponible dans l’application desktop.");
         const conversationId = selectedConversation.id;
@@ -3395,7 +3511,7 @@ export function useAgentRuntime(options: {
       }
       await sendRpc(selectedConversation.id, { id: uid(type), type, ...fields });
     },
-    [addActivity, awaitMaintenanceRefresh, cancelConversationRequests, cancelPersistentConversationRequests, detection?.mode, ensureProcessStarted, ensureStarted, isCurrentSelection, loadConversationHistory, onNotice, recentCompactionEnd, rejectGoalMutation, removeActivity, runGoalMutation, selectedConversation, selectedProject, sendConversationRequest, sendSelectionRequest, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation],
+    [addActivity, awaitMaintenanceRefresh, cancelConversationRequests, cancelPersistentConversationRequests, detection?.mode, ensureProcessStarted, ensureStarted, isCurrentSelection, loadConversationHistory, onNotice, recentCompactionEnd, refreshLocalRefinements, rejectGoalMutation, removeActivity, runGoalMutation, selectedConversation, selectedProject, sendConversationRequest, sendSelectionRequest, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation],
   );
 
   const observeSubagent = useCallback(async (activeSessionId?: string) => {
@@ -3566,6 +3682,8 @@ export function useAgentRuntime(options: {
     stats: runtime?.stats,
     sessionState: runtime?.state,
     goalMutation: runtime?.goalMutation,
+    refinements: runtime?.refinements,
+    harnessEntries: runtime?.harnessEntries,
     isCompacting: runtime?.isCompacting ?? runtime?.state?.isCompacting ?? false,
     isRefining: runtime?.isRefining ?? false,
     schedules: runtime?.schedules ?? [],
@@ -4616,7 +4734,7 @@ function stableToken(value: unknown): string {
   return (hash >>> 0).toString(36);
 }
 
-function rlmChildPresentation(child: Record<string, unknown> | undefined, status: string): {
+export function rlmChildPresentation(child: Record<string, unknown> | undefined, status: string): {
   title: string;
   detail?: string;
   status: ActivityItem["status"];
@@ -4632,7 +4750,11 @@ function rlmChildPresentation(child: Record<string, unknown> | undefined, status
       : activityKind === "waiting"
         ? "Attend une nouvelle étape"
         : undefined;
-  const primaryDetail = textValue(child?.error)
+  const parentManagedClosure = isParentManagedSubagentClosure({
+    status: status === "cancelled" ? "cancelled" : "running",
+    error: textValue(child?.error),
+  });
+  const primaryDetail = (parentManagedClosure ? undefined : textValue(child?.error))
     ?? textValue(child?.recap)
     ?? activityDetail
     ?? textValue(child?.answerPreview);
@@ -4650,6 +4772,7 @@ function rlmChildPresentation(child: Record<string, unknown> | undefined, status
 
   if (status === "done") return { title: `Sous-agent « ${label} » terminé`, detail, status: "success" };
   if (status === "error") return { title: `Échec du sous-agent « ${label} »`, detail, status: "error" };
+  if (parentManagedClosure) return { title: `Sous-agent « ${label} » fermé par l’agent principal`, detail, status: "info" };
   if (status === "cancelled") return { title: `Sous-agent « ${label} » annulé`, detail, status: "warning" };
   if (status === "queued") return { title: `Sous-agent « ${label} » en attente`, detail, status: "info" };
   return { title: `Sous-agent « ${label} » travaille`, detail, status: "running" };

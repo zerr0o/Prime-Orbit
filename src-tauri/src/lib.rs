@@ -2,6 +2,7 @@ mod agents;
 mod connections;
 mod exports;
 mod files;
+mod harness;
 mod install;
 #[cfg(windows)]
 mod node_compat;
@@ -9,8 +10,31 @@ mod paths;
 mod runtime;
 mod session_history;
 mod session_lease;
+mod spellcheck;
 mod storage;
 mod updater;
+#[cfg(windows)]
+mod webview_context_menu;
+#[cfg(not(windows))]
+mod webview_context_menu {
+    #[derive(Default)]
+    pub(crate) struct ContextMenuRegistry;
+
+    #[tauri::command]
+    pub(crate) async fn install_webview_context_menu() -> Result<(), String> {
+        Ok(())
+    }
+
+    #[tauri::command]
+    pub(crate) fn resolve_webview_context_menu(
+        _request_id: String,
+        _command_id: Option<i32>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    pub(crate) fn discard_window(_label: &str, _registry: &ContextMenuRegistry) {}
+}
 
 use agents::AgentsState;
 use exports::HtmlExportState;
@@ -69,6 +93,7 @@ pub fn run() {
         .manage(InstallState::default())
         .manage(PersistenceLock::default())
         .manage(UpdateManager::default())
+        .manage(webview_context_menu::ContextMenuRegistry::default())
         .invoke_handler(tauri::generate_handler![
             runtime::detect_prime_agent,
             runtime::diagnose_prerequisites,
@@ -102,16 +127,22 @@ pub fn run() {
             files::open_project_folder,
             files::open_git_file_folder,
             files::open_conversation_path,
+            harness::open_harness_state,
+            harness::open_refinement_journal,
+            harness::delete_harness_entry,
             connections::inspect_prime_agent_connections,
             connections::inspect_prime_agent_defaults,
             connections::save_prime_agent_defaults,
             connections::check_ollama_health,
+            spellcheck::get_spelling_suggestions,
             connections::save_mcp_server,
             connections::delete_mcp_server,
             updater::get_app_update_state,
             updater::check_for_app_updates,
             updater::download_app_update,
             updater::install_app_update,
+            webview_context_menu::install_webview_context_menu,
+            webview_context_menu::resolve_webview_context_menu,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Prime Orbit");
@@ -128,6 +159,8 @@ pub fn run() {
             event: tauri::WindowEvent::Destroyed,
             ..
         } => {
+            let context_menus = app.state::<webview_context_menu::ContextMenuRegistry>();
+            webview_context_menu::discard_window(&label, context_menus.inner());
             // Window destruction can happen without React getting an unmount
             // callback. Release its process leases away from the UI thread;
             // active agents are retained until their agent_end boundary.
