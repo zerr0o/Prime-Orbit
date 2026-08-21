@@ -243,6 +243,16 @@ export function useWorkspace() {
     saveTimer.current = window.setTimeout(() => void persistLatestState(), 0);
   }, [persistLatestState]);
 
+  const flushWorkspaceState = useCallback(async () => {
+    window.clearTimeout(saveTimer.current);
+    for (let attempt = 0; saveInFlight.current && attempt < 200; attempt += 1) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 10));
+    }
+    if (saveInFlight.current) return false;
+    await persistLatestState();
+    return statesEqual(durableState(stateRef.current), baseSnapshot.current.state);
+  }, [persistLatestState]);
+
   useEffect(() => {
     if (!loaded) return;
     const currentDurableState = durableState(state);
@@ -645,6 +655,7 @@ export function useWorkspace() {
     loaded,
     workspaceSaveError,
     retryWorkspaceSave,
+    flushWorkspaceState,
     selectedProject,
     selectedConversation,
     projectConversations,

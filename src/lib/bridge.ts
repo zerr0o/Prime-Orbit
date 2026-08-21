@@ -30,6 +30,21 @@ import packageMetadata from "../../package.json";
 
 export const isNative = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+export async function hideCurrentWindowToTray(): Promise<void> {
+  if (!isNative()) return;
+  await invoke("hide_window_to_tray");
+}
+
+export async function quitPrimeOrbit(): Promise<void> {
+  if (!isNative()) return;
+  await invoke("quit_prime_orbit");
+}
+
+export async function setTrayLanguage(language: "fr" | "en"): Promise<void> {
+  if (!isNative()) return;
+  await invoke("set_tray_language", { language });
+}
+
 interface NativeDetection {
   found: boolean;
   runtimeKind?: "executable" | "source";

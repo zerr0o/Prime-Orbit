@@ -1,5 +1,6 @@
 mod agents;
 mod connections;
+mod desktop;
 mod exports;
 mod files;
 mod harness;
@@ -87,6 +88,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .setup(desktop::setup_tray)
         .manage(AgentsState::default())
         .manage(AttachmentCache::default())
         .manage(HtmlExportState::default())
@@ -143,6 +145,9 @@ pub fn run() {
             updater::install_app_update,
             webview_context_menu::install_webview_context_menu,
             webview_context_menu::resolve_webview_context_menu,
+            desktop::hide_window_to_tray,
+            desktop::quit_prime_orbit,
+            desktop::set_tray_language,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Prime Orbit");

@@ -269,6 +269,8 @@ export interface Preferences {
   theme: ThemeMode;
   language: "fr" | "en";
   restoreLastWorkspace: boolean;
+  askBeforeClose: boolean;
+  closeAction: "minimize" | "quit";
   automaticUpdateChecks: boolean;
   compactSidebar: boolean;
   inspectorOpen: boolean;

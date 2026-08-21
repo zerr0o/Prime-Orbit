@@ -158,6 +158,17 @@ function findNode(node, predicate) {
   return undefined;
 }
 
+test("a modal can preserve the source item's icon in its accessible heading", () => {
+  hooks.beginRender();
+  const tree = Modal({ title: "Project memory", description: "Memory · session", icon: "memory-icon", onClose() {}, children: null });
+  const dialogNode = findNode(tree, (node) => node.type === "section" && node.props?.role === "dialog");
+  const iconNode = findNode(tree, (node) => node.type === "span" && node.props?.className === "modal-heading-icon");
+  assert.ok(dialogNode?.props["aria-labelledby"]);
+  assert.ok(dialogNode?.props["aria-describedby"]);
+  assert.equal(iconNode?.props.children, "memory-icon");
+  assert.equal(iconNode?.props["aria-hidden"], "true");
+});
+
 test("a periodic parent rerender does not steal focus from a rename field", () => {
   const originalHTMLElement = globalThis.HTMLElement;
   const originalDocument = globalThis.document;

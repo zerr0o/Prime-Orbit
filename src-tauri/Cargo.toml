@@ -1,6 +1,6 @@
 [package]
 name = "prime-orbit"
-version = "0.1.19"
+version = "0.1.20"
 description = "Prime Orbit desktop client for Prime Agent"
 authors = ["Prime Orbit contributors"]
 edition = "2021"
@@ -23,7 +23,7 @@ parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tauri = { version = "=2.11.5", features = [] }
+tauri = { version = "=2.11.5", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"

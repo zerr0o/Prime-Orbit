@@ -27,7 +27,7 @@ export function Switch({ checked, onChange, label }: { checked: boolean; onChang
   );
 }
 
-export function Modal({ title, description, children, onClose, width = "560px", footer }: PropsWithChildren<{ title: string; description?: string; onClose: () => void; width?: string; footer?: ReactNode }>) {
+export function Modal({ title, description, icon, children, onClose, width = "560px", footer, className = "", bodyClassName = "" }: PropsWithChildren<{ title: string; description?: ReactNode; icon?: ReactNode; onClose: () => void; width?: string; footer?: ReactNode; className?: string; bodyClassName?: string }>) {
   const { t } = useI18n();
   const dialogRef = useRef<HTMLElement>(null);
   const onCloseRef = useRef(onClose);
@@ -88,15 +88,18 @@ export function Modal({ title, description, children, onClose, width = "560px", 
   }, []);
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section ref={dialogRef} className="modal-card" role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={description ? descriptionId : undefined} tabIndex={-1} style={{ maxWidth: width }}>
+      <section ref={dialogRef} className={`modal-card ${className}`.trim()} role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={description ? descriptionId : undefined} tabIndex={-1} style={{ maxWidth: width }}>
         <header className="modal-header">
-          <div>
-            <h2 id={titleId}>{title}</h2>
-            {description ? <p id={descriptionId}>{description}</p> : null}
+          <div className="modal-heading">
+            {icon ? <span className="modal-heading-icon" aria-hidden="true">{icon}</span> : null}
+            <div>
+              <h2 id={titleId}>{title}</h2>
+              {description ? <p id={descriptionId}>{description}</p> : null}
+            </div>
           </div>
           <IconButton label={t("common.close")} onClick={onClose}><X size={18} /></IconButton>
         </header>
-        <div className="modal-body">{children}</div>
+        <div className={`modal-body ${bodyClassName}`.trim()}>{children}</div>
         {footer ? <footer className="modal-footer">{footer}</footer> : null}
       </section>
     </div>

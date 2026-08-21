@@ -6,7 +6,9 @@ import {
   Activity,
   ArchiveRestore,
   CalendarClock,
+  ArrowLeft,
   ArrowDown,
+  ArrowRight,
   ArrowUp,
   Box,
   Bot,
@@ -2542,6 +2544,34 @@ function refinementTargetScope(target: RefinementMenuTarget) {
   return target.type === "entry" ? target.entry.scope : target.record.scope;
 }
 
+export function refinementReaderAdjacentIndex(currentIndex: number, direction: -1 | 1, itemCount: number) {
+  if (itemCount <= 0 || currentIndex < 0) return -1;
+  return Math.max(0, Math.min(itemCount - 1, currentIndex + direction));
+}
+
+export function refinementReaderCopyText(target: RefinementMenuTarget, language: AppLanguage) {
+  if (target.type === "entry") {
+    const title = target.entry.title?.trim() || target.entry.id;
+    return [title, target.entry.content?.trim()].filter(Boolean).join("\n\n");
+  }
+  const record = target.record;
+  const sections = [record.summary?.trim() || bi(language, "Raffinement sans résumé", "Refinement without summary")];
+  if (record.rationale?.trim()) sections.push(`${bi(language, "Raison", "Rationale")}\n${record.rationale.trim()}`);
+  if (record.expectedOutcome?.trim()) sections.push(`${bi(language, "Résultat attendu", "Expected outcome")}\n${record.expectedOutcome.trim()}`);
+  if (record.appliedEdits.length) {
+    sections.push([
+      bi(language, "Modifications", "Changes"),
+      ...record.appliedEdits.map((edit) => {
+        const status = edit.applied ? refinementActionLabel(edit.action, language) : bi(language, "Échec", "Failed");
+        const heading = `- ${status} · ${refinementKindLabel(edit.kind, language)} · ${edit.title?.trim() || edit.id}`;
+        const details = [edit.content?.trim(), !edit.applied ? edit.error?.trim() : undefined].filter(Boolean);
+        return details.length ? `${heading}\n  ${details.join("\n  ")}` : heading;
+      }),
+    ].join("\n"));
+  }
+  return sections.join("\n\n");
+}
+
 function RefinementMonitor({ projectPath, conversation, isRefining, refinements, harnessEntries, onRunCommand }: { projectPath: string; conversation: Conversation; isRefining: boolean; refinements?: SessionRefinementRecord[]; harnessEntries?: SessionHarnessEntry[]; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void> }) {
   const { language, locale } = useI18n();
   const [requesting, setRequesting] = useState(false);
@@ -2553,6 +2583,8 @@ function RefinementMonitor({ projectPath, conversation, isRefining, refinements,
   const [pendingConfirmation, setPendingConfirmation] = useState<RefinementConfirmation>();
   const [confirmationText, setConfirmationText] = useState("");
   const [mutationBusy, setMutationBusy] = useState(false);
+  const [readerTargetKey, setReaderTargetKey] = useState<string>();
+  const [readerCopied, setReaderCopied] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const refreshHistory = useLatestCallback(onRunCommand);
   const localHistory = refinementHistory(conversation.activities)
@@ -2560,10 +2592,50 @@ function RefinementMonitor({ projectPath, conversation, isRefining, refinements,
   const persistedHistory = persistedRefinementHistory(refinements ?? []);
   const knownEntries = harnessEntries ?? [];
   const shownEntries = knownEntries.slice(0, visibleEntries);
+  const readerTargets = useMemo<RefinementMenuTarget[]>(() => [
+    ...knownEntries.map((entry) => ({ type: "entry", entry }) as const),
+    ...persistedHistory.map((record) => ({ type: "refinement", record }) as const),
+  ], [knownEntries, persistedHistory]);
+  const activeReaderTarget = readerTargetKey
+    ? readerTargets.find((target) => refinementTargetKey(target) === readerTargetKey)
+    : undefined;
+  const readerIndex = activeReaderTarget
+    ? readerTargets.findIndex((target) => refinementTargetKey(target) === readerTargetKey)
+    : -1;
   const conversationBusy = isConversationMaintenanceBlocked(conversation.status);
   const refineBusy = requesting || isRefining;
   const sectionBusy = refineBusy || mutationBusy;
   const mutationDisabled = refineBusy || mutationBusy || conversationBusy;
+
+  useEffect(() => {
+    setReaderTargetKey(undefined);
+    setReaderCopied(false);
+  }, [conversation.id]);
+
+  useEffect(() => {
+    setReaderCopied(false);
+  }, [readerTargetKey]);
+
+  useEffect(() => {
+    if (!readerCopied) return;
+    const timeout = window.setTimeout(() => setReaderCopied(false), 1800);
+    return () => window.clearTimeout(timeout);
+  }, [readerCopied]);
+
+  useEffect(() => {
+    if (!activeReaderTarget) return;
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      const element = event.target instanceof HTMLElement ? event.target : undefined;
+      if (element?.matches("input, textarea, select, [contenteditable='true']")) return;
+      const nextIndex = refinementReaderAdjacentIndex(readerIndex, event.key === "ArrowLeft" ? -1 : 1, readerTargets.length);
+      if (nextIndex < 0 || nextIndex === readerIndex) return;
+      event.preventDefault();
+      setReaderTargetKey(refinementTargetKey(readerTargets[nextIndex]));
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [activeReaderTarget, readerIndex, readerTargets]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2628,7 +2700,7 @@ function RefinementMonitor({ projectPath, conversation, isRefining, refinements,
   const openContextMenuFromCard = (event: ReactMouseEvent<HTMLElement>, target: RefinementMenuTarget) => {
     event.preventDefault();
     event.stopPropagation();
-    const trigger = event.currentTarget.querySelector<HTMLElement>("summary") ?? event.currentTarget;
+    const trigger = event.currentTarget.querySelector<HTMLElement>(".refinement-reader-trigger") ?? event.currentTarget;
     openContextMenu(target, event.clientX, event.clientY, trigger);
   };
 
@@ -2643,6 +2715,40 @@ function RefinementMonitor({ projectPath, conversation, isRefining, refinements,
     const trigger = contextMenu?.trigger;
     setContextMenu(undefined);
     if (restoreFocus && trigger) requestAnimationFrame(() => trigger.isConnected && trigger.focus({ preventScroll: true }));
+  };
+
+  const openReader = (target: RefinementMenuTarget) => {
+    closeContextMenu();
+    setError(undefined);
+    setReaderTargetKey(refinementTargetKey(target));
+  };
+
+  const navigateReader = (direction: -1 | 1) => {
+    const nextIndex = refinementReaderAdjacentIndex(readerIndex, direction, readerTargets.length);
+    if (nextIndex < 0 || nextIndex === readerIndex) return;
+    setReaderTargetKey(refinementTargetKey(readerTargets[nextIndex]));
+  };
+
+  const copyReaderContent = async () => {
+    if (!activeReaderTarget) return;
+    setError(undefined);
+    try {
+      await navigator.clipboard.writeText(refinementReaderCopyText(activeReaderTarget, language));
+      setReaderCopied(true);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const openReaderLink = async (href: string) => {
+    const target = classifyConversationLink(href);
+    if (target.kind !== "external") return;
+    setError(undefined);
+    try {
+      await openUrl(target.url);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
   };
 
   const runOpenAction = async (target: RefinementMenuTarget, destination: "file" | "folder") => {
@@ -2672,6 +2778,7 @@ function RefinementMonitor({ projectPath, conversation, isRefining, refinements,
 
   const askForConfirmation = (confirmation: RefinementConfirmation) => {
     closeContextMenu();
+    setReaderTargetKey(undefined);
     setError(undefined);
     setConfirmationText("");
     setPendingConfirmation(confirmation);
@@ -2742,6 +2849,8 @@ function RefinementMonitor({ projectPath, conversation, isRefining, refinements,
     : !conversation.sessionId
       ? bi(language, "L’identifiant vérifiable de cette session est absent.", "This session's verifiable identifier is missing.")
       : bi(language, "La portée de cet élément n’est pas connue : Prime Orbit refuse de cibler un fichier au hasard.", "This item's scope is unknown, so Prime Orbit will not guess which file to target.");
+  const readerScope = activeReaderTarget ? refinementTargetScope(activeReaderTarget) : undefined;
+  const readerTargetUnavailable = !conversation.sessionPath || !conversation.sessionId || (readerScope !== "local" && readerScope !== "global");
   const confirmationIsGlobal = pendingConfirmation?.type === "delete-entry"
     ? pendingConfirmation.entry.scope === "global"
     : pendingConfirmation?.record.scope === "global";
@@ -2749,6 +2858,19 @@ function RefinementMonitor({ projectPath, conversation, isRefining, refinements,
     ? harnessConfirmationPhrase(pendingConfirmation.entry)
     : confirmationIsGlobal ? pendingConfirmation?.record.id ?? "" : "";
   const confirmationValid = !requiredConfirmation || confirmationText === requiredConfirmation;
+  const readerTitle = activeReaderTarget?.type === "entry"
+    ? activeReaderTarget.entry.title ?? activeReaderTarget.entry.id
+    : activeReaderTarget?.record.summary ?? bi(language, "Raffinement sans résumé", "Refinement without summary");
+  const readerScopeLabel = readerScope === "global"
+    ? bi(language, "globale", "global")
+    : readerScope === "local" ? bi(language, "session", "session") : bi(language, "portée non signalée", "scope not reported");
+  const readerTypeLabel = activeReaderTarget?.type === "entry"
+    ? refinementKindLabel(activeReaderTarget.entry.kind, language)
+    : bi(language, "Raffinement", "Refinement");
+  const readerTimestamp = activeReaderTarget?.type === "entry"
+    ? safeRefinementTime(activeReaderTarget.entry.updatedAt, locale)
+    : activeReaderTarget ? safeRefinementTime(activeReaderTarget.record.timestamp, locale) : "—";
+  const readerDescription = activeReaderTarget ? <span className="harness-reader-header-meta"><span>{readerTypeLabel}</span><span>{readerScopeLabel}</span><span>{activeReaderTarget.type === "entry" ? bi(language, "Mis à jour", "Updated") : bi(language, "Créé", "Created")} {readerTimestamp}</span></span> : undefined;
 
   const handleMenuKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
@@ -2772,7 +2894,7 @@ function RefinementMonitor({ projectPath, conversation, isRefining, refinements,
       {loadingHistory && refinements === undefined ? <p className="refinement-empty" role="status"><LoaderCircle size={15} className="spin" />{bi(language, "Lecture du harness persistant…", "Reading persistent harness…")}</p> : shownEntries.length ? <div className="harness-entry-list">{shownEntries.map((entry) => {
         const target: RefinementMenuTarget = { type: "entry", entry };
         const active = contextTarget ? refinementTargetKey(contextTarget) === refinementTargetKey(target) : false;
-        return <div className="harness-entry" key={entry.key} onContextMenu={(event) => openContextMenuFromCard(event, target)}><details><summary><span className={`harness-kind is-${entry.kind}`}>{refinementKindIcon(entry.kind)}</span><span><strong>{entry.title ?? entry.id}</strong><small>{refinementKindLabel(entry.kind, language)} · {entry.scope === "global" ? bi(language, "globale", "global") : entry.scope === "local" ? bi(language, "session", "session") : bi(language, "portée non signalée", "scope not reported")}</small></span><ChevronRight size={14} /></summary><div className="harness-entry-details">{entry.content ? <p>{entry.content}</p> : <p className="is-muted">{bi(language, "Prime Agent n’a pas inclus de contenu public pour cette entrée.", "Prime Agent did not include public content for this entry.")}</p>}<small>{bi(language, "Dernière mise à jour", "Last updated")} · {safeRefinementTime(entry.updatedAt, locale)}</small></div></details><IconButton className="refinement-overflow" label={bi(language, `Actions pour ${entry.title ?? entry.id}`, `Actions for ${entry.title ?? entry.id}`)} aria-haspopup="menu" aria-expanded={active} onClick={(event) => openContextMenuFromButton(event, target)}><MoreHorizontal size={14} /></IconButton></div>;
+        return <div className="harness-entry" key={entry.key} onContextMenu={(event) => openContextMenuFromCard(event, target)}><button type="button" className="refinement-reader-trigger" aria-haspopup="dialog" onClick={() => openReader(target)}><span className={`harness-kind is-${entry.kind}`}>{refinementKindIcon(entry.kind)}</span><span><strong>{entry.title ?? entry.id}</strong><small>{refinementKindLabel(entry.kind, language)} · {entry.scope === "global" ? bi(language, "globale", "global") : entry.scope === "local" ? bi(language, "session", "session") : bi(language, "portée non signalée", "scope not reported")}</small></span><ChevronRight size={14} /></button><IconButton className="refinement-overflow" label={bi(language, `Actions pour ${entry.title ?? entry.id}`, `Actions for ${entry.title ?? entry.id}`)} aria-haspopup="menu" aria-expanded={active} onClick={(event) => openContextMenuFromButton(event, target)}><MoreHorizontal size={14} /></IconButton></div>;
       })}</div> : <p className="refinement-empty"><Brain size={15} />{bi(language, "Aucune entrée active n’a été trouvée dans le harness local ou global.", "No active entry was found in the local or global harness.")}</p>}
       {visibleEntries < knownEntries.length ? <Button variant="ghost" className="full-button refinement-show-more" onClick={() => setVisibleEntries((value) => Math.min(value + 12, knownEntries.length))}>{bi(language, `Afficher ${Math.min(12, knownEntries.length - visibleEntries)} entrées de plus`, `Show ${Math.min(12, knownEntries.length - visibleEntries)} more entries`)}</Button> : null}
       <div className="refinement-subsection-title"><span>{bi(language, "Historique des raffinements", "Refinement history")}</span><small>{refinements?.length ?? 0}</small></div>
@@ -2781,7 +2903,7 @@ function RefinementMonitor({ projectPath, conversation, isRefining, refinements,
         const scope = record.scope === "global" ? bi(language, "globale", "global") : record.scope === "local" ? bi(language, "session", "session") : bi(language, "portée non signalée", "scope not reported");
         const target: RefinementMenuTarget = { type: "refinement", record };
         const active = contextTarget ? refinementTargetKey(contextTarget) === refinementTargetKey(target) : false;
-        return <div className="persisted-refinement" key={record.id} onContextMenu={(event) => openContextMenuFromCard(event, target)}><details><summary><span className="refinement-history-icon"><WandSparkles size={14} /></span><span><strong>{record.summary ?? bi(language, "Raffinement sans résumé", "Refinement without summary")}</strong><small>{applied.length} {applied.length === 1 ? bi(language, "modification appliquée", "applied edit") : bi(language, "modifications appliquées", "applied edits")} · {scope}</small></span><time dateTime={record.timestamp}>{safeRefinementTime(record.timestamp, locale)}</time></summary><div className="persisted-refinement-details">{record.rationale ? <p>{record.rationale}</p> : null}{record.expectedOutcome ? <p><strong>{bi(language, "Résultat attendu :", "Expected outcome:")}</strong> {record.expectedOutcome}</p> : null}<ul>{record.appliedEdits.map((edit, index) => <li className={edit.applied ? "" : "is-error"} key={`${record.id}:${edit.kind}:${edit.id}:${index}`}><span>{refinementActionLabel(edit.action, language)}</span><strong>{refinementKindLabel(edit.kind, language)} · {edit.title ?? edit.id}</strong>{!edit.applied && edit.error ? <small>{edit.error}</small> : null}</li>)}</ul></div></details><IconButton className="refinement-overflow" label={bi(language, "Actions pour ce raffinement", "Actions for this refinement")} aria-haspopup="menu" aria-expanded={active} onClick={(event) => openContextMenuFromButton(event, target)}><MoreHorizontal size={14} /></IconButton></div>;
+        return <div className="persisted-refinement" key={record.id} onContextMenu={(event) => openContextMenuFromCard(event, target)}><button type="button" className="refinement-reader-trigger" aria-haspopup="dialog" onClick={() => openReader(target)}><span className="refinement-history-icon"><WandSparkles size={14} /></span><span><strong>{record.summary ?? bi(language, "Raffinement sans résumé", "Refinement without summary")}</strong><small>{applied.length} {applied.length === 1 ? bi(language, "modification appliquée", "applied edit") : bi(language, "modifications appliquées", "applied edits")} · {scope}</small></span><span className="refinement-reader-meta"><time dateTime={record.timestamp}>{safeRefinementTime(record.timestamp, locale)}</time><ChevronRight size={14} /></span></button><IconButton className="refinement-overflow" label={bi(language, "Actions pour ce raffinement", "Actions for this refinement")} aria-haspopup="menu" aria-expanded={active} onClick={(event) => openContextMenuFromButton(event, target)}><MoreHorizontal size={14} /></IconButton></div>;
       })}</div> : !loadingHistory ? <p className="refinement-empty"><WandSparkles size={15} />{bi(language, "Aucun raffinement persisté dans cette session.", "No refinement is persisted in this session.")}</p> : null}
       {localHistory.length ? <div className="refinement-history local-refinement-history">{localHistory.map((activity) => <div className={`refinement-history-row is-${activity.status}`} key={activity.id}><span className="refinement-history-icon">{activity.status === "error" ? <CircleAlert size={14} /> : activity.status === "running" ? <LoaderCircle size={14} className="spin" /> : <WandSparkles size={14} />}</span><span><strong>{title(activity)}</strong><small>{activity.detail ?? bi(language, "Aucun détail supplémentaire fourni par Prime Agent.", "Prime Agent provided no additional detail.")}</small></span><time dateTime={activity.updatedAt ?? activity.createdAt}>{formatTime(activity.updatedAt ?? activity.createdAt, locale)}</time></div>)}</div> : null}
       <Button variant="ghost" className="full-button" loading={refineBusy} disabled={sectionBusy || conversationBusy || !SESSION_MEMORY_CAPABILITIES.canRequestRefinement} title={conversationBusy ? bi(language, "Attendez la fin du tour actif avant de lancer un raffinement.", "Wait for the active turn to finish before starting refinement.") : undefined} onClick={() => void requestRefinement()}>{refineBusy ? null : <WandSparkles size={14} />}{bi(language, "Lancer un raffinement", "Run refinement")}</Button>
@@ -2795,6 +2917,45 @@ function RefinementMonitor({ projectPath, conversation, isRefining, refinements,
         <button className="app-context-item is-danger" type="button" role="menuitem" disabled={targetUnavailable || mutationDisabled} title={targetUnavailable ? unavailableReason : mutationDisabled ? bi(language, "Attendez la fin de l’opération active.", "Wait for the active operation to finish.") : undefined} onClick={() => askForConfirmation(contextTarget.type === "entry" ? { type: "delete-entry", entry: contextTarget.entry } : { type: "rollback-refinement", record: contextTarget.record })}>{contextTarget.type === "entry" ? <Trash2 size={14} /> : <Undo2 size={14} />}<span>{contextTarget.type === "entry" ? bi(language, "Supprimer…", "Delete…") : bi(language, "Annuler ce raffinement…", "Roll back this refinement…")}</span></button>
         {targetUnavailable ? <p className="refinement-context-note">{unavailableReason}</p> : null}
       </div> : null}
+
+      {activeReaderTarget ? <Modal
+        title={readerTitle}
+        description={readerDescription}
+        icon={activeReaderTarget.type === "entry" ? <span className={`harness-kind is-${activeReaderTarget.entry.kind}`}>{refinementKindIcon(activeReaderTarget.entry.kind)}</span> : <span className="refinement-history-icon"><WandSparkles size={14} /></span>}
+        width="960px"
+        className={`harness-reader-modal ${activeReaderTarget.type === "entry" ? `is-${activeReaderTarget.entry.kind}` : "is-refinement"}`}
+        bodyClassName="harness-reader-modal-body"
+        onClose={() => setReaderTargetKey(undefined)}
+      >
+        <div className="harness-reader">
+          <div className="harness-reader-toolbar">
+            <div className="harness-reader-navigation" aria-label={bi(language, "Navigation entre les éléments", "Navigate between items")}>
+              <IconButton label={bi(language, "Élément précédent", "Previous item")} disabled={readerIndex <= 0} onClick={() => navigateReader(-1)}><ArrowLeft size={15} /></IconButton>
+              <span>{readerIndex + 1} / {readerTargets.length}</span>
+              <IconButton label={bi(language, "Élément suivant", "Next item")} disabled={readerIndex >= readerTargets.length - 1} onClick={() => navigateReader(1)}><ArrowRight size={15} /></IconButton>
+            </div>
+            <div className="harness-reader-actions">
+              <Button variant="ghost" onClick={() => void copyReaderContent()}>{readerCopied ? <Check size={14} /> : <Copy size={14} />}{readerCopied ? bi(language, "Copié", "Copied") : bi(language, "Copier", "Copy")}</Button>
+              <Button variant="ghost" disabled={readerTargetUnavailable} title={readerTargetUnavailable ? unavailableReason : undefined} onClick={() => void runOpenAction(activeReaderTarget, "file")}><FileText size={14} />{activeReaderTarget.type === "entry" ? bi(language, "Ouvrir le fichier", "Open file") : bi(language, "Ouvrir le journal", "Open journal")}</Button>
+              <Button variant="ghost" disabled={readerTargetUnavailable} title={readerTargetUnavailable ? unavailableReason : undefined} onClick={() => void runOpenAction(activeReaderTarget, "folder")}><FolderOpen size={14} />{bi(language, "Ouvrir le dossier", "Open folder")}</Button>
+            </div>
+          </div>
+          <div className="harness-reader-scroll">
+            {activeReaderTarget.type === "entry" ? <article className="assistant-message-body harness-reader-document">
+              {activeReaderTarget.entry.content ? <ConversationMarkdown content={activeReaderTarget.entry.content} onOpenLink={openReaderLink} /> : <p className="harness-reader-empty"><Brain size={18} />{bi(language, "Prime Agent n’a pas inclus de contenu public pour cette entrée.", "Prime Agent did not include public content for this entry.")}</p>}
+            </article> : <article className="harness-reader-document harness-refinement-document">
+              {activeReaderTarget.record.rationale ? <section><h3>{bi(language, "Pourquoi ce raffinement", "Why this refinement")}</h3><div className="assistant-message-body"><ConversationMarkdown content={activeReaderTarget.record.rationale} onOpenLink={openReaderLink} /></div></section> : null}
+              {activeReaderTarget.record.expectedOutcome ? <section><h3>{bi(language, "Résultat attendu", "Expected outcome")}</h3><div className="assistant-message-body"><ConversationMarkdown content={activeReaderTarget.record.expectedOutcome} onOpenLink={openReaderLink} /></div></section> : null}
+              <section><h3>{bi(language, "Modifications appliquées", "Applied changes")}</h3>{activeReaderTarget.record.appliedEdits.length ? <ol className="harness-reader-edit-list">{activeReaderTarget.record.appliedEdits.map((edit, index) => <li className={edit.applied ? "" : "is-error"} key={`${activeReaderTarget.record.id}:${edit.kind}:${edit.id}:${index}`}><header><Badge tone={!edit.applied || edit.action === "delete" ? "danger" : edit.action === "create" ? "success" : "accent"}>{edit.applied ? refinementActionLabel(edit.action, language) : bi(language, "Échec", "Failed")}</Badge><span><strong>{edit.title ?? edit.id}</strong><small>{refinementKindLabel(edit.kind, language)}</small></span></header>{edit.content ? <div className="assistant-message-body"><ConversationMarkdown content={edit.content} onOpenLink={openReaderLink} /></div> : null}{!edit.applied && edit.error ? <p className="harness-reader-edit-error"><CircleAlert size={14} />{edit.error}</p> : null}</li>)}</ol> : <p className="harness-reader-empty"><Info size={18} />{bi(language, "Aucune modification publique n’est associée à ce raffinement.", "No public change is associated with this refinement.")}</p>}</section>
+            </article>}
+            {error ? <p className="trust-note harness-reader-error" role="alert"><CircleAlert size={14} />{error}</p> : null}
+          </div>
+          <div className="harness-reader-footer">
+            <p><Info size={14} />{bi(language, "Seuls les champs publics fournis par Prime Agent sont affichés.", "Only public fields supplied by Prime Agent are shown.")}</p>
+            <Button variant="ghost" className="harness-reader-destructive" disabled={readerTargetUnavailable || mutationDisabled} title={readerTargetUnavailable ? unavailableReason : mutationDisabled ? bi(language, "Attendez la fin de l’opération active.", "Wait for the active operation to finish.") : undefined} onClick={() => askForConfirmation(activeReaderTarget.type === "entry" ? { type: "delete-entry", entry: activeReaderTarget.entry } : { type: "rollback-refinement", record: activeReaderTarget.record })}>{activeReaderTarget.type === "entry" ? <Trash2 size={14} /> : <Undo2 size={14} />}{activeReaderTarget.type === "entry" ? bi(language, "Supprimer…", "Delete…") : bi(language, "Annuler ce raffinement…", "Roll back this refinement…")}</Button>
+          </div>
+        </div>
+      </Modal> : null}
 
       {pendingConfirmation ? <Modal
         title={pendingConfirmation.type === "delete-entry" ? bi(language, "Supprimer cette entrée ?", "Delete this entry?") : bi(language, "Annuler ce raffinement ?", "Roll back this refinement?")}

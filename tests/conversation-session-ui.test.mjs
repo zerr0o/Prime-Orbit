@@ -35,6 +35,8 @@ const {
   isGoalPanelBusy,
   isRefineControlBusy,
   normalizeLegacyActivity,
+  refinementReaderAdjacentIndex,
+  refinementReaderCopyText,
 } = compiledModule.exports;
 
 test("clamps memory and refinement menus inside the visible desktop viewport", () => {
@@ -47,6 +49,50 @@ test("requires an explicit stable phrase only for destructive global harness cha
   assert.equal(harnessConfirmationPhrase({ id: "global-note", title: "Shared decision", scope: "global" }), "Shared decision");
   assert.equal(harnessConfirmationPhrase({ id: "global-note", title: "x".repeat(81), scope: "global" }), "global-note");
   assert.equal(harnessConfirmationPhrase({ id: "unknown-note", title: "Unknown", scope: "unknown" }), "");
+});
+
+test("navigates the memory reader without wrapping past the available inventory", () => {
+  assert.equal(refinementReaderAdjacentIndex(2, -1, 5), 1);
+  assert.equal(refinementReaderAdjacentIndex(2, 1, 5), 3);
+  assert.equal(refinementReaderAdjacentIndex(0, -1, 5), 0);
+  assert.equal(refinementReaderAdjacentIndex(4, 1, 5), 4);
+  assert.equal(refinementReaderAdjacentIndex(-1, 1, 5), -1);
+  assert.equal(refinementReaderAdjacentIndex(0, 1, 0), -1);
+});
+
+test("copies only the public memory and refinement fields shown in the reader", () => {
+  const memory = refinementReaderCopyText({
+    type: "entry",
+    entry: {
+      key: "private-storage-key",
+      id: "memory-1",
+      kind: "memory",
+      scope: "local",
+      title: "Project conventions",
+      content: "Use the shared release pipeline.",
+      refinementId: "private-refinement-id",
+      updatedAt: "2026-08-21T12:00:00.000Z",
+    },
+  }, "en");
+  assert.equal(memory, "Project conventions\n\nUse the shared release pipeline.");
+  assert.doesNotMatch(memory, /private-storage-key|private-refinement-id/);
+
+  const refinement = refinementReaderCopyText({
+    type: "refinement",
+    record: {
+      id: "private-journal-id",
+      timestamp: "2026-08-21T12:00:00.000Z",
+      summary: "Keep releases reproducible",
+      rationale: "The installer must be verifiable.",
+      expectedOutcome: "Every artifact has a checksum.",
+      scope: "local",
+      appliedEdits: [{ action: "update", kind: "memory", id: "release-pipeline", title: "Release pipeline", content: "Record SHA-256.", applied: true }],
+    },
+  }, "en");
+  assert.match(refinement, /Rationale\nThe installer must be verifiable\./);
+  assert.match(refinement, /Expected outcome\nEvery artifact has a checksum\./);
+  assert.match(refinement, /Updated · Memory · Release pipeline/);
+  assert.doesNotMatch(refinement, /private-journal-id/);
 });
 
 test("connection startup is not presented to the composer as an active turn", () => {

@@ -4,6 +4,26 @@ All notable changes to Prime Orbit are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.20] - 2026-08-22
+
+### Desktop tray and closing
+
+- Added a native Windows tray menu that can reopen Prime Orbit or quit it explicitly while conversations remain available in the background.
+- Replaced ambiguous window closing with an integrated **Minimize** or **Quit** choice, including a **Don't ask again** preference and a matching control in **Settings > General**.
+- Kept the close dialog focused and visually consistent with the rest of the application, with the two destination cards acting as the only action buttons.
+- Flushed the latest workspace state before a remembered quit and synchronized native tray labels with the selected application language.
+
+### Memory and refinement reader
+
+- Opened memory and refinement cards in a dedicated large reader with rendered Markdown, bounded public metadata, and the same type-specific icon used in the Session list.
+- Added comfortable reading width, clearer hierarchy, compact metadata badges, previous and next navigation, and keyboard shortcuts without exposing private runtime fields.
+- Added safe copy, open-file, reveal-folder, delete, and rollback actions while retaining the existing integrated confirmation flows for destructive operations.
+
+### Validation
+
+- Added frontend coverage for native close decisions, remembered preferences, tray localization, memory and refinement navigation, safe copying, contextual file actions, and destructive confirmations.
+- Revalidated the production frontend build, complete frontend and Rust test suites, formatting, strict Clippy, Rust 1.88 compatibility, and signed Windows release gates.
+
 ## [0.1.19] - 2026-08-21
 
 ### Session memory and controls
@@ -275,6 +295,7 @@ All notable changes to Prime Orbit are documented in this file.
 - TypeScript build and checks.
 - Strict Rust Clippy validation with warnings denied.
 
+[0.1.20]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.20
 [0.1.19]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.19
 [0.1.18]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.18
 [0.1.17]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.17

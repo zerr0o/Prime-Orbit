@@ -25,6 +25,8 @@ export const defaultAppState: PersistedAppState = {
     theme: "dark",
     language: "fr",
     restoreLastWorkspace: false,
+    askBeforeClose: true,
+    closeAction: "minimize",
     automaticUpdateChecks: true,
     compactSidebar: false,
     inspectorOpen: true,

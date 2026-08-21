@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Activity,
   Archive,
@@ -11,11 +12,14 @@ import {
   FileText,
   FolderOpen,
   Keyboard,
+  LoaderCircle,
   Maximize2,
   MessageSquarePlus,
+  Minimize2,
   PackageCheck,
   PanelBottomClose,
   PanelBottomOpen,
+  Power,
   Search,
   Settings,
   Sparkles,
@@ -41,6 +45,7 @@ import {
   createWorkspaceWindow,
   checkOllamaHealth,
   detectPrimeAgent,
+  hideCurrentWindowToTray,
   inspectPrimeAgentDefaults,
   listenToPrimeAgentDefaults,
   listGitChanges,
@@ -49,6 +54,9 @@ import {
   pickProjectFolder,
   quickInstallPrimeAgent,
   openProjectFolder,
+  isNative,
+  quitPrimeOrbit,
+  setTrayLanguage,
   stopAgent,
 } from "./lib/bridge";
 import { redactText } from "./lib/redaction";
@@ -105,6 +113,7 @@ function App() {
     archiveConversation,
     workspaceSaveError,
     retryWorkspaceSave,
+    flushWorkspaceState,
   } = workspace;
 
   useEffect(() => {
@@ -146,6 +155,12 @@ function App() {
   const [updateBlockingAgents, setUpdateBlockingAgents] = useState<number>();
   const [settingsSection, setSettingsSection] = useState<SettingsSectionId>("general");
   const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string>();
+  const [closeDecisionOpen, setCloseDecisionOpen] = useState(false);
+  const [closeDontAskAgain, setCloseDontAskAgain] = useState(false);
+  const [closeActionPending, setCloseActionPending] = useState<"minimize" | "quit">();
+  const [closeActionError, setCloseActionError] = useState<string>();
+  const closeDecisionOpenRef = useRef(false);
+  const closeActionBusyRef = useRef(false);
   const appUpdater = useAppUpdater({
     automaticChecks: loaded && state.preferences.automaticUpdateChecks,
   });
@@ -168,6 +183,7 @@ function App() {
 
   useEffect(() => {
     setAppLanguage(state.preferences.language);
+    void setTrayLanguage(state.preferences.language).catch(() => undefined);
   }, [state.preferences.language]);
 
   const refreshDetection = useCallback(() => {
@@ -547,7 +563,91 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  const setClosePromptOpen = useCallback((open: boolean) => {
+    closeDecisionOpenRef.current = open;
+    setCloseDecisionOpen(open);
+  }, []);
+
+  const performDesktopCloseAction = useCallback(async (
+    action: "minimize" | "quit",
+    rememberChoice: boolean,
+  ) => {
+    if (closeActionBusyRef.current) return;
+    closeActionBusyRef.current = true;
+    setCloseActionPending(action);
+    setCloseActionError(undefined);
+    try {
+      if (rememberChoice) {
+        updateState((current) => ({
+          ...current,
+          preferences: {
+            ...current.preferences,
+            askBeforeClose: false,
+            closeAction: action,
+          },
+        }));
+      }
+      if (rememberChoice || action === "quit") {
+        const saved = await flushWorkspaceState();
+        if (!saved) throw new Error(t("app.closeSaveFailed"));
+      }
+      if (action === "minimize") {
+        await hideCurrentWindowToTray();
+        setClosePromptOpen(false);
+        setCloseDontAskAgain(false);
+      } else {
+        await quitPrimeOrbit();
+      }
+    } catch (error) {
+      setCloseActionError(error instanceof Error ? error.message : String(error));
+      setClosePromptOpen(true);
+    } finally {
+      closeActionBusyRef.current = false;
+      setCloseActionPending(undefined);
+    }
+  }, [flushWorkspaceState, setClosePromptOpen, t, updateState]);
+
+  useEffect(() => {
+    if (!loaded || !isNative()) return;
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void getCurrentWindow().onCloseRequested((event) => {
+      event.preventDefault();
+      if (closeActionBusyRef.current || closeDecisionOpenRef.current) return;
+      const preferences = workspace.state.preferences;
+      if (preferences.askBeforeClose) {
+        setCloseDontAskAgain(false);
+        setCloseActionError(undefined);
+        setClosePromptOpen(true);
+        return;
+      }
+      void performDesktopCloseAction(preferences.closeAction, false);
+    }).then((stop) => {
+      if (active) unlisten = stop;
+      else stop();
+    });
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [loaded, performDesktopCloseAction, setClosePromptOpen, workspace.state.preferences]);
+
   if (!loaded || !detection) return <><AppBoot /><AppContextMenu /></>;
+
+  const closeDecisionModal = closeDecisionOpen ? (
+    <CloseDecisionModal
+      dontAskAgain={closeDontAskAgain}
+      pendingAction={closeActionPending}
+      error={closeActionError}
+      onDontAskAgain={setCloseDontAskAgain}
+      onClose={() => {
+        if (closeActionBusyRef.current) return;
+        setCloseActionError(undefined);
+        setClosePromptOpen(false);
+      }}
+      onAction={(action) => void performDesktopCloseAction(action, closeDontAskAgain)}
+    />
+  ) : null;
 
   const showOnboarding = !onboardingDismissed && !detection.installed;
   if (showOnboarding) {
@@ -561,6 +661,7 @@ function App() {
           onContinue={() => setOnboardingDismissed(true)}
         />
         <AppContextMenu />
+        {closeDecisionModal}
       </>
     );
   }
@@ -701,6 +802,7 @@ function App() {
       {conversationToRename ? <RenameConversationModal conversation={conversationToRename} onClose={() => setConversationToRename(undefined)} onConfirm={renameConversationAndSync} /> : null}
       {projectToArchive ? <ArchiveProjectModal project={projectToArchive} conversationCount={state.conversations.filter((conversation) => conversation.projectId === projectToArchive.id && !conversation.archived).length} onClose={() => setProjectToArchive(undefined)} onConfirm={archiveProjectConversations} /> : null}
       {projectToDelete ? <DeleteProjectModal project={projectToDelete} conversationCount={state.conversations.filter((conversation) => conversation.projectId === projectToDelete.id).length} onClose={() => setProjectToDelete(undefined)} onConfirm={removeProject} /> : null}
+      {closeDecisionModal}
       {updateBlockingAgents !== undefined ? (
         <Modal
           title={t("settings.updateBusyTitle")}
@@ -747,6 +849,37 @@ function primeAgentModelRef(defaults?: PrimeAgentDefaults) {
   const provider = defaults?.defaultProvider?.trim();
   const model = defaults?.defaultModel?.trim();
   return provider && model ? `${provider}/${model}` : undefined;
+}
+
+function CloseDecisionModal({ dontAskAgain, pendingAction, error, onDontAskAgain, onClose, onAction }: {
+  dontAskAgain: boolean;
+  pendingAction?: "minimize" | "quit";
+  error?: string;
+  onDontAskAgain: (checked: boolean) => void;
+  onClose: () => void;
+  onAction: (action: "minimize" | "quit") => void;
+}) {
+  const { t } = useI18n();
+  const busy = Boolean(pendingAction);
+  return (
+    <Modal
+      title={t("app.closeTitle")}
+      description={t("app.closeDescription")}
+      width="600px"
+      onClose={onClose}
+    >
+      <div className="close-decision-options">
+        <button type="button" className="close-decision-option is-primary" disabled={busy} data-modal-autofocus="" onClick={() => onAction("minimize")}><span>{pendingAction === "minimize" ? <LoaderCircle size={20} className="spin" /> : <Minimize2 size={20} />}</span><div><strong>{t("app.closeMinimize")}</strong><p>{t("app.closeMinimizeText")}</p></div></button>
+        <button type="button" className="close-decision-option is-quit" disabled={busy} onClick={() => onAction("quit")}><span>{pendingAction === "quit" ? <LoaderCircle size={20} className="spin" /> : <Power size={20} />}</span><div><strong>{t("app.closeQuit")}</strong><p>{t("app.closeQuitText")}</p></div></button>
+      </div>
+      <label className="close-remember-option">
+        <input type="checkbox" checked={dontAskAgain} disabled={busy} onChange={(event) => onDontAskAgain(event.target.checked)} />
+        <span className="close-remember-checkbox" aria-hidden="true">{dontAskAgain ? <Check size={13} /> : null}</span>
+        <span><strong>{t("app.closeDontAskAgain")}</strong><small>{t("app.closeRememberText")}</small></span>
+      </label>
+      {error ? <div className="close-decision-error" role="alert"><CircleAlert size={16} /><span>{error}</span></div> : null}
+    </Modal>
+  );
 }
 
 function RenameProjectModal({ project, onClose, onConfirm }: { project: Project; onClose: () => void; onConfirm: (project: Project, name: string) => void }) {
