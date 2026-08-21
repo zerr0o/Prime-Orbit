@@ -35,13 +35,12 @@ import { IconButton } from "./Ui";
 interface GlobalRailProps {
   view: AppView;
   onView: (view: AppView) => void;
-  onNewConversation: () => void;
   onOpenProject: () => void;
   onCommandPalette: () => void;
   activeRuns: number;
 }
 
-export function GlobalRail({ view, onView, onNewConversation, onOpenProject, onCommandPalette, activeRuns }: GlobalRailProps) {
+export function GlobalRail({ view, onView, onOpenProject, onCommandPalette, activeRuns }: GlobalRailProps) {
   const { language } = useI18n();
   const t = (key: NavKey, params?: TextParams) => navText(language, key, params);
   const items: Array<{ view: AppView; label: string; icon: typeof Home }> = [
@@ -55,9 +54,6 @@ export function GlobalRail({ view, onView, onNewConversation, onOpenProject, onC
       <button className="brand-mark" type="button" onClick={() => onView("home")} aria-label={t("nav.brandHome")}>
         <span className="orbit-ring"><span /></span>
       </button>
-      <div className="rail-primary-action">
-        <IconButton label={t("nav.newConversation")} className="new-conversation-button" onClick={onNewConversation}><Plus size={20} /></IconButton>
-      </div>
       <div className="rail-items">
         {items.map((item) => {
           const ItemIcon = item.icon;

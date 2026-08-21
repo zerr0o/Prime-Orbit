@@ -1,6 +1,6 @@
 [package]
 name = "prime-orbit"
-version = "0.1.17"
+version = "0.1.18"
 description = "Prime Orbit desktop client for Prime Agent"
 authors = ["Prime Orbit contributors"]
 edition = "2021"

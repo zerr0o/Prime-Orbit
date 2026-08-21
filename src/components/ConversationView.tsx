@@ -58,11 +58,13 @@ import {
 } from "lucide-react";
 import { admitDroppedAttachment, getGitFileDiff, openConversationPath, openGitFileFolder, pickAttachments, releaseAttachmentHandles } from "../lib/bridge";
 import { classifyConversationLink } from "../lib/conversation-links";
+import { agentMessagePreview } from "../lib/agent-message-notices";
 import { sessionGoalCount, type GoalMutationRuntimeState } from "../lib/goal-control";
 import { useDismissableLayer } from "../hooks/useDismissableLayer";
 import { useI18n, type AppLanguage } from "../i18n";
 import type {
   ActivityItem,
+  AgentMessageRelationship,
   AgentSessionState,
   AgentSchedule,
   AgentHeartbeatSummary,
@@ -263,6 +265,60 @@ export function resolveComposerDraftAfterSelection(
 ) {
   if (currentConversationId !== nextConversationId) return nextPersistedDraft;
   return nextPersistedDraft === reportedDraft ? currentDraft : nextPersistedDraft;
+}
+
+export interface ComposerListContinuation {
+  value: string;
+  selectionStart: number;
+  selectionEnd: number;
+  action: "continue" | "exit";
+}
+
+/**
+ * Applies the small amount of Markdown-aware editing a textarea needs for
+ * comfortable lists. Plain Enter continues a dash or numbered item; Enter on
+ * an empty item removes its marker and leaves the caret on a normal line.
+ */
+export function continueComposerMarkdownList(
+  value: string,
+  selectionStart: number,
+  selectionEnd: number,
+): ComposerListContinuation | undefined {
+  if (selectionStart !== selectionEnd || selectionStart < 0 || selectionStart > value.length) return undefined;
+  const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
+  const nextNewline = value.indexOf("\n", selectionStart);
+  const lineEnd = nextNewline === -1 ? value.length : nextNewline;
+  const currentLine = value.slice(lineStart, lineEnd);
+  const beforeCaret = value.slice(lineStart, selectionStart);
+  const lineMatch = /^([ \t]*)(-|\d+\.)(?:[ \t]+)(.*)$/.exec(currentLine);
+  const caretMatch = /^([ \t]*)(-|\d+\.)(?:[ \t]+)(.*)$/.exec(beforeCaret);
+  if (!lineMatch || !caretMatch || lineMatch[1] !== caretMatch[1] || lineMatch[2] !== caretMatch[2]) return undefined;
+
+  const indent = lineMatch[1] ?? "";
+  const content = lineMatch[3] ?? "";
+  if (!content.trim()) {
+    const caret = lineStart + indent.length;
+    return {
+      value: `${value.slice(0, lineStart)}${indent}${value.slice(lineEnd)}`,
+      selectionStart: caret,
+      selectionEnd: caret,
+      action: "exit",
+    };
+  }
+
+  const marker = caretMatch[2] ?? "-";
+  const number = marker === "-" ? undefined : Number.parseInt(marker, 10);
+  const nextMarker = number === undefined
+    ? "-"
+    : `${Number.isSafeInteger(number) && number < Number.MAX_SAFE_INTEGER ? number + 1 : number}.`;
+  const insertion = `\n${indent}${nextMarker} `;
+  const caret = selectionStart + insertion.length;
+  return {
+    value: `${value.slice(0, selectionStart)}${insertion}${value.slice(selectionStart)}`,
+    selectionStart: caret,
+    selectionEnd: caret,
+    action: "continue",
+  };
 }
 
 export function ConversationView(props: ConversationViewProps) {
@@ -729,10 +785,62 @@ const ConversationMarkdown = memo(function ConversationMarkdown({ content, onOpe
   }}>{content}</ReactMarkdown>;
 });
 
+export function agentMessageRelationshipLabel(
+  language: AppLanguage,
+  relationship?: AgentMessageRelationship,
+) {
+  if (relationship === "child") return bi(language, "Message du sous-agent", "Subagent message");
+  if (relationship === "parent") return bi(language, "Message de l’agent parent", "Parent agent message");
+  if (relationship === "sibling") return bi(language, "Message d’un agent pair", "Peer agent message");
+  return bi(language, "Message inter-agent", "Agent message");
+}
+
+export function initialAgentMessageNoticeExpanded() {
+  return false;
+}
+
+const AgentMessageItem = memo(function AgentMessageItem({ message, onOpenLink }: { message: ChatMessage; onOpenLink: (href: string) => Promise<void> }) {
+  const { language, locale } = useI18n();
+  const [expanded, setExpanded] = useState(initialAgentMessageNoticeExpanded);
+  const notice = message.notice?.kind === "agent_message" ? message.notice : undefined;
+  const bodyId = `agent-message-body-${message.id.replace(/[^A-Za-z0-9_-]/gu, "-")}`;
+
+  if (!notice) return null;
+
+  return (
+    <article className={`agent-message-notice ${expanded ? "is-expanded" : ""}`}>
+      <button
+        type="button"
+        className="agent-message-notice-summary"
+        aria-expanded={expanded}
+        aria-controls={bodyId}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <span className="agent-message-notice-icon" aria-hidden="true"><Bot size={15} /></span>
+        <span className="agent-message-notice-copy">
+          <span className="agent-message-notice-heading">
+            <strong>{agentMessageRelationshipLabel(language, notice.relationship)}</strong>
+            {notice.participant ? <span className="agent-message-notice-participant">{notice.participant}</span> : null}
+          </span>
+          <span className="agent-message-notice-preview">{agentMessagePreview(message.content, 180)}</span>
+        </span>
+        <time dateTime={message.createdAt}>{formatTime(message.createdAt, locale)}</time>
+        <ChevronRight className="agent-message-notice-chevron" size={15} aria-hidden="true" />
+      </button>
+      <div id={bodyId} className="agent-message-notice-body assistant-message-body" hidden={!expanded}>
+        {expanded ? <ConversationMarkdown content={message.content} onOpenLink={onOpenLink} /> : null}
+      </div>
+    </article>
+  );
+});
+
 const MessageItem = memo(function MessageItem({ message, onOpenLink, onRetryMessage, onForkMessage, showTools = true }: { message: ChatMessage; onOpenLink: (href: string) => Promise<void>; onRetryMessage: (assistantMessageId: string) => Promise<void>; onForkMessage: (assistantMessageId: string) => Promise<void>; showTools?: boolean }) {
   const { language, locale } = useI18n();
   const isUser = message.role === "user";
   const isSystem = message.role === "system";
+  if (message.notice?.kind === "agent_message") {
+    return <AgentMessageItem message={message} onOpenLink={onOpenLink} />;
+  }
   return (
     <article className={`message message-${message.role}`}>
       <div className="message-avatar" aria-hidden="true">{isUser ? "ZE" : isSystem ? <Info size={14} /> : <span className="mini-orbit"><span /></span>}</div>
@@ -1550,6 +1658,19 @@ function Composer({ project, conversation, models, commands, stats, sessionState
       return;
     }
     if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+      if (!event.ctrlKey && !event.metaKey && !event.altKey) {
+        const edit = continueComposerMarkdownList(
+          editorValue,
+          event.currentTarget.selectionStart,
+          event.currentTarget.selectionEnd,
+        );
+        if (edit) {
+          event.preventDefault();
+          updateEditorValue(edit.value);
+          requestAnimationFrame(() => textarea.current?.setSelectionRange(edit.selectionStart, edit.selectionEnd));
+          return;
+        }
+      }
       event.preventDefault();
       void submit(isBusy ? "follow_up" : undefined);
     }
@@ -1837,7 +1958,7 @@ function Composer({ project, conversation, models, commands, stats, sessionState
       {attachmentError ? <p className="trust-note" role="alert"><Info size={14} />{attachmentError}</p> : null}
       {commandError ? <p className="trust-note composer-command-error" role="alert"><CircleAlert size={14} />{commandError}</p> : null}
       <div className="composer-editor">
-        <textarea ref={textarea} value={editorValue} onChange={(event) => updateEditorValue(event.target.value)} onKeyDown={handleKeyDown} onPaste={handlePaste} onFocus={() => setComposerFocused(true)} onBlur={() => { setComposerFocused(false); if (draftRef.current !== reportedDraftRef.current) reportDraftNow(draftRef.current); }} placeholder={activeSlashCommand ? activeSlashCommand.command.description : isCompacting ? bi(language, "Ajoutez un message après le compactage…", "Add a message after compaction…") : isRunning ? bi(language, "Ajoutez une instruction à la suite…", "Add a follow-up instruction…") : `${bi(language, "Demandez quelque chose sur", "Ask something about")} ${project.name}…`} rows={1} aria-label={bi(language, "Message à Prime Agent", "Message Prime Agent")} aria-autocomplete="list" aria-expanded={slashPaletteOpen} aria-controls={slashPaletteOpen ? "composer-slash-command-list" : undefined} aria-activedescendant={slashPaletteOpen ? `composer-slash-command-${Math.min(slashSelection, filteredSlashCommands.length - 1)}` : undefined} />
+        <textarea ref={textarea} value={editorValue} onChange={(event) => updateEditorValue(event.target.value)} onKeyDown={handleKeyDown} onPaste={handlePaste} onFocus={() => setComposerFocused(true)} onBlur={() => { setComposerFocused(false); if (draftRef.current !== reportedDraftRef.current) reportDraftNow(draftRef.current); }} placeholder={activeSlashCommand ? activeSlashCommand.command.description : isCompacting ? bi(language, "Ajoutez un message après le compactage…", "Add a message after compaction…") : isRunning ? bi(language, "Ajoutez une instruction à la suite…", "Add a follow-up instruction…") : `${bi(language, "Demandez quelque chose sur", "Ask something about")} ${project.name}…`} rows={1} lang={language} spellCheck data-native-spellcheck-menu="true" aria-label={bi(language, "Message à Prime Agent", "Message Prime Agent")} aria-autocomplete="list" aria-expanded={slashPaletteOpen} aria-controls={slashPaletteOpen ? "composer-slash-command-list" : undefined} aria-activedescendant={slashPaletteOpen ? `composer-slash-command-${Math.min(slashSelection, filteredSlashCommands.length - 1)}` : undefined} />
       </div>
       <div className="composer-toolbar">
         <div className="composer-tools-left">

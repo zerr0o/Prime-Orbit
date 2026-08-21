@@ -29,7 +29,10 @@ const {
   durableAttachmentMetadata,
   enqueueExtensionRequest,
   extensionRequestKey,
+  finalizeAuthoritativeIdleSnapshot,
   handleMessageEvent,
+  isAuthoritativeIdleSessionSnapshot,
+  mapAgentMessages,
   mergeHistoricalAttachmentPreviews,
   promptAttachmentPayload,
   reconcileQueuedMessages,
@@ -39,11 +42,107 @@ const {
   shouldClearPromptRunAfterQueueDeletion,
   shouldConsumeConversationResponse,
   shouldReloadQueuedTranscript,
+  shouldApplySessionStateResponse,
+  shouldScheduleTerminalStateReconciliation,
   isCompactDaemonAcknowledgementTimeout,
   isRefineDaemonAcknowledgementTimeout,
   refineLifecycleDisposition,
   refinementResultPresentation,
 } = compiledModule.exports;
+
+const idleSessionSnapshot = (overrides = {}) => ({
+  isStreaming: false,
+  isCompacting: false,
+  sessionActions: {
+    queuedCount: 0,
+    steering: [],
+    followUps: [],
+  },
+  ...overrides,
+});
+
+test("uses only a quiescent daemon state snapshot as an idle recovery boundary", () => {
+  assert.equal(isAuthoritativeIdleSessionSnapshot(idleSessionSnapshot()), true);
+  assert.equal(isAuthoritativeIdleSessionSnapshot(idleSessionSnapshot({ isStreaming: true })), false);
+  assert.equal(isAuthoritativeIdleSessionSnapshot(idleSessionSnapshot({ isCompacting: true })), false);
+  assert.equal(isAuthoritativeIdleSessionSnapshot(idleSessionSnapshot({
+    sessionActions: { queuedCount: 1, steering: [], followUps: ["next"] },
+  })), false);
+  assert.equal(isAuthoritativeIdleSessionSnapshot(idleSessionSnapshot({
+    sessionActions: {
+      queuedCount: 0,
+      steering: [],
+      followUps: [],
+      active: { kind: "turn", phase: "running" },
+    },
+  })), false);
+});
+
+test("rejects an idle snapshot requested before a newer prompt or lifecycle epoch", () => {
+  assert.equal(shouldApplySessionStateResponse(12, 12), true);
+  assert.equal(shouldApplySessionStateResponse(12, 13), false);
+  assert.equal(shouldApplySessionStateResponse(undefined, 0), false);
+});
+
+test("terminal-looking events request state reconciliation without treating message_end as idle", () => {
+  assert.equal(shouldScheduleTerminalStateReconciliation({ type: "turn_end" }), true);
+  assert.equal(shouldScheduleTerminalStateReconciliation({
+    type: "message_end",
+    message: { role: "assistant", stopReason: "stop" },
+  }), true);
+  assert.equal(shouldScheduleTerminalStateReconciliation({
+    type: "message_end",
+    message: { role: "assistant", stopReason: "toolUse" },
+  }), false);
+  assert.equal(shouldScheduleTerminalStateReconciliation({
+    type: "message_end",
+    message: { role: "user" },
+  }), false);
+  assert.equal(shouldScheduleTerminalStateReconciliation({ type: "agent_end" }), false);
+});
+
+test("an authoritative idle snapshot closes orphaned Python tools and their running activity", () => {
+  const recovered = finalizeAuthoritativeIdleSnapshot(conversation({
+    status: "tool",
+    messages: [{
+      id: "assistant-python",
+      role: "assistant",
+      content: "Finished",
+      createdAt: "2026-08-21T11:29:16.000Z",
+      status: "complete",
+      tools: [{
+        id: "call-python",
+        name: "ipython",
+        title: "Python",
+        status: "running",
+        startedAt: "2026-08-21T11:28:16.000Z",
+      }],
+    }],
+    activities: [{
+      id: "tool:call-python",
+      type: "tool_execution_start",
+      title: "Python en cours",
+      status: "running",
+      createdAt: "2026-08-21T11:28:16.000Z",
+      raw: { toolName: "ipython" },
+    }],
+  }), "2026-08-21T11:29:17.000Z");
+
+  assert.equal(recovered.status, "idle");
+  assert.equal(recovered.messages[0].tools[0].status, "completed");
+  assert.equal(recovered.messages[0].tools[0].endedAt, "2026-08-21T11:29:17.000Z");
+  assert.equal(recovered.activities[0].status, "success");
+  assert.equal(recovered.lastError, undefined);
+
+  const next = beginPromptTransaction(recovered, {
+    message: "This must start a normal turn",
+    attachments: [],
+    messageId: "user-after-recovery",
+    createdAt: "2026-08-21T11:29:18.000Z",
+  });
+  assert.equal(next.conversation.status, "streaming");
+  assert.equal(next.conversation.messages.at(-1).queueDelivery, undefined);
+});
 
 test("goal prompt responses stay scoped to their mutation, including late failures", () => {
   assert.equal(shouldConsumeConversationResponse(undefined), false);
@@ -346,6 +445,72 @@ test("does not drop a sanitized live message_start whose visible text is empty",
   assert.equal(current.messages[0].id, "live-document-message");
   assert.equal(current.messages[0].content, "Fichier joint");
   assert.deepEqual(current.messages[0].attachments, [document]);
+});
+
+test("renders a live agent message once with only its useful structured body", () => {
+  const agentMessage = {
+    role: "custom",
+    customType: "agent_message",
+    display: true,
+    content: "[from child:reviewer]\nAgent-to-agent message received.\nSource: agent_message\nMessage id: agentmsg_live\n\nDo not render this envelope.",
+    details: {
+      id: "agentmsg_live",
+      message: "Audit complete. No files edited.",
+      from: { sessionName: "reviewer", activeSessionId: "child-active" },
+      fromRelationship: "child",
+    },
+    timestamp: "2026-08-20T22:42:16.353Z",
+  };
+  let current = conversation();
+  const update = (_conversationId, updater) => {
+    current = typeof updater === "function" ? updater(current) : { ...current, ...updater };
+  };
+
+  handleMessageEvent("conversation-a", { type: "message_start", message: agentMessage }, update);
+  handleMessageEvent("conversation-a", { type: "message_end", message: agentMessage }, update);
+  handleMessageEvent("conversation-a", { type: "message_start", message: agentMessage }, update);
+
+  assert.equal(current.messages.length, 1);
+  assert.equal(current.messages[0].content, "Audit complete. No files edited.");
+  assert.deepEqual(current.messages[0].notice, {
+    kind: "agent_message",
+    messageId: "agentmsg_live",
+    participant: "reviewer",
+    relationship: "child",
+  });
+  assert.doesNotMatch(current.messages[0].content, /Source:|Message id:/u);
+});
+
+test("deduplicates structured and canonical legacy agent messages in restored history", () => {
+  const canonical = [
+    "[from child:reviewer]",
+    "Agent-to-agent message received.",
+    "Source: agent_message",
+    "From: reviewer, active child-active, session child-session",
+    "To: active parent-active, session parent-session",
+    "Message id: agentmsg_history",
+    "",
+    "History audit complete.",
+  ].join("\n");
+  const mapped = mapAgentMessages([
+    {
+      role: "custom",
+      customType: "agent_message",
+      display: true,
+      content: canonical,
+      details: {
+        id: "agentmsg_history",
+        message: "History audit complete.",
+        from: { sessionName: "reviewer" },
+        fromRelationship: "child",
+      },
+    },
+    { role: "custom", display: true, content: canonical },
+  ]);
+
+  assert.equal(mapped.length, 1);
+  assert.equal(mapped[0].content, "History audit complete.");
+  assert.equal(mapped[0].notice.messageId, "agentmsg_history");
 });
 
 function conversation(overrides = {}) {

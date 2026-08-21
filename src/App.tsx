@@ -554,7 +554,7 @@ function App() {
   const extensionRequest = agent.extensionRequest;
   return (
     <div className="app-shell">
-      <GlobalRail view={view} onView={setView} onNewConversation={newConversation} onOpenProject={() => void openProject()} onCommandPalette={() => setCommandPalette(true)} activeRuns={activeRuns} />
+      <GlobalRail view={view} onView={setView} onOpenProject={() => void openProject()} onCommandPalette={() => setCommandPalette(true)} activeRuns={activeRuns} />
       {showProjectSidebar ? (
         <ProjectSidebar
           projects={state.projects}
@@ -746,7 +746,7 @@ function RenameProjectModal({ project, onClose, onConfirm }: { project: Project;
     >
       <label className="confirmation-field">
         <span>{t("app.projectName")}</span>
-        <input value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") confirm(); }} autoFocus autoComplete="off" />
+        <input value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") confirm(); }} autoFocus data-modal-autofocus="" autoComplete="off" />
       </label>
     </Modal>
   );
@@ -769,7 +769,7 @@ function RenameConversationModal({ conversation, onClose, onConfirm }: { convers
     >
       <label className="confirmation-field">
         <span>{t("app.conversationName")}</span>
-        <input value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") confirm(); }} autoFocus autoComplete="off" />
+        <input value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") confirm(); }} autoFocus data-modal-autofocus="" autoComplete="off" />
       </label>
     </Modal>
   );

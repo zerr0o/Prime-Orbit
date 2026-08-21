@@ -42,6 +42,20 @@ export interface ToolActivity {
   endedAt?: string;
 }
 
+export type AgentMessageRelationship = "parent" | "sibling" | "child";
+
+/** Structured presentation metadata for Prime Agent's agent-to-agent channel.
+ * The useful message body stays in ChatMessage.content; transport headers and
+ * runtime identifiers never need to be rendered as conversation text. */
+export interface AgentMessageNotice {
+  kind: "agent_message";
+  messageId: string;
+  participant?: string;
+  relationship?: AgentMessageRelationship;
+}
+
+export type ConversationNotice = AgentMessageNotice;
+
 export interface ChatMessage {
   id: string;
   /** Prime Agent session-tree entry used for real forks when available. */
@@ -60,6 +74,8 @@ export interface ChatMessage {
     cacheRead?: number;
     total?: number;
   };
+  /** Typed Prime Agent notice with a dedicated, progressively disclosed UI. */
+  notice?: ConversationNotice;
   /** A user turn accepted by Prime Agent but not delivered to the model yet. */
   queueDelivery?: "steer" | "follow_up";
   /** Set after the turn has appeared in Prime Agent's authoritative queue snapshot. */

@@ -4,6 +4,26 @@ All notable changes to Prime Orbit are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-08-21
+
+### Reliable runtime recovery
+
+- Reconciled terminal renderer state with Prime Agent's authoritative daemon state when a final lifecycle event is missed, closing orphaned Python activity and preventing completed runs from forcing the next prompt into the follow-up queue.
+- Guarded idle recovery and Goal resynchronization with lifecycle epochs so an older state response cannot erase a newer prompt or agent run.
+- Retried authoritative history loading after recovery when an earlier response was rejected while stale local run markers were still present.
+
+### Cleaner collaboration and editing
+
+- Replaced raw agent-to-agent protocol envelopes with compact expandable notices, with native and renderer-side validation, bounded content, deduplication, and removal of private runtime identifiers.
+- Kept rename fields focused through periodic workspace refreshes and restored focus correctly when dialogs close.
+- Added Markdown list continuation in the composer and delegated its right-click menu to native WebView2 spelling suggestions when available.
+- Rendered updater release notes as safe structured Markdown and temporarily hid the global new-conversation button while keeping workspace creation available.
+
+### Validation
+
+- Added coverage for missed terminal events, stale idle snapshots, orphaned Python tools, inter-agent message sanitization, modal focus, list editing, native spelling-menu delegation, and release-note Markdown safety.
+- Revalidated the frontend production build, complete frontend and Rust test suites, formatting, strict Clippy, Rust 1.88 compatibility, and signed Windows release gates.
+
 ## [0.1.17] - 2026-08-21
 
 ### Reliable session controls
@@ -230,6 +250,7 @@ All notable changes to Prime Orbit are documented in this file.
 - TypeScript build and checks.
 - Strict Rust Clippy validation with warnings denied.
 
+[0.1.18]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.18
 [0.1.17]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.17
 [0.1.16]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.16
 [0.1.15]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.15

@@ -23,11 +23,45 @@ const {
   buildToolSequenceSegments,
   buildContextUsageSnapshot,
   buildSessionPanelSummary,
+  continueComposerMarkdownList,
+  agentMessageRelationshipLabel,
+  initialAgentMessageNoticeExpanded,
   initialPythonExecutionGroupExpanded,
   initialToolCardExpanded,
   isGoalPanelBusy,
   isRefineControlBusy,
 } = compiledModule.exports;
+
+test("continues and exits Markdown lists without replacing the textarea", () => {
+  assert.deepEqual(continueComposerMarkdownList("- premier", 9, 9), {
+    value: "- premier\n- ",
+    selectionStart: 12,
+    selectionEnd: 12,
+    action: "continue",
+  });
+  assert.deepEqual(continueComposerMarkdownList("1. un", 5, 5), {
+    value: "1. un\n2. ",
+    selectionStart: 9,
+    selectionEnd: 9,
+    action: "continue",
+  });
+  assert.deepEqual(continueComposerMarkdownList("- premier\n- ", 12, 12), {
+    value: "- premier\n",
+    selectionStart: 10,
+    selectionEnd: 10,
+    action: "exit",
+  });
+  assert.equal(continueComposerMarkdownList("texte normal", 12, 12), undefined);
+  assert.equal(continueComposerMarkdownList("- sélection", 2, 5), undefined);
+});
+
+test("keeps agent-to-agent notices compact and labels their relationship", () => {
+  assert.equal(initialAgentMessageNoticeExpanded(), false);
+  assert.equal(agentMessageRelationshipLabel("fr", "child"), "Message du sous-agent");
+  assert.equal(agentMessageRelationshipLabel("en", "parent"), "Parent agent message");
+  assert.equal(agentMessageRelationshipLabel("fr", "sibling"), "Message d’un agent pair");
+  assert.equal(agentMessageRelationshipLabel("en"), "Agent message");
+});
 
 test("keeps Python tool details collapsed while a live execution is running", () => {
   assert.equal(initialPythonExecutionGroupExpanded(), false);

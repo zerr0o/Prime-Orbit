@@ -192,6 +192,15 @@ async function openExternalLink(href: string) {
 }
 
 /**
+ * WebView2 owns spelling suggestions. The app delegates only explicitly
+ * opted-in text controls to that native menu and keeps its custom menu for all
+ * project, conversation, link, and other editing surfaces.
+ */
+export function shouldUseNativeSpellcheckMenu(target: Pick<Element, "closest">) {
+  return Boolean(target.closest('[data-native-spellcheck-menu="true"]'));
+}
+
+/**
  * Mount once near the application root. It suppresses the WebView's native
  * context menu globally and renders a focused app menu only when the target has
  * useful contextual actions.
@@ -222,8 +231,12 @@ export function AppContextMenu({
 
   useEffect(() => {
     const handleContextMenu = (event: MouseEvent) => {
-      event.preventDefault();
       const target = event.target;
+      if (target instanceof Element && shouldUseNativeSpellcheckMenu(target)) {
+        setContext(undefined);
+        return;
+      }
+      event.preventDefault();
       if (!(target instanceof Element)) {
         setContext(undefined);
         return;

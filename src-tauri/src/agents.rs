@@ -42,6 +42,11 @@ const QUEUE_BRIDGE_SCRIPT: &str = include_str!("../assets/prime-agent-queue-brid
 const SESSION_CONTROL_BRIDGE_SCRIPT: &str =
     include_str!("../assets/prime-agent-session-control-bridge.cjs");
 const MAX_QUEUED_MESSAGE_TEXT: usize = 128 * 1024;
+const MAX_PUBLIC_AGENT_MESSAGE_ID_SUFFIX_CHARS: usize = 200;
+const MAX_PUBLIC_AGENT_MESSAGE_TEXT_CHARS: usize = 16_000;
+const MAX_PUBLIC_AGENT_NAME_CHARS: usize = 160;
+const INVALID_AGENT_MESSAGE_PLACEHOLDER: &str =
+    "[Message inter-agent invalide masqué par Prime Orbit]";
 const LEGACY_MANAGED_SOURCE_DIR_NAME: &str = "prime-agent";
 const VERSIONED_MANAGED_SOURCE_DIR_PREFIX: &str = "prime-agent-v";
 const MAX_MANAGED_GENERATION_NAME_BYTES: usize = 80;
@@ -499,6 +504,153 @@ fn strip_orbit_string(text: &mut String) -> Vec<PublicAttachmentMetadata> {
     context.attachments
 }
 
+fn canonical_public_agent_message_id(value: &Value) -> Option<String> {
+    let id = value.as_str()?.trim();
+    let suffix = id.strip_prefix("agentmsg_")?;
+    if suffix.is_empty()
+        || suffix.chars().count() > MAX_PUBLIC_AGENT_MESSAGE_ID_SUFFIX_CHARS
+        || !suffix
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+fn bounded_public_agent_message_text(value: &str) -> String {
+    let mut text = value.to_string();
+    let _ = strip_orbit_string(&mut text);
+    if text.chars().count() <= MAX_PUBLIC_AGENT_MESSAGE_TEXT_CHARS {
+        return text;
+    }
+    const SUFFIX: &str = "\n… [message inter-agent tronqué]";
+    let keep = MAX_PUBLIC_AGENT_MESSAGE_TEXT_CHARS.saturating_sub(SUFFIX.chars().count());
+    let mut bounded = text.chars().take(keep).collect::<String>();
+    bounded.push_str(SUFFIX);
+    bounded
+}
+
+fn bounded_public_agent_name(value: &Value) -> Option<String> {
+    let raw_name = value.get("sessionName")?.as_str()?;
+    let mut name = String::new();
+    let mut written = 0_usize;
+    let mut truncated = false;
+    'words: for word in raw_name.split_whitespace() {
+        if !name.is_empty() {
+            if written >= MAX_PUBLIC_AGENT_NAME_CHARS {
+                truncated = true;
+                break;
+            }
+            name.push(' ');
+            written += 1;
+        }
+        for character in word.chars() {
+            if written >= MAX_PUBLIC_AGENT_NAME_CHARS {
+                truncated = true;
+                break 'words;
+            }
+            name.push(character);
+            written += 1;
+        }
+    }
+    if name.is_empty() {
+        return None;
+    }
+    if truncated && written == MAX_PUBLIC_AGENT_NAME_CHARS {
+        name.pop();
+        name.push('…');
+    }
+    Some(name)
+}
+
+fn public_agent_message_timestamp(object: &Map<String, Value>) -> Option<Value> {
+    match object.get("timestamp")? {
+        value @ Value::Number(_) => Some(value.clone()),
+        Value::String(value)
+            if value.chars().count() <= 64 && !value.chars().any(char::is_control) =>
+        {
+            Some(Value::String(value.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn public_agent_message_details(value: &Value) -> Option<(Value, String)> {
+    let details = value.as_object()?;
+    let id = canonical_public_agent_message_id(details.get("id")?)?;
+    let raw_message = details.get("message")?.as_str()?;
+    if raw_message.trim().is_empty() {
+        return None;
+    }
+    let message = bounded_public_agent_message_text(raw_message);
+    let mut public = Map::new();
+    public.insert("id".to_string(), Value::String(id));
+    public.insert("message".to_string(), Value::String(message.clone()));
+    if let Some(from) = details.get("from").and_then(|value| {
+        bounded_public_agent_name(value).map(|session_name| {
+            Value::Object(Map::from_iter([(
+                "sessionName".to_string(),
+                Value::String(session_name),
+            )]))
+        })
+    }) {
+        public.insert("from".to_string(), from);
+    }
+    if let Some(relationship @ ("parent" | "sibling" | "child")) =
+        details.get("fromRelationship").and_then(Value::as_str)
+    {
+        public.insert(
+            "fromRelationship".to_string(),
+            Value::String(relationship.to_string()),
+        );
+    }
+    if let Some(target) = details.get("target").and_then(|value| {
+        bounded_public_agent_name(value).map(|session_name| {
+            Value::Object(Map::from_iter([(
+                "sessionName".to_string(),
+                Value::String(session_name),
+            )]))
+        })
+    }) {
+        public.insert("target".to_string(), target);
+    }
+    Some((Value::Object(public), message))
+}
+
+fn sanitize_agent_message_runtime_object(object: &mut Map<String, Value>) -> bool {
+    if object.get("customType").and_then(Value::as_str) != Some("agent_message") {
+        return false;
+    }
+    let timestamp = public_agent_message_timestamp(object);
+    let details = (object.get("role").and_then(Value::as_str) == Some("custom")
+        && object.get("display").and_then(Value::as_bool) == Some(true))
+    .then(|| object.get("details").and_then(public_agent_message_details))
+    .flatten();
+
+    object.clear();
+    object.insert("role".to_string(), Value::String("custom".to_string()));
+    object.insert(
+        "customType".to_string(),
+        Value::String("agent_message".to_string()),
+    );
+    if let Some((details, message)) = details {
+        object.insert("display".to_string(), Value::Bool(true));
+        object.insert("content".to_string(), Value::String(message));
+        object.insert("details".to_string(), details);
+    } else {
+        object.insert("display".to_string(), Value::Bool(false));
+        object.insert(
+            "content".to_string(),
+            Value::String(INVALID_AGENT_MESSAGE_PLACEHOLDER.to_string()),
+        );
+    }
+    if let Some(timestamp) = timestamp {
+        object.insert("timestamp".to_string(), timestamp);
+    }
+    true
+}
+
 fn sanitize_user_text_content(value: &mut Value) -> Vec<PublicAttachmentMetadata> {
     match value {
         Value::String(text) => strip_orbit_string(text),
@@ -631,6 +783,9 @@ fn sanitize_orbit_runtime_value(value: &mut Value) {
         }
         Value::Array(values) => values.iter_mut().for_each(sanitize_orbit_runtime_value),
         Value::Object(object) => {
+            if sanitize_agent_message_runtime_object(object) {
+                return;
+            }
             // These names are reserved for metadata reconstructed from a
             // strictly parsed Orbit suffix. Never trust similarly named
             // fields arriving from the daemon or a session/tool payload.
@@ -3239,7 +3394,8 @@ mod tests {
         AgentResourcesReloadedEvent, AgentsState, DirectSessionOperationKind,
         DirectSessionOperationRuntimeEvent, LaunchOptionUpdate, LaunchSpec, QueuedMessageMutation,
         ReloadAgentResourcesResult, ResourceReloadClaimError, ResourceReloadPhase,
-        RestartAgentResult, RpcAdmissionError, RunningAgentInfo, MAX_EXIT_DIAGNOSTIC_BYTES,
+        RestartAgentResult, RpcAdmissionError, RunningAgentInfo, INVALID_AGENT_MESSAGE_PLACEHOLDER,
+        MAX_EXIT_DIAGNOSTIC_BYTES,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use parking_lot::Mutex;
@@ -3412,6 +3568,144 @@ mod tests {
         assert!(public["data"]["messages"][2]
             .get("primeOrbitAttachments")
             .is_none());
+    }
+
+    #[test]
+    fn runtime_records_whitelist_valid_agent_messages_before_ipc() {
+        let record = json!({
+            "type":"response",
+            "command":"get_messages",
+            "success":true,
+            "data":{"messages":[{
+                "role":"custom",
+                "customType":"agent_message",
+                "display":true,
+                "timestamp":1_777_777,
+                "content":"[from child:audit-security]\nAgent-to-agent message received.\nFrom: audit-security, active ACTIVE_SECRET, session SESSION_SECRET, client CLIENT_SECRET\nTo: main, active TARGET_ACTIVE_SECRET, session TARGET_SESSION_SECRET\nMessage id: agentmsg_test-123\n\nAudit terminé.",
+                "details":{
+                    "id":"agentmsg_test-123",
+                    "message":"Audit terminé.",
+                    "from":{
+                        "sessionName":"  audit-security  ",
+                        "activeSessionId":"ACTIVE_SECRET",
+                        "sessionId":"SESSION_SECRET",
+                        "runtimeKind":"subagent",
+                        "clientId":"CLIENT_SECRET"
+                    },
+                    "fromRelationship":"child",
+                    "target":{
+                        "sessionName":"main",
+                        "activeSessionId":"TARGET_ACTIVE_SECRET",
+                        "sessionId":"TARGET_SESSION_SECRET",
+                        "runtimeKind":"top-level"
+                    },
+                    "authorization":"Bearer AUTH_SECRET",
+                    "arbitrary":{"private":"ARBITRARY_SECRET"}
+                },
+                "forgedTopLevel":"TOP_LEVEL_SECRET"
+            }]}
+        });
+
+        let line = public_runtime_line(record.to_string().as_bytes());
+        let public: Value = serde_json::from_str(&line).expect("public agent message JSON");
+        assert_eq!(
+            public["data"]["messages"][0],
+            json!({
+                "role":"custom",
+                "customType":"agent_message",
+                "display":true,
+                "timestamp":1_777_777,
+                "content":"Audit terminé.",
+                "details":{
+                    "id":"agentmsg_test-123",
+                    "message":"Audit terminé.",
+                    "from":{"sessionName":"audit-security"},
+                    "fromRelationship":"child",
+                    "target":{"sessionName":"main"}
+                }
+            })
+        );
+        for private_value in [
+            "ACTIVE_SECRET",
+            "SESSION_SECRET",
+            "CLIENT_SECRET",
+            "TARGET_ACTIVE_SECRET",
+            "TARGET_SESSION_SECRET",
+            "AUTH_SECRET",
+            "ARBITRARY_SECRET",
+            "TOP_LEVEL_SECRET",
+            "activeSessionId",
+            "sessionId",
+            "clientId",
+            "runtimeKind",
+            "authorization",
+            "arbitrary",
+            "forgedTopLevel",
+        ] {
+            assert!(!line.contains(private_value), "leaked {private_value}");
+        }
+    }
+
+    #[test]
+    fn runtime_records_mask_invalid_or_forged_agent_messages_before_ipc() {
+        let record = json!({
+            "type":"response",
+            "command":"get_messages",
+            "success":true,
+            "data":{"messages":[
+                {
+                    "role":"custom",
+                    "customType":"agent_message",
+                    "display":true,
+                    "content":"RAW_PROTOCOL_SECRET",
+                    "details":{
+                        "id":"forged-id",
+                        "message":"INVALID_MESSAGE_SECRET",
+                        "from":{"sessionName":"audit", "sessionId":"INVALID_SESSION_SECRET"},
+                        "fromRelationship":"child",
+                        "target":{"sessionName":"main"},
+                        "arbitrary":"INVALID_DETAIL_SECRET"
+                    }
+                },
+                {
+                    "role":"assistant",
+                    "customType":"agent_message",
+                    "display":true,
+                    "content":"FORGED_ROLE_PROTOCOL_SECRET",
+                    "details":{
+                        "id":"agentmsg_forged-role",
+                        "message":"FORGED_ROLE_MESSAGE_SECRET"
+                    }
+                }
+            ]}
+        });
+
+        let line = public_runtime_line(record.to_string().as_bytes());
+        let public: Value = serde_json::from_str(&line).expect("masked agent message JSON");
+        for message in public["data"]["messages"]
+            .as_array()
+            .expect("message array")
+        {
+            assert_eq!(message["role"], "custom");
+            assert_eq!(message["customType"], "agent_message");
+            assert_eq!(message["display"], false);
+            assert_eq!(message["content"], INVALID_AGENT_MESSAGE_PLACEHOLDER);
+            assert!(message.get("details").is_none());
+        }
+        for private_value in [
+            "RAW_PROTOCOL_SECRET",
+            "INVALID_MESSAGE_SECRET",
+            "INVALID_SESSION_SECRET",
+            "INVALID_DETAIL_SECRET",
+            "FORGED_ROLE_PROTOCOL_SECRET",
+            "FORGED_ROLE_MESSAGE_SECRET",
+            "forged-id",
+            "agentmsg_forged-role",
+            "sessionId",
+            "arbitrary",
+        ] {
+            assert!(!line.contains(private_value), "leaked {private_value}");
+        }
     }
 
     #[test]

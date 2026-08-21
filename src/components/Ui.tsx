@@ -30,8 +30,13 @@ export function Switch({ checked, onChange, label }: { checked: boolean; onChang
 export function Modal({ title, description, children, onClose, width = "560px", footer }: PropsWithChildren<{ title: string; description?: string; onClose: () => void; width?: string; footer?: ReactNode }>) {
   const { t } = useI18n();
   const dialogRef = useRef<HTMLElement>(null);
+  const onCloseRef = useRef(onClose);
   const titleId = useId();
   const descriptionId = useId();
+  onCloseRef.current = onClose;
+  // This effect owns one open-modal lifecycle. App-level polling can rerender
+  // the modal with a fresh callback identity; restarting the effect would
+  // restore and then reassign focus while the user is typing.
   useEffect(() => {
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
     const dialog = dialogRef.current;
@@ -44,7 +49,9 @@ export function Modal({ title, description, children, onClose, width = "560px", 
       "[tabindex]:not([tabindex='-1'])",
     ].join(",");
     const focusFirstControl = () => {
-      const first = dialog?.querySelector<HTMLElement>("[autofocus]")
+      if (dialog && document.activeElement && dialog.contains(document.activeElement)) return;
+      const first = dialog?.querySelector<HTMLElement>("[data-modal-autofocus]")
+        ?? dialog?.querySelector<HTMLElement>("[autofocus]")
         ?? dialog?.querySelector<HTMLElement>(focusableSelector);
       (first ?? dialog)?.focus();
     };
@@ -52,7 +59,7 @@ export function Modal({ title, description, children, onClose, width = "560px", 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (event.key !== "Tab" || !dialog) return;
@@ -78,7 +85,7 @@ export function Modal({ title, description, children, onClose, width = "560px", 
       window.removeEventListener("keydown", onKeyDown);
       if (previousFocus?.isConnected) previousFocus.focus();
     };
-  }, [onClose]);
+  }, []);
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <section ref={dialogRef} className="modal-card" role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={description ? descriptionId : undefined} tabIndex={-1} style={{ maxWidth: width }}>

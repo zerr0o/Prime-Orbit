@@ -21,6 +21,8 @@ const MAX_MESSAGES: usize = 5_000;
 const MAX_PUBLIC_TEXT_CHARS: usize = 16_000;
 const MAX_SUMMARY_CHARS: usize = 64_000;
 const MAX_IPC_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PUBLIC_AGENT_MESSAGE_ID_SUFFIX_CHARS: usize = 200;
+const MAX_PUBLIC_AGENT_NAME_CHARS: usize = 160;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -816,6 +818,90 @@ fn copy_timestamp(target: &mut Map<String, Value>, source: &Value, fallback: &Va
     }
 }
 
+fn public_agent_message_id(value: &Value, truncated: &mut bool) -> Option<String> {
+    let id = value.as_str()?.trim();
+    let suffix = id.strip_prefix("agentmsg_");
+    if suffix.is_none_or(|suffix| {
+        suffix.is_empty()
+            || suffix.chars().count() > MAX_PUBLIC_AGENT_MESSAGE_ID_SUFFIX_CHARS
+            || !suffix
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    }) {
+        *truncated = true;
+        return None;
+    }
+    Some(id.to_string())
+}
+
+fn public_agent_name(value: &Value, truncated: &mut bool) -> Option<String> {
+    let raw_name = value.get("sessionName")?.as_str()?;
+    let mut name = String::new();
+    let mut written = 0_usize;
+    let mut name_truncated = false;
+    'words: for word in raw_name.split_whitespace() {
+        if !name.is_empty() {
+            if written >= MAX_PUBLIC_AGENT_NAME_CHARS {
+                name_truncated = true;
+                break;
+            }
+            name.push(' ');
+            written += 1;
+        }
+        for character in word.chars() {
+            if written >= MAX_PUBLIC_AGENT_NAME_CHARS {
+                name_truncated = true;
+                break 'words;
+            }
+            name.push(character);
+            written += 1;
+        }
+    }
+    if name.is_empty() {
+        return None;
+    }
+    if name_truncated && written == MAX_PUBLIC_AGENT_NAME_CHARS {
+        name.pop();
+        name.push('…');
+    }
+    *truncated |= name_truncated;
+    Some(name)
+}
+
+fn sanitized_agent_message_details(value: &Value, truncated: &mut bool) -> Option<Value> {
+    let details = value.as_object()?;
+    let id = public_agent_message_id(details.get("id")?, truncated)?;
+    let message = details.get("message")?.as_str()?;
+    if message.trim().is_empty() {
+        return None;
+    }
+    let mut public = Map::new();
+    public.insert("id".to_string(), Value::String(id));
+    public.insert(
+        "message".to_string(),
+        Value::String(truncate_text(message, MAX_PUBLIC_TEXT_CHARS, truncated)),
+    );
+    if let Some(from) = details.get("from").and_then(|value| {
+        public_agent_name(value, truncated).map(|session_name| json!({"sessionName": session_name}))
+    }) {
+        public.insert("from".to_string(), from);
+    }
+    if let Some(relationship @ ("parent" | "sibling" | "child")) =
+        details.get("fromRelationship").and_then(Value::as_str)
+    {
+        public.insert(
+            "fromRelationship".to_string(),
+            Value::String(relationship.to_string()),
+        );
+    }
+    if let Some(target) = details.get("target").and_then(|value| {
+        public_agent_name(value, truncated).map(|session_name| json!({"sessionName": session_name}))
+    }) {
+        public.insert("target".to_string(), target);
+    }
+    Some(Value::Object(public))
+}
+
 fn sanitized_message(entry: &ParsedEntry, truncated: &mut bool) -> Option<Value> {
     let kind = string_field(&entry.value, "type")?;
     match kind {
@@ -907,18 +993,37 @@ fn sanitized_message(entry: &ParsedEntry, truncated: &mut bool) -> Option<Value>
             public.insert("role".to_string(), Value::String("custom".to_string()));
             public.insert("display".to_string(), Value::Bool(true));
             copy_timestamp(&mut public, &entry.value, &entry.value);
-            public.insert(
-                "content".to_string(),
-                sanitized_content(
-                    entry
-                        .value
-                        .get("content")
-                        .unwrap_or(&Value::String(String::new())),
+            if string_field(&entry.value, "customType") == Some("agent_message") {
+                let details = sanitized_agent_message_details(
+                    entry.value.get("details").unwrap_or(&Value::Null),
                     truncated,
-                    &mut orbit_attachments,
-                    false,
-                ),
-            );
+                )?;
+                public.insert(
+                    "customType".to_string(),
+                    Value::String("agent_message".to_string()),
+                );
+                public.insert(
+                    "content".to_string(),
+                    details
+                        .get("message")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String(String::new())),
+                );
+                public.insert("details".to_string(), details);
+            } else {
+                public.insert(
+                    "content".to_string(),
+                    sanitized_content(
+                        entry
+                            .value
+                            .get("content")
+                            .unwrap_or(&Value::String(String::new())),
+                        truncated,
+                        &mut orbit_attachments,
+                        false,
+                    ),
+                );
+            }
             if !orbit_attachments.is_empty() {
                 public.insert(
                     "primeOrbitAttachments".to_string(),
@@ -1261,6 +1366,99 @@ mod tests {
         assert!(!serialized.contains("primeOrbitAttachments"));
         assert_eq!(history.messages[0]["content"], "assistant visible");
         assert_eq!(history.messages[1]["content"][0]["text"], "tool visible");
+    }
+
+    #[test]
+    fn preserves_only_safe_agent_message_history_details() {
+        let fixture = Fixture::new(&[json!({
+            "type":"custom_message",
+            "customType":"agent_message",
+            "id":"entry-agent-message",
+            "parentId":null,
+            "timestamp":"2026-01-01T00:00:00Z",
+            "display":true,
+            "content":"[from child:audit-security]\nAgent-to-agent message received.\nSource: agent_message\nFrom: audit-security, active ACTIVE_SECRET, session SESSION_SECRET, client CLIENT_SECRET\nTo: main, active TARGET_ACTIVE_SECRET, session TARGET_SESSION_SECRET\nMessage id: agentmsg_public\n\nAudit terminé.",
+            "details":{
+                "id":"agentmsg_public",
+                "message":"Audit terminé.",
+                "from":{
+                    "sessionName":"  audit-security  ",
+                    "activeSessionId":"ACTIVE_SECRET",
+                    "sessionId":"SESSION_SECRET",
+                    "runtimeKind":"subagent",
+                    "clientId":"CLIENT_SECRET"
+                },
+                "fromRelationship":"child",
+                "target":{
+                    "sessionName":"main",
+                    "activeSessionId":"TARGET_ACTIVE_SECRET",
+                    "sessionId":"TARGET_SESSION_SECRET",
+                    "runtimeKind":"top-level"
+                },
+                "authorization":"Bearer AUTH_SECRET",
+                "arbitrary":{"private":"ARBITRARY_SECRET"}
+            }
+        })]);
+
+        let history = fixture.load().expect("load safe agent message");
+        assert_eq!(history.messages.len(), 1);
+        assert_eq!(history.messages[0]["role"], "custom");
+        assert_eq!(history.messages[0]["customType"], "agent_message");
+        assert_eq!(history.messages[0]["content"], "Audit terminé.");
+        assert_eq!(
+            history.messages[0]["details"],
+            json!({
+                "id":"agentmsg_public",
+                "message":"Audit terminé.",
+                "from":{"sessionName":"audit-security"},
+                "fromRelationship":"child",
+                "target":{"sessionName":"main"}
+            })
+        );
+        let serialized = serde_json::to_string(&history.messages).expect("public history");
+        for private_value in [
+            "ACTIVE_SECRET",
+            "SESSION_SECRET",
+            "CLIENT_SECRET",
+            "TARGET_ACTIVE_SECRET",
+            "TARGET_SESSION_SECRET",
+            "AUTH_SECRET",
+            "ARBITRARY_SECRET",
+            "runtimeKind",
+            "activeSessionId",
+            "sessionId",
+            "clientId",
+            "authorization",
+            "arbitrary",
+        ] {
+            assert!(
+                !serialized.contains(private_value),
+                "leaked {private_value}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unbounded_agent_message_identifiers_before_ipc() {
+        let fixture = Fixture::new(&[json!({
+            "type":"custom_message",
+            "customType":"agent_message",
+            "id":"entry-agent-message",
+            "parentId":null,
+            "display":true,
+            "content":"raw protocol must not cross IPC",
+            "details":{
+                "id":format!("agentmsg_{}", "x".repeat(MAX_PUBLIC_AGENT_MESSAGE_ID_SUFFIX_CHARS + 1)),
+                "message":"still private because the envelope is invalid",
+                "from":{"sessionName":"audit"},
+                "fromRelationship":"child",
+                "target":{"sessionName":"main"}
+            }
+        })]);
+
+        let history = fixture.load().expect("ignore invalid agent message");
+        assert!(history.messages.is_empty());
+        assert!(history.truncated);
     }
 
     #[test]

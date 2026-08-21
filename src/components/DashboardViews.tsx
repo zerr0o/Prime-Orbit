@@ -47,6 +47,7 @@ import { useI18n } from "../i18n";
 import packageMetadata from "../../package.json";
 import type { AppUpdateState, AppView, Conversation, McpAuthKind, McpScope, McpServerSummary, ModelInfo, OllamaHealth, PersistedAppState, PrimeAgentConnections, PrimeAgentDefaults, Project, RuntimeDetection, SettingsSectionId, ThinkingLevel } from "../types";
 import { Badge, Button, EmptyState, Modal, Switch } from "./Ui";
+import { ReleaseNotesMarkdown } from "./ReleaseNotesMarkdown";
 
 interface HomeViewProps {
   projects: Project[];
@@ -726,7 +727,7 @@ function AppUpdatePanel({ state, onCheck, onDownload, onInstall }: {
       </div>
       {state.phase === "downloading" ? <div className="update-progress"><progress max={state.totalBytes} value={state.totalBytes ? state.downloadedBytes ?? 0 : undefined} aria-label={t("settings.downloadingUpdate", { version: state.update?.version ?? "" })} aria-valuetext={progress !== undefined && downloaded && total ? t("settings.downloadProgress", { percent: progress, received: downloaded, total }) : downloaded ? t("settings.downloadProgressUnknown", { received: downloaded }) : t("settings.downloadStarting")} /><span className="update-progress-copy" aria-live="polite">{progress !== undefined && downloaded && total ? t("settings.downloadProgress", { percent: progress, received: downloaded, total }) : downloaded ? t("settings.downloadProgressUnknown", { received: downloaded }) : t("settings.downloadStarting")}</span></div> : null}
       {state.phase === "error" ? <div className="update-error-details" role="alert"><ShieldAlert size={15} /><span>{state.error ?? t("settings.updateUnknownError")}</span></div> : null}
-      {state.update?.notes ? <details className="update-release-notes"><summary>{t("settings.releaseNotes")}</summary><p>{state.update.notes}</p><a href={updateReleaseUrl(state.update.version)} target="_blank" rel="noreferrer">{t("settings.openReleasePage")}<ExternalLink size={12} /></a></details> : null}
+      {state.update?.notes ? <details className="update-release-notes"><summary>{t("settings.releaseNotes")}</summary><ReleaseNotesMarkdown content={state.update.notes} /><a href={updateReleaseUrl(state.update.version)} target="_blank" rel="noreferrer">{t("settings.openReleasePage")}<ExternalLink size={12} /></a></details> : null}
     </section>
   );
 }
