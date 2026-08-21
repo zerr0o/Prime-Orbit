@@ -900,6 +900,15 @@ mod tests {
             let session_dir = agent_root.join("sessions").join("project-key");
             fs::create_dir_all(&session_dir).expect("session directory");
             fs::create_dir_all(&project).expect("project directory");
+            // GitHub's Windows runner can expose the temporary directory via
+            // an 8.3 alias while `dunce::canonicalize` returns its long form.
+            // Keep every fixture path in the same canonical namespace as the
+            // production validation so prefix checks exercise real traversal
+            // behavior instead of comparing two aliases for the same folder.
+            let home = canonicalize(&home).expect("canonical home");
+            let project = canonicalize(&project).expect("canonical project");
+            let agent_root = canonicalize(&agent_root).expect("canonical agent root");
+            let session_dir = canonicalize(&session_dir).expect("canonical session directory");
             let session_id = "session-safe-id".to_string();
             let session = session_dir.join("session.jsonl");
             let header = json!({
@@ -909,6 +918,7 @@ mod tests {
                 "cwd": project,
             });
             fs::write(&session, format!("{header}\n")).expect("session file");
+            let session = canonicalize(&session).expect("canonical session");
             Self {
                 _temp: temp,
                 home,
