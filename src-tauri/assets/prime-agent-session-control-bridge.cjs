@@ -8,6 +8,7 @@ const { pathToFileURL } = require("node:url");
 const MAX_REQUEST_BYTES = 64 * 1024;
 const SUPPORTED_PROTOCOL_VERSION = 7;
 const RELOAD_REQUEST_TIMEOUT_MS = 120_000;
+const DAEMON_SHUTDOWN_TIMEOUT_MS = 10_000;
 const HARD_TIMEOUT_MS = RELOAD_REQUEST_TIMEOUT_MS + 15_000;
 const MAX_WINDOWS_DAEMON_SOCKET_BYTES = 240;
 const MAX_UNIX_DAEMON_SOCKET_BYTES = 100;
@@ -157,12 +158,14 @@ function validRequest(request) {
   return request
     && typeof request === "object"
     && !Array.isArray(request)
-    && request.action === "reload"
-    && typeof request.sessionFile === "string"
-    && request.sessionFile.length > 0
-    && request.sessionFile.length <= 32_768
-    && (request.sessionId === undefined
-      || (typeof request.sessionId === "string" && request.sessionId.length > 0 && request.sessionId.length <= 512));
+    && (request.action === "shutdown"
+      ? Object.keys(request).length === 1
+      : request.action === "reload"
+        && typeof request.sessionFile === "string"
+        && request.sessionFile.length > 0
+        && request.sessionFile.length <= 32_768
+        && (request.sessionId === undefined
+          || (typeof request.sessionId === "string" && request.sessionId.length > 0 && request.sessionId.length <= 512)));
 }
 
 function selectSession(sessions, request) {
@@ -244,6 +247,43 @@ async function reloadAgentResources(client, request, hello) {
   return { status: "reloaded", supported: true };
 }
 
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+/** Stop the exact Orbit-owned daemon and prove that its socket stopped
+ * accepting connections. A shutdown acknowledgement alone is insufficient:
+ * Prime Agent can close the requester while its workers are still winding
+ * down, which is precisely the race that corrupts an app-update relaunch. */
+async function shutdownPrimeAgentDaemon(
+  createClient,
+  socketPath,
+  timeoutMs = DAEMON_SHUTDOWN_TIMEOUT_MS,
+  now = Date.now,
+  wait = delay,
+) {
+  const deadline = now() + timeoutMs;
+  while (now() < deadline) {
+    const client = createClient(socketPath);
+    let reachable = false;
+    try {
+      await client.connect(500);
+      reachable = true;
+      await client.waitForHello(1_000).catch(() => undefined);
+      await client.request({ type: "shutdown", force: true }, 1_500).catch(() => undefined);
+    } catch {
+      // Connection refusal is the authoritative stopped state. Any failure
+      // after connect is retried until the socket disappears or the bounded
+      // deadline expires.
+    } finally {
+      client.close();
+    }
+    if (!reachable) return { status: "stopped" };
+    await wait(50);
+  }
+  throw new Error("Le daemon Prime Agent est resté actif après la demande d’arrêt de mise à jour.");
+}
+
 async function readRequest() {
   const chunks = [];
   let requestBytes = 0;
@@ -274,6 +314,13 @@ async function main() {
     process.env.PRIME_ORBIT_DAEMON_SOCKET,
     defaultDaemonSocketPath,
   );
+  if (!validRequest(request)) throw new Error("Requête de contrôle Prime Agent invalide.");
+  if (request.action === "shutdown") {
+    const result = await shutdownPrimeAgentDaemon((target) => new DaemonClient(target), socketPath);
+    process.stdout.write(JSON.stringify(result));
+    return;
+  }
+
   const client = new DaemonClient(socketPath);
   const ownedDescriptor = readOwnedClientDescriptor(getAgentDir(), socketPath, request);
   bindOwnedClientIdentity(client, ownedDescriptor);
@@ -288,6 +335,7 @@ async function main() {
 }
 
 module.exports = {
+  DAEMON_SHUTDOWN_TIMEOUT_MS,
   RELOAD_REQUEST_TIMEOUT_MS,
   SUPPORTED_PROTOCOL_VERSION,
   bindOwnedClientIdentity,
@@ -300,6 +348,7 @@ module.exports = {
   resolveDaemonSocketPath,
   selectSession,
   selectOwnedClientDescriptor,
+  shutdownPrimeAgentDaemon,
   validOwnedClientDescriptor,
   validOwnedRequestIdSeed,
   validRequest,

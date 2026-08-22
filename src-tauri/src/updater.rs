@@ -793,9 +793,10 @@ pub async fn install_app_update(
 
     let install_app = app.clone();
     let install_result = crate::run_blocking(move || {
-        if force {
-            shutdown_all_agents_for_update(&install_app, &agents)?;
-        }
+        // Even an apparently idle Orbit process can retain its managed Prime
+        // Agent supervisor after the last RPC client detached. Stop and attest
+        // the private daemon before replacing/restarting the application.
+        shutdown_all_agents_for_update(&install_app, &agents)?;
         update
             .install(bytes.as_ref())
             .map_err(|error| error.to_string())

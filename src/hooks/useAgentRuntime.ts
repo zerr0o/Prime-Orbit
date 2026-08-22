@@ -3015,11 +3015,15 @@ export function useAgentRuntime(options: {
       }
       throw error;
     }
-    if (status !== "applied") {
+    const staleInactiveDelete = status === "inactive" && input.mutation.type === "delete";
+    if (status !== "applied" && !staleInactiveDelete) {
       const delivered = await reconcileMutationRace();
       if (input.mutation.type === "delete" && delivered) return;
       if (delivered) {
         throw new Error("Cette instruction a déjà été livrée à Prime Agent et ne peut plus être modifiée.");
+      }
+      if (status === "inactive") {
+        throw new Error("Cette instruction n’est plus modifiable car la session Prime Agent a déjà quitté la file active.");
       }
       if (status === "unsupported") {
         throw new Error("Ce runtime Prime Agent ne permet pas encore de modifier sa file d’attente.");

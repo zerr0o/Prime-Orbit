@@ -63,13 +63,18 @@ const MAX_GENERATION_DAEMON_SOCKET_BYTES: usize = 240;
 const MAX_GENERATION_DAEMON_SOCKET_BYTES: usize = 100;
 
 #[derive(Clone)]
-pub struct AgentsState(Arc<Mutex<HashMap<String, RunningAgent>>>, Arc<AtomicBool>);
+pub struct AgentsState(
+    Arc<Mutex<HashMap<String, RunningAgent>>>,
+    Arc<AtomicBool>,
+    Arc<Mutex<HashMap<PathBuf, ManagedDaemonShutdownTarget>>>,
+);
 
 impl Default for AgentsState {
     fn default() -> Self {
         Self(
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(HashMap::new())),
         )
     }
 }
@@ -118,6 +123,13 @@ struct RunningAgent {
     release_when_idle: bool,
     restarting: bool,
     operations: AgentOperations,
+}
+
+#[derive(Clone)]
+struct ManagedDaemonShutdownTarget {
+    node: PathBuf,
+    cli: PathBuf,
+    socket: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,6 +301,16 @@ struct SessionControlBridgeRequest {
     session_file: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DaemonShutdownBridgeRequest {
+    action: &'static str,
+}
+
+#[derive(Deserialize)]
+struct DaemonShutdownBridgeResult {
+    status: String,
 }
 
 fn validated_identifier(value: String) -> Result<String, String> {
@@ -2068,6 +2090,26 @@ fn managed_generation_daemon_socket(launch_spec: &LaunchSpec) -> Result<Option<P
     Ok(Some(socket))
 }
 
+fn managed_daemon_shutdown_target(
+    launch_spec: &LaunchSpec,
+    daemon_socket: Option<&Path>,
+) -> Option<ManagedDaemonShutdownTarget> {
+    let LaunchSpec::Source {
+        node,
+        cli,
+        managed: true,
+        ..
+    } = launch_spec
+    else {
+        return None;
+    };
+    Some(ManagedDaemonShutdownTarget {
+        node: node.clone(),
+        cli: cli.clone(),
+        socket: daemon_socket?.to_path_buf(),
+    })
+}
+
 fn configure_bridge_daemon_socket(command: &mut std::process::Command, socket: Option<&Path>) {
     // A user-defined parent environment must never redirect Orbit's private
     // bridges. Only the endpoint selected and retained by the native runtime is
@@ -2355,6 +2397,9 @@ fn start_agent_blocking(
         daemon_socket.as_deref(),
         &launch_spec,
     )?;
+    if let Some(target) = managed_daemon_shutdown_target(&launch_spec, daemon_socket.as_deref()) {
+        agents.2.lock().insert(target.socket.clone(), target);
+    }
     let info = spawned.info.clone();
     map.insert(
         conversation_id.clone(),
@@ -2760,7 +2805,7 @@ fn mutate_agent_queue_blocking(
         .map_err(|error| format!("Réponse de mutation de file invalide: {error}"))?;
     if !matches!(
         result.status.as_str(),
-        "applied" | "rejected" | "invalid" | "unsupported"
+        "applied" | "rejected" | "invalid" | "unsupported" | "inactive"
     ) {
         return Err("Statut de mutation de file inconnu.".to_string());
     }
@@ -3490,10 +3535,67 @@ pub fn shutdown_all_agents(app: &AppHandle, agents: &AgentsState) {
     }
 }
 
+fn shutdown_managed_daemon_for_update(target: &ManagedDaemonShutdownTarget) -> Result<(), String> {
+    let request = serde_json::to_vec(&DaemonShutdownBridgeRequest { action: "shutdown" }).map_err(
+        |error| format!("Impossible de préparer l’arrêt du daemon Prime Agent: {error}"),
+    )?;
+    let arguments = [
+        OsString::from("-e"),
+        OsString::from(SESSION_CONTROL_BRIDGE_SCRIPT),
+    ];
+    let mut command = external_command(&target.node, &arguments);
+    configure_bridge_daemon_socket(&mut command, Some(&target.socket));
+    command
+        .env("PRIME_ORBIT_CLI_PATH", &target.cli)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Impossible de lancer l’arrêt du daemon Prime Agent: {error}"))?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| {
+            "Impossible d’ouvrir l’entrée de contrôle du daemon Prime Agent.".to_string()
+        })
+        .and_then(|mut stdin| {
+            stdin.write_all(&request).map_err(|error| {
+                format!("Impossible d’envoyer l’arrêt au daemon Prime Agent: {error}")
+            })
+        });
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("Impossible d’attendre l’arrêt du daemon Prime Agent: {error}"))?;
+    if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if details.is_empty() {
+            format!(
+                "Le contrôle d’arrêt du daemon Prime Agent a quitté avec le statut {}.",
+                output.status
+            )
+        } else {
+            details
+        });
+    }
+    let result: DaemonShutdownBridgeResult = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Réponse d’arrêt du daemon Prime Agent invalide: {error}"))?;
+    if result.status != "stopped" {
+        return Err("Prime Agent n’a pas confirmé l’arrêt de son daemon.".to_string());
+    }
+    Ok(())
+}
+
 /// Stops every Prime Agent before installing an application update and fails
-/// closed when a child process cannot be confirmed stopped. Failed entries are
-/// restored to the registry so the UI can retry or stop them explicitly after
-/// the installation fence is released.
+/// closed until both every RPC client and every private managed daemon have
+/// been confirmed stopped. Failed child entries are restored to the registry
+/// so the UI can retry or stop them explicitly after the installation fence is
+/// released.
 pub fn shutdown_all_agents_for_update(app: &AppHandle, agents: &AgentsState) -> Result<(), String> {
     let running: Vec<_> = agents.0.lock().drain().collect();
     let mut failed = Vec::new();
@@ -3511,22 +3613,31 @@ pub fn shutdown_all_agents_for_update(app: &AppHandle, agents: &AgentsState) -> 
         }
     }
 
-    if failed.is_empty() {
-        return Ok(());
+    if !failed.is_empty() {
+        let mut failures = Vec::with_capacity(failed.len());
+        let mut map = agents.0.lock();
+        for (conversation_id, agent, error) in failed {
+            failures.push(format!("{conversation_id}: {error}"));
+            map.entry(conversation_id).or_insert(agent);
+        }
+        drop(map);
+
+        return Err(format!(
+            "La mise à jour a été annulée car Prime Orbit n’a pas pu confirmer l’arrêt de toutes les sessions Prime Agent: {}",
+            failures.join("; ")
+        ));
     }
 
-    let mut failures = Vec::with_capacity(failed.len());
-    let mut map = agents.0.lock();
-    for (conversation_id, agent, error) in failed {
-        failures.push(format!("{conversation_id}: {error}"));
-        map.entry(conversation_id).or_insert(agent);
+    let targets: Vec<_> = agents.2.lock().values().cloned().collect();
+    for target in targets {
+        shutdown_managed_daemon_for_update(&target).map_err(|error| {
+            format!(
+                "La mise à jour a été annulée car le daemon Prime Agent n’a pas pu être arrêté proprement: {error}"
+            )
+        })?;
+        agents.2.lock().remove(&target.socket);
     }
-    drop(map);
-
-    Err(format!(
-        "La mise à jour a été annulée car Prime Orbit n’a pas pu confirmer l’arrêt de toutes les sessions Prime Agent: {}",
-        failures.join("; ")
-    ))
+    Ok(())
 }
 
 pub fn release_window_agents(agents: AgentsState, owner: String) {
@@ -3542,9 +3653,10 @@ mod tests {
         conflicting_session_conversation, direct_session_operation_runtime_event,
         ensure_update_installation_is_idle, finish_resource_reload, finish_runtime_write,
         is_extension_ui_request, is_reload_acknowledgement_timeout, lease_absence_attests_release,
-        managed_generation_daemon_socket, mark_resource_reload_unknown, owner_may_send,
-        public_runtime_line, release_owner_lease_state, requested_launch_option_update,
-        restart_slot_matches, rpc_launch_arguments, rpc_starts_busy_operation, runtime_busy_state,
+        managed_daemon_shutdown_target, managed_generation_daemon_socket,
+        mark_resource_reload_unknown, owner_may_send, public_runtime_line,
+        release_owner_lease_state, requested_launch_option_update, restart_slot_matches,
+        rpc_launch_arguments, rpc_starts_busy_operation, runtime_busy_state,
         runtime_launch_options, runtime_session_id, runtime_session_path,
         should_emit_resources_reloaded, validate_queue_lane, validate_queue_mutation,
         validate_reload_result, wait_for_child_until, waiter_may_remove_slot, AgentOperations,
@@ -4660,6 +4772,35 @@ mod tests {
         .expect("other valid managed generation")
         .expect("other generation socket");
         assert_ne!(first, other);
+    }
+
+    #[test]
+    fn only_private_managed_generations_are_registered_for_update_shutdown() {
+        let generation = "prime-agent-v0.7.4-4a6f213a1ed44889a0f0b40ea4774f3d";
+        let launch = source_launch_spec(generation, true);
+        let socket = managed_generation_daemon_socket(&launch)
+            .expect("valid generation")
+            .expect("private socket");
+        let target =
+            managed_daemon_shutdown_target(&launch, Some(&socket)).expect("managed daemon target");
+        assert_eq!(target.node, PathBuf::from("node"));
+        assert_eq!(target.cli, PathBuf::from("cli.js"));
+        assert_eq!(target.socket, socket);
+
+        assert!(managed_daemon_shutdown_target(&launch, None).is_none());
+        assert!(managed_daemon_shutdown_target(
+            &source_launch_spec(generation, false),
+            Some(Path::new("external.sock")),
+        )
+        .is_none());
+        assert!(managed_daemon_shutdown_target(
+            &LaunchSpec::Executable {
+                executable: PathBuf::from("prime-agent"),
+                managed: false,
+            },
+            Some(Path::new("system.sock")),
+        )
+        .is_none());
     }
 
     #[test]

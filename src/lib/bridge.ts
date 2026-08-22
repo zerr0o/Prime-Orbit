@@ -288,7 +288,7 @@ export async function sendRpc(conversationId: string, payload: Record<string, un
   await invoke("send_rpc", { conversationId, payload });
 }
 
-export type QueueMutationStatus = "applied" | "rejected" | "invalid" | "unsupported";
+export type QueueMutationStatus = "applied" | "rejected" | "invalid" | "unsupported" | "inactive";
 export type QueueMutation =
   | { type: "delete" }
   | { type: "move"; direction: -1 | 1 }

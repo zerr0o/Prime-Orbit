@@ -216,7 +216,12 @@ async function main() {
       session = sessions.find((item) => normalizedFile(item?.sessionFile) === expectedFile && item?.activeSessionId);
     }
     if (!session?.activeSessionId) {
-      throw new Error("La session Prime Agent n’est pas active dans le daemon.");
+      // The queued action may have crossed its durable delivery boundary
+      // between the renderer click and this one-shot bridge lookup. This is a
+      // reconciliation state, not a transport failure: the renderer can drop
+      // a stale delete row, while edits still fail with a precise explanation.
+      process.stdout.write(JSON.stringify({ status: "inactive" }));
+      return;
     }
 
     const state = await client.request({

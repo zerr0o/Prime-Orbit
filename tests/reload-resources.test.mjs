@@ -15,6 +15,7 @@ const {
   resolveDaemonSocketPath,
   selectSession,
   selectOwnedClientDescriptor,
+  shutdownPrimeAgentDaemon,
   validOwnedClientDescriptor,
   validOwnedRequestIdSeed,
   validRequest,
@@ -139,9 +140,60 @@ test("allocates a disjoint command namespace before impersonating an RPC owner",
 
 test("accepts only the bounded native reload action", () => {
   assert.equal(validRequest(request), true);
+  assert.equal(validRequest({ action: "shutdown" }), true);
+  assert.equal(validRequest({ action: "shutdown", sessionFile: request.sessionFile }), false);
   assert.equal(validRequest({ ...request, action: "prompt" }), false);
   assert.equal(validRequest({ ...request, sessionFile: "" }), false);
   assert.equal(validRequest({ ...request, sessionId: "x".repeat(513) }), false);
+});
+
+test("stops the exact managed daemon and waits until its socket disappears", async () => {
+  const commands = [];
+  let attempts = 0;
+  const createClient = (socketPath) => {
+    attempts += 1;
+    const reachable = attempts === 1;
+    return {
+      async connect() {
+        assert.equal(socketPath, generationSocket);
+        if (!reachable) throw new Error("socket gone");
+      },
+      async waitForHello() { return hello; },
+      async request(command, timeoutMs) {
+        commands.push({ command, timeoutMs });
+        return { success: true };
+      },
+      close() {},
+    };
+  };
+
+  assert.deepEqual(
+    await shutdownPrimeAgentDaemon(createClient, generationSocket, 500, Date.now, async () => undefined),
+    { status: "stopped" },
+  );
+  assert.deepEqual(commands, [{ command: { type: "shutdown", force: true }, timeoutMs: 1_500 }]);
+  assert.equal(attempts, 2, "the shutdown acknowledgement is followed by a socket probe");
+});
+
+test("fails closed when a managed daemon keeps accepting connections", async () => {
+  let clock = 0;
+  const createClient = () => ({
+    async connect() {},
+    async waitForHello() { return hello; },
+    async request() { return { success: true }; },
+    close() {},
+  });
+
+  await assert.rejects(
+    shutdownPrimeAgentDaemon(
+      createClient,
+      generationSocket,
+      100,
+      () => clock,
+      async (milliseconds) => { clock += milliseconds; },
+    ),
+    /resté actif/u,
+  );
 });
 
 test("resolves the daemon session by canonical id before the file fallback", () => {
