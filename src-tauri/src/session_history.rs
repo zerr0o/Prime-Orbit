@@ -409,9 +409,18 @@ fn canonical_if_directory(path: &Path) -> Option<PathBuf> {
         .and_then(|_| canonicalize(path).ok())
 }
 
-fn is_under_known_session_root(path: &Path, home: &Path) -> bool {
-    canonical_if_directory(&home.join(".prime").join("agent").join("sessions"))
-        .is_some_and(|root| path.starts_with(root))
+fn known_session_roots(home: &Path, project_path: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![home.join(".prime").join("agent").join("sessions")];
+    let configured = std::env::var_os("PRIME_AGENT_CODING_AGENT_DIR")
+        .or_else(|| std::env::var_os("PI_CODING_AGENT_DIR"));
+    roots.push(resolve_agent_dir(home, project_path, configured.as_deref()).join("sessions"));
+    roots
+}
+
+fn is_under_known_session_root(path: &Path, home: &Path, project_path: &Path) -> bool {
+    known_session_roots(home, project_path).iter().any(|root| {
+        canonical_if_directory(root).is_some_and(|canonical| path.starts_with(canonical))
+    })
 }
 
 fn header_version(header: &Value) -> Result<u64, String> {
@@ -442,6 +451,15 @@ fn validate_header(
         string_field(header, "cwd").and_then(|value| canonical_if_directory(Path::new(value)));
     let cwd_matches = header_cwd.as_deref() == Some(project_path);
 
+    // Containment in a known session root is mandatory in BOTH branches:
+    // knowing the header id must never widen which files the renderer can
+    // make Prime Orbit read and parse.
+    if !is_under_known_session_root(session_path, home, project_path) {
+        return Err(
+            "La session ne correspond ni à la conversation ni au projet sélectionné".to_string(),
+        );
+    }
+
     if let Some(expected_session_id) = expected_session_id {
         if expected_session_id != header_id {
             return Err("La session ne correspond pas à la conversation sélectionnée".to_string());
@@ -452,7 +470,7 @@ fn validate_header(
         }));
     }
 
-    if !is_under_known_session_root(session_path, home) || !cwd_matches {
+    if !cwd_matches {
         return Err(
             "La session ne correspond ni à la conversation ni au projet sélectionné".to_string(),
         );
@@ -2405,6 +2423,26 @@ mod tests {
         let error = load_session_history_blocking(
             outside.to_string_lossy().into_owned(),
             Some("different-id".to_string()),
+            fixture.project.to_string_lossy().into_owned(),
+            fixture.home.clone(),
+        )
+        .unwrap_err();
+        assert!(error.contains("ne correspond"));
+    }
+
+    #[test]
+    fn rejects_outside_root_even_with_matching_expected_id() {
+        let fixture = Fixture::new(&[json!({
+            "type":"message","id":"one","parentId":null,
+            "message":{"role":"user","content":"lecture hors racine"}
+        })]);
+        let outside = fixture._temp.path().join("outside.jsonl");
+        fs::copy(&fixture.session, &outside).unwrap();
+        // The copied header keeps its valid id, so only the root containment
+        // check can reject this read.
+        let error = load_session_history_blocking(
+            outside.to_string_lossy().into_owned(),
+            Some(fixture.session_id.clone()),
             fixture.project.to_string_lossy().into_owned(),
             fixture.home.clone(),
         )

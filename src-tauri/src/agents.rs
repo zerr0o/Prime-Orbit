@@ -3300,15 +3300,26 @@ fn restart_agent_blocking(
     Ok(result)
 }
 
+struct StopAgentSnapshot {
+    child: Arc<Mutex<Child>>,
+    exit_emitted: Arc<AtomicBool>,
+    pid: u32,
+    restarting: bool,
+}
+
 fn stop_agent_blocking(
     app: AppHandle,
     agents: AgentsState,
+    owner: String,
     conversation_id: String,
 ) -> Result<bool, String> {
     let conversation_id = validated_identifier(conversation_id)?;
-    let agent = {
+    // Snapshot the handles without removing the slot. The slot is only dropped
+    // after the child is proven terminated, so a failed kill can never orphan a
+    // running RPC client behind a freed conversation id.
+    let snapshot = {
         let mut map = agents.0.lock();
-        let Some(agent) = map.get(&conversation_id) else {
+        let Some(agent) = map.get_mut(&conversation_id) else {
             return Ok(false);
         };
         if agent.operations.reloading.is_some() {
@@ -3317,31 +3328,57 @@ fn stop_agent_blocking(
                     .to_string(),
             );
         }
-        map.remove(&conversation_id)
-            .expect("agent slot checked under the same lock")
+        // Ownership mirrors restart_agent. An agent whose owners have all been
+        // released (idle release still pending) remains stoppable by any window.
+        if !agent.owners.contains(&owner) && !agent.owners.is_empty() {
+            return Err(
+                "Cette fenêtre ne possède pas la conversation Prime Agent demandée.".to_string(),
+            );
+        }
+        StopAgentSnapshot {
+            child: Arc::clone(&agent.child),
+            exit_emitted: Arc::clone(&agent.exit_emitted),
+            pid: agent.info.pid,
+            restarting: agent.restarting,
+        }
     };
 
-    let status = terminate_child(&mut agent.child.lock());
-    if agent.restarting {
+    let status = terminate_child(&mut snapshot.child.lock())?;
+
+    {
+        let mut map = agents.0.lock();
+        // Drop the slot only while it still refers to the exact process this
+        // call terminated. A concurrent restart keeps ownership of the slot
+        // until its replacement takes over under a new pid.
+        let same_process = map
+            .get(&conversation_id)
+            .is_some_and(|agent| agent.info.pid == snapshot.pid && !agent.restarting);
+        if same_process {
+            map.remove(&conversation_id)
+                .expect("agent slot checked under the same lock");
+        }
+    }
+
+    if snapshot.restarting {
         // A concurrent explicit stop wins over emergency restart. Restart had
         // suppressed the old waiter's exit, so publish the stop result here.
-        let event = match status {
-            Ok(status) => AgentExitEvent {
+        let _ = app.emit(
+            "prime-agent://exit",
+            AgentExitEvent {
                 conversation_id: conversation_id.clone(),
                 code: status.code(),
                 success: status.success(),
                 error: None,
             },
-            Err(error) => AgentExitEvent {
-                conversation_id: conversation_id.clone(),
-                code: None,
-                success: false,
-                error: Some(error),
-            },
-        };
-        let _ = app.emit("prime-agent://exit", event);
+        );
     } else {
-        emit_exit_once(&app, &conversation_id, &agent.exit_emitted, status, None);
+        emit_exit_once(
+            &app,
+            &conversation_id,
+            &snapshot.exit_emitted,
+            Ok(status),
+            None,
+        );
     }
     Ok(true)
 }
@@ -3492,11 +3529,13 @@ pub async fn reload_agent_resources(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn stop_agent(
     app: AppHandle,
+    window: tauri::WebviewWindow,
     agents: tauri::State<'_, AgentsState>,
     conversation_id: String,
 ) -> Result<bool, String> {
     let agents = agents.inner().clone();
-    crate::run_blocking(move || stop_agent_blocking(app, agents, conversation_id)).await
+    let owner = window.label().to_string();
+    crate::run_blocking(move || stop_agent_blocking(app, agents, owner, conversation_id)).await
 }
 
 /// Emergency-restarts only the RPC client associated with one conversation.

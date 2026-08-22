@@ -4,6 +4,25 @@ All notable changes to Prime Orbit are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-08-22
+
+### Conversation state reliability
+
+- Cleared the active-run marker when a queued prompt submission fails before reaching Prime Agent, so failed sends roll back cleanly instead of forcing every later prompt into queue-only delivery until restart.
+- Kept the agent slot alive when child termination fails during an explicit stop, preventing orphaned RPC clients from hiding behind a freed conversation identifier; the slot is removed only after the exact terminated process is confirmed and only while no emergency restart has claimed it.
+
+### Process ownership
+
+- Added window ownership enforcement to explicit agent stops, mirroring restart semantics: windows attached to the conversation may stop it, unowned idle agents remain stoppable for cleanup, and foreign windows are rejected.
+
+### History containment
+
+- Required session history files to reside under a known Prime Agent sessions root even when the expected session identifier matches, closing a local file disclosure path through renderer-controlled session paths; configured agent directories remain valid roots.
+
+### Interface
+
+- Introduced a modal stack so stacked dialogs close one layer at a time and only the topmost dialog traps Tab focus.
+
 ## [0.1.23] - 2026-08-22
 
 ### Queue cleanup

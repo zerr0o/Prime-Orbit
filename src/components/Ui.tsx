@@ -27,6 +27,12 @@ export function Switch({ checked, onChange, label }: { checked: boolean; onChang
   );
 }
 
+// Stacked modals otherwise install competing window keydown listeners: one
+// Escape press would close both, and an older dialog could steal Tab trapping
+// from the one actually on screen. Only the topmost modal may act.
+const modalStack: symbol[] = [];
+const isTopModal = (token: symbol) => modalStack[modalStack.length - 1] === token;
+
 export function Modal({ title, description, icon, children, onClose, width = "560px", footer, className = "", bodyClassName = "" }: PropsWithChildren<{ title: string; description?: ReactNode; icon?: ReactNode; onClose: () => void; width?: string; footer?: ReactNode; className?: string; bodyClassName?: string }>) {
   const { t } = useI18n();
   const dialogRef = useRef<HTMLElement>(null);
@@ -38,6 +44,8 @@ export function Modal({ title, description, icon, children, onClose, width = "56
   // the modal with a fresh callback identity; restarting the effect would
   // restore and then reassign focus while the user is typing.
   useEffect(() => {
+    const modalToken = Symbol("modal");
+    modalStack.push(modalToken);
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
     const dialog = dialogRef.current;
     const focusableSelector = [
@@ -57,6 +65,7 @@ export function Modal({ title, description, icon, children, onClose, width = "56
     };
     const frame = window.requestAnimationFrame(focusFirstControl);
     const onKeyDown = (event: KeyboardEvent) => {
+      if (!isTopModal(modalToken)) return;
       if (event.key === "Escape") {
         event.preventDefault();
         onCloseRef.current();
@@ -83,6 +92,8 @@ export function Modal({ title, description, icon, children, onClose, width = "56
     return () => {
       window.cancelAnimationFrame(frame);
       window.removeEventListener("keydown", onKeyDown);
+      const index = modalStack.indexOf(modalToken);
+      if (index >= 0) modalStack.splice(index, 1);
       if (previousFocus?.isConnected) previousFocus.focus();
     };
   }, []);

@@ -2865,7 +2865,10 @@ export function useAgentRuntime(options: {
       try {
         await ensureStarted(selectedConversation, selectedProject);
       } catch (error) {
-        if (!forceQueued) activePromptRuns.current.delete(conversationId);
+        // Nothing was admitted: whether or not the prompt was queued, there is
+        // no run to track. Keeping the marker would force every later prompt
+        // into queued delivery until an agent_end that can never arrive.
+        activePromptRuns.current.delete(conversationId);
         throw error;
       } finally {
         pendingPromptAdmissions.current.delete(conversationId);
@@ -2941,7 +2944,11 @@ export function useAgentRuntime(options: {
           }, 50);
         }
       } catch (error) {
-        if (!forceQueued) activePromptRuns.current.delete(conversationId);
+        // The RPC was rejected before reaching Prime Agent's stdin: roll the
+        // optimistic message back and stop tracking a run that never started.
+        // Keeping the marker would force every later prompt into queued
+        // delivery until an agent_end that can never arrive.
+        activePromptRuns.current.delete(conversationId);
         updateConversation(conversationId, (conversation) => rollbackPromptTransaction(conversation, prepared.transaction));
         throw error;
       }
