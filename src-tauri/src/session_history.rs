@@ -1312,6 +1312,77 @@ fn sanitized_agent_message_details(value: &Value, truncated: &mut bool) -> Optio
     Some(Value::Object(public))
 }
 
+fn sanitized_refinement_outcome_edit(value: &Value, truncated: &mut bool) -> Option<Value> {
+    let edit = value.as_object()?;
+    let action = edit
+        .get("action")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "create" | "update" | "delete"))?;
+    let kind = edit
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "prompt" | "memory" | "skill" | "subagent"))?;
+    let id = refinement_id(edit.get("id").and_then(Value::as_str), truncated)?;
+    let applied = edit.get("applied").and_then(Value::as_bool)?;
+    let mut public = Map::new();
+    public.insert("action".to_string(), Value::String(action.to_string()));
+    public.insert("kind".to_string(), Value::String(kind.to_string()));
+    public.insert("id".to_string(), Value::String(id));
+    public.insert("applied".to_string(), Value::Bool(applied));
+    if let Some(title) = refinement_text(
+        edit.get("title").and_then(Value::as_str),
+        MAX_REFINEMENT_SUMMARY_CHARS,
+        truncated,
+    ) {
+        public.insert("title".to_string(), Value::String(title));
+    }
+    if let Some(error) = refinement_text(
+        edit.get("error").and_then(Value::as_str),
+        MAX_REFINEMENT_DETAIL_CHARS,
+        truncated,
+    ) {
+        public.insert("error".to_string(), Value::String(error));
+    }
+    Some(Value::Object(public))
+}
+
+fn sanitized_refinement_outcome_details(value: &Value, truncated: &mut bool) -> Option<Value> {
+    let details = value.as_object()?;
+    let public_id = refinement_id(
+        details.get("refinementId").and_then(Value::as_str),
+        truncated,
+    )?;
+    let summary = refinement_text(
+        details.get("summary").and_then(Value::as_str),
+        MAX_REFINEMENT_SUMMARY_CHARS,
+        truncated,
+    )?;
+    let scope = details
+        .get("scope")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "local" | "global"))?;
+    let edits = details.get("edits").and_then(Value::as_array)?;
+    if edits.len() > MAX_REFINEMENT_EDITS {
+        *truncated = true;
+    }
+    let edits = edits
+        .iter()
+        .take(MAX_REFINEMENT_EDITS)
+        .filter_map(|edit| sanitized_refinement_outcome_edit(edit, truncated))
+        .collect::<Vec<_>>();
+    let mut public = Map::new();
+    public.insert("refinementId".to_string(), Value::String(public_id));
+    public.insert("summary".to_string(), Value::String(summary));
+    public.insert("scope".to_string(), Value::String(scope.to_string()));
+    public.insert("edits".to_string(), Value::Array(edits));
+    if let Some(rollback_of) =
+        refinement_id(details.get("rollbackOf").and_then(Value::as_str), truncated)
+    {
+        public.insert("rollbackOf".to_string(), Value::String(rollback_of));
+    }
+    Some(Value::Object(public))
+}
+
 fn sanitized_message(entry: &ParsedEntry, truncated: &mut bool) -> Option<Value> {
     let kind = string_field(&entry.value, "type")?;
     match kind {
@@ -1377,6 +1448,24 @@ fn sanitized_message(entry: &ParsedEntry, truncated: &mut bool) -> Option<Value>
             }
             if role == "custom" {
                 public.insert("display".to_string(), Value::Bool(true));
+                if source.get("customType").and_then(Value::as_str) == Some("refinement_outcome") {
+                    let details = sanitized_refinement_outcome_details(
+                        source.get("details").unwrap_or(&Value::Null),
+                        truncated,
+                    )?;
+                    public.insert(
+                        "customType".to_string(),
+                        Value::String("refinement_outcome".to_string()),
+                    );
+                    public.insert(
+                        "content".to_string(),
+                        details
+                            .get("summary")
+                            .cloned()
+                            .unwrap_or_else(|| Value::String(String::new())),
+                    );
+                    public.insert("details".to_string(), details);
+                }
             }
             if role == "bashExecution" {
                 for key in ["command", "output"] {
@@ -1416,6 +1505,23 @@ fn sanitized_message(entry: &ParsedEntry, truncated: &mut bool) -> Option<Value>
                     "content".to_string(),
                     details
                         .get("message")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String(String::new())),
+                );
+                public.insert("details".to_string(), details);
+            } else if string_field(&entry.value, "customType") == Some("refinement_outcome") {
+                let details = sanitized_refinement_outcome_details(
+                    entry.value.get("details").unwrap_or(&Value::Null),
+                    truncated,
+                )?;
+                public.insert(
+                    "customType".to_string(),
+                    Value::String("refinement_outcome".to_string()),
+                );
+                public.insert(
+                    "content".to_string(),
+                    details
+                        .get("summary")
                         .cloned()
                         .unwrap_or_else(|| Value::String(String::new())),
                 );
@@ -2177,6 +2283,64 @@ mod tests {
         let history = fixture.load().expect("ignore invalid agent message");
         assert!(history.messages.is_empty());
         assert!(history.truncated);
+    }
+
+    #[test]
+    fn preserves_only_safe_refinement_outcome_history_details() {
+        let fixture = Fixture::new(&[json!({
+            "type":"custom_message",
+            "customType":"refinement_outcome",
+            "id":"entry-refinement-outcome",
+            "parentId":null,
+            "timestamp":"2026-08-22T12:00:00Z",
+            "display":true,
+            "content":"Refinement complete: raw fallback",
+            "details":{
+                "refinementId":"refine_public",
+                "summary":"Persist the verified runtime migration.",
+                "scope":"global",
+                "edits":[{
+                    "action":"update","kind":"memory","id":"runtime-v080","title":"Prime Agent 0.8","applied":true,
+                    "before":{"content":"PRIVATE_BEFORE"},"after":{"content":"PRIVATE_AFTER"},"metadata":{"token":"PRIVATE_TOKEN"}
+                }],
+                "harnessStatePath":"C:\\PRIVATE\\harness_state.json",
+                "rationale":"PRIVATE_RATIONALE"
+            }
+        })]);
+
+        let history = fixture.load().expect("load safe refinement outcome");
+        assert_eq!(history.messages.len(), 1);
+        assert_eq!(history.messages[0]["customType"], "refinement_outcome");
+        assert_eq!(
+            history.messages[0]["content"],
+            "Persist the verified runtime migration."
+        );
+        assert_eq!(
+            history.messages[0]["details"],
+            json!({
+                "refinementId":"refine_public",
+                "summary":"Persist the verified runtime migration.",
+                "scope":"global",
+                "edits":[{"action":"update","kind":"memory","id":"runtime-v080","title":"Prime Agent 0.8","applied":true}]
+            })
+        );
+        let serialized =
+            serde_json::to_string(&history.messages).expect("public refinement outcome");
+        for private_value in [
+            "PRIVATE_BEFORE",
+            "PRIVATE_AFTER",
+            "PRIVATE_TOKEN",
+            "PRIVATE_RATIONALE",
+            "harnessStatePath",
+            "before",
+            "after",
+            "metadata",
+        ] {
+            assert!(
+                !serialized.contains(private_value),
+                "leaked {private_value}"
+            );
+        }
     }
 
     #[test]

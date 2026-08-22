@@ -20,8 +20,8 @@ use tauri::AppHandle;
 use std::ffi::OsStr;
 
 pub const OFFICIAL_REPOSITORY_URL: &str = "https://github.com/PrimeIntellect-ai/prime-agent.git";
-pub const SUPPORTED_PRIME_AGENT_TAG: &str = "v0.7.4";
-pub const SUPPORTED_PRIME_AGENT_COMMIT: &str = "af0b8e00b9f704e834787fd321065ca78281f2aa";
+pub const SUPPORTED_PRIME_AGENT_TAG: &str = "v0.8.0";
+pub const SUPPORTED_PRIME_AGENT_COMMIT: &str = "8d7deeab5861bf9d77bde3d8511046a5c799818d";
 const LEGACY_MANAGED_SOURCE_DIR_NAME: &str = "prime-agent";
 const MANAGED_SOURCE_DIR_PREFIX: &str = "prime-agent-";
 const MINIMUM_PRIME_AGENT_NODE_VERSION: (u64, u64) = (22, 8);

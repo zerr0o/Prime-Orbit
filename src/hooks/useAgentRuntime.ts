@@ -25,6 +25,10 @@ import {
   parseAgentMessageNotice,
 } from "../lib/agent-message-notices";
 import {
+  appendUniqueRefinementOutcome,
+  parseRefinementOutcomeNotice,
+} from "../lib/refinement-outcome-notices";
+import {
   goalAcknowledgementDisposition,
   goalForSessionSnapshot,
   goalMutationDescriptor,
@@ -157,7 +161,7 @@ const HISTORY_RESPONSE_TIMEOUT_MS = 30_000;
 const HISTORY_REQUEST_ATTEMPTS = 1;
 const PASSIVE_RESPONSE_TIMEOUT_MS = 30_000;
 const HTML_EXPORT_RESPONSE_TIMEOUT_MS = 20 * 60_000;
-// Prime Agent v0.7.4 gives daemon refinements a ten-minute window. Orbit keeps
+// Prime Agent gives daemon refinements a ten-minute window. Orbit keeps
 // the request conversation-scoped (so navigation cannot cancel it) and adds a
 // small transport margin without pretending that a timeout cancelled the work.
 const REFINE_RESPONSE_TIMEOUT_MS = 12 * 60_000;
@@ -3761,14 +3765,13 @@ export function handleMessageEvent(
     return;
   }
   if (role === "custom") {
-    // Agent-to-agent messages are durable prompt boundaries. Prime Agent emits
-    // the same custom record at message_start and message_end; append only the
-    // start event and deduplicate by its canonical agentmsg id.
+    // Durable custom records are emitted at both message_start and message_end.
+    // Append only the start and deduplicate on their canonical public id.
     if (event.type !== "message_start") return;
-    const parsed = parseAgentMessageNotice(rawMessage);
+    const parsed = parseAgentMessageNotice(rawMessage) ?? parseRefinementOutcomeNotice(rawMessage);
     if (!parsed) return;
     const message: ChatMessage = {
-      id: parsed.notice.messageId,
+      id: parsed.notice.kind === "agent_message" ? parsed.notice.messageId : parsed.notice.refinementId,
       role: "system",
       content: parsed.content,
       createdAt: historyTimestamp(rawMessage?.timestamp),
@@ -3776,7 +3779,9 @@ export function handleMessageEvent(
       notice: parsed.notice,
     };
     updateConversation(conversationId, (conversation) => {
-      const messages = appendUniqueAgentMessage(conversation.messages, message);
+      const messages = parsed.notice.kind === "agent_message"
+        ? appendUniqueAgentMessage(conversation.messages, message)
+        : appendUniqueRefinementOutcome(conversation.messages, message);
       return messages === conversation.messages
         ? conversation
         : { ...conversation, hasContent: true, messages };
@@ -4413,6 +4418,7 @@ export function mapAgentMessages(messages: unknown[]): ChatMessage[] {
   const mapped: ChatMessage[] = [];
   const toolLocations = new Map<string, { messageIndex: number; toolIndex: number }>();
   const agentMessageIds = new Set<string>();
+  const refinementOutcomeIds = new Set<string>();
 
   for (let index = 0; index < messages.length; index += 1) {
     const message = asRecord(messages[index]);
@@ -4529,6 +4535,20 @@ export function mapAgentMessages(messages: unknown[]): ChatMessage[] {
           createdAt,
           status: "complete",
           notice: agentMessage.notice,
+        });
+        continue;
+      }
+      const refinementOutcome = parseRefinementOutcomeNotice(message);
+      if (refinementOutcome) {
+        if (refinementOutcomeIds.has(refinementOutcome.notice.refinementId)) continue;
+        refinementOutcomeIds.add(refinementOutcome.notice.refinementId);
+        mapped.push({
+          id: String(message.id ?? refinementOutcome.notice.refinementId),
+          role: "system",
+          content: refinementOutcome.content,
+          createdAt,
+          status: "complete",
+          notice: refinementOutcome.notice,
         });
         continue;
       }

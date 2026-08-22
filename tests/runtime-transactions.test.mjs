@@ -545,6 +545,57 @@ test("renders a live agent message once with only its useful structured body", (
   assert.doesNotMatch(current.messages[0].content, /Source:|Message id:/u);
 });
 
+test("renders Prime Agent 0.8 refinement outcomes once without private edit snapshots", () => {
+  const refinement = {
+    role: "custom",
+    customType: "refinement_outcome",
+    display: true,
+    content: "Refinement complete: wire fallback",
+    details: {
+      refinementId: "refine_live",
+      summary: "Keep the validated migration fact.",
+      scope: "global",
+      edits: [{ action: "create", kind: "memory", id: "runtime-v080", title: "Prime Agent 0.8", applied: true }],
+    },
+    timestamp: "2026-08-22T12:00:00.000Z",
+  };
+  let current = conversation();
+  const update = (_conversationId, updater) => {
+    current = typeof updater === "function" ? updater(current) : { ...current, ...updater };
+  };
+
+  handleMessageEvent("conversation-a", { type: "message_start", message: refinement }, update);
+  handleMessageEvent("conversation-a", { type: "message_end", message: refinement }, update);
+  handleMessageEvent("conversation-a", { type: "message_start", message: refinement }, update);
+
+  assert.equal(current.messages.length, 1);
+  assert.equal(current.messages[0].content, "Keep the validated migration fact.");
+  assert.equal(current.messages[0].notice.kind, "refinement_outcome");
+  assert.equal(current.messages[0].notice.refinementId, "refine_live");
+});
+
+test("restores a durable Prime Agent 0.8 refinement outcome as a typed notice", () => {
+  const mapped = mapAgentMessages([{
+    id: "entry-refine-history",
+    role: "custom",
+    customType: "refinement_outcome",
+    display: true,
+    content: "Persist the durable migration outcome.",
+    details: {
+      refinementId: "refine_history",
+      summary: "Persist the durable migration outcome.",
+      scope: "local",
+      edits: [{ action: "update", kind: "memory", id: "runtime-v080", applied: true }],
+    },
+  }]);
+
+  assert.equal(mapped.length, 1);
+  assert.equal(mapped[0].id, "entry-refine-history");
+  assert.equal(mapped[0].role, "system");
+  assert.equal(mapped[0].notice.kind, "refinement_outcome");
+  assert.equal(mapped[0].notice.refinementId, "refine_history");
+});
+
 test("deduplicates structured and canonical legacy agent messages in restored history", () => {
   const canonical = [
     "[from child:reviewer]",

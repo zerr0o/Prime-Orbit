@@ -5,12 +5,12 @@ const minutesAgo = (minutes: number) => new Date(now.getTime() - minutes * 60_00
 
 export const demoDetection: RuntimeDetection = {
   installed: true,
-  version: "0.7.4",
+  version: "0.8.0",
   executable: "prime-agent",
   mode: "system",
   configDir: "~/.prime/agent",
   prerequisites: [
-    { name: "Prime Agent", found: true, version: "0.7.4" },
+    { name: "Prime Agent", found: true, version: "0.8.0" },
     { name: "Node.js", found: true, version: "22.17.0" },
     { name: "Python", found: true, version: "3.13.7" },
     { name: "Git", found: true, version: "2.51.0" },

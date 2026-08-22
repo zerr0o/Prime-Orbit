@@ -855,7 +855,7 @@ mod tests {
         assert!(first
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("prime-agent-v0.7.4-")));
+            .is_some_and(|name| name.starts_with("prime-agent-v0.8.0-")));
         assert!(!first.exists());
     }
 
@@ -871,10 +871,10 @@ mod tests {
 
     #[test]
     fn accepts_only_the_pinned_built_runtime_version() {
-        assert!(verify_built_runtime_version("0.7.4").is_ok());
-        assert!(verify_built_runtime_version("prime-agent v0.7.4").is_ok());
+        assert!(verify_built_runtime_version("0.8.0").is_ok());
+        assert!(verify_built_runtime_version("prime-agent v0.8.0").is_ok());
         let error = verify_built_runtime_version("0.7.3").expect_err("wrong version");
-        assert!(error.contains("v0.7.4"));
+        assert!(error.contains("v0.8.0"));
         assert!(error.contains("ancien runtime reste sélectionné"));
     }
 

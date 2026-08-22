@@ -889,12 +889,68 @@ const AgentMessageItem = memo(function AgentMessageItem({ message, onOpenLink }:
   );
 });
 
+const RefinementOutcomeItem = memo(function RefinementOutcomeItem({ message }: { message: ChatMessage }) {
+  const { language, locale } = useI18n();
+  const [expanded, setExpanded] = useState(false);
+  const notice = message.notice?.kind === "refinement_outcome" ? message.notice : undefined;
+  if (!notice) return null;
+  const bodyId = `refinement-outcome-body-${message.id.replace(/[^A-Za-z0-9_-]/gu, "-")}`;
+  const appliedCount = notice.edits.filter((edit) => edit.applied).length;
+  const failedCount = notice.edits.length - appliedCount;
+  const scopeLabel = notice.scope === "global"
+    ? bi(language, "Global", "Global")
+    : bi(language, "Session", "Session");
+  const heading = notice.rollbackOf
+    ? bi(language, "Refinement annulé", "Refinement rolled back")
+    : bi(language, "Refinement terminé", "Refinement complete");
+
+  return (
+    <article className={`agent-message-notice refinement-outcome-notice ${expanded ? "is-expanded" : ""}`}>
+      <button
+        type="button"
+        className="agent-message-notice-summary"
+        aria-expanded={expanded}
+        aria-controls={bodyId}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <span className="agent-message-notice-icon" aria-hidden="true"><WandSparkles size={15} /></span>
+        <span className="agent-message-notice-copy">
+          <span className="agent-message-notice-heading">
+            <strong>{heading}</strong>
+            <span className="agent-message-notice-participant">{scopeLabel} · {appliedCount}/{notice.edits.length} {bi(language, "modifications", "edits")}</span>
+          </span>
+          <span className="agent-message-notice-preview">{notice.summary}</span>
+        </span>
+        <time dateTime={message.createdAt}>{formatTime(message.createdAt, locale)}</time>
+        <ChevronRight className="agent-message-notice-chevron" size={15} aria-hidden="true" />
+      </button>
+      <div id={bodyId} className="agent-message-notice-body refinement-outcome-body" hidden={!expanded}>
+        <p>{notice.summary}</p>
+        {failedCount ? <p className="refinement-outcome-warning"><CircleAlert size={13} />{failedCount} {bi(language, "modification(s) non appliquée(s)", "edit(s) not applied")}</p> : null}
+        {notice.edits.length ? (
+          <ul>
+            {notice.edits.map((edit, index) => (
+              <li key={`${edit.kind}:${edit.id}:${index}`} className={edit.applied ? "is-applied" : "is-failed"}>
+                <span>{edit.applied ? <Check size={13} /> : <CircleAlert size={13} />}</span>
+                <div><strong>{edit.title ?? edit.id}</strong><small>{edit.action} · {edit.kind}{edit.error ? ` · ${edit.error}` : ""}</small></div>
+              </li>
+            ))}
+          </ul>
+        ) : <small>{bi(language, "Aucune modification du harness.", "No harness edits.")}</small>}
+      </div>
+    </article>
+  );
+});
+
 const MessageItem = memo(function MessageItem({ message, onOpenLink, onRetryMessage, onForkMessage, showTools = true }: { message: ChatMessage; onOpenLink: (href: string) => Promise<void>; onRetryMessage: (assistantMessageId: string) => Promise<void>; onForkMessage: (assistantMessageId: string) => Promise<void>; showTools?: boolean }) {
   const { language, locale } = useI18n();
   const isUser = message.role === "user";
   const isSystem = message.role === "system";
   if (message.notice?.kind === "agent_message") {
     return <AgentMessageItem message={message} onOpenLink={onOpenLink} />;
+  }
+  if (message.notice?.kind === "refinement_outcome") {
+    return <RefinementOutcomeItem message={message} />;
   }
   return (
     <article className={`message message-${message.role}`}>

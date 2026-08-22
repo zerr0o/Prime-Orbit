@@ -893,6 +893,16 @@ kbd { padding: 2px 5px; border: 1px solid var(--border); border-radius: 5px; col
 .agent-message-notice-chevron { color: var(--text-faint); transition: transform 140ms ease; }
 .agent-message-notice.is-expanded .agent-message-notice-chevron { transform: rotate(90deg); }
 .agent-message-notice-body { padding: 13px 14px 15px 50px; border-top: 1px solid var(--border-soft); }
+.refinement-outcome-notice .agent-message-notice-icon { border-color: color-mix(in srgb, var(--accent-strong) 30%, transparent); color: var(--accent-strong); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.refinement-outcome-body > p { margin: 0 0 12px; color: var(--text-secondary); font-size: 11px; line-height: 1.55; }
+.refinement-outcome-body ul { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.refinement-outcome-body li { display: grid; grid-template-columns: 22px minmax(0, 1fr); align-items: start; gap: 7px; padding: 7px 9px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--surface-1); }
+.refinement-outcome-body li > span { display: grid; width: 20px; height: 20px; place-items: center; color: var(--success); }
+.refinement-outcome-body li.is-failed > span { color: var(--danger); }
+.refinement-outcome-body li div { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.refinement-outcome-body li strong { overflow: hidden; color: var(--text); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.refinement-outcome-body li small { overflow-wrap: anywhere; color: var(--text-tertiary); font-size: 9.5px; }
+.refinement-outcome-warning { display: flex; align-items: center; gap: 6px; color: var(--danger) !important; }
 .mini-orbit { position: relative; display: block; width: 14px; height: 14px; border: 1.5px solid var(--accent-strong); border-radius: 50%; }
 .mini-orbit::after { position: absolute; top: 5px; left: -3px; width: 17px; height: 4px; border: 1px solid var(--signal); border-top-color: transparent; border-radius: 50%; content: ""; }
 .mini-orbit span { position: absolute; top: 1px; right: -2px; width: 3px; height: 3px; border-radius: 50%; background: #fff; }

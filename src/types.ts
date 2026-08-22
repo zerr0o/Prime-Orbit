@@ -54,7 +54,31 @@ export interface AgentMessageNotice {
   relationship?: AgentMessageRelationship;
 }
 
-export type ConversationNotice = AgentMessageNotice;
+export type RefinementOutcomeScope = "local" | "global";
+export type RefinementOutcomeAction = "create" | "update" | "delete";
+export type RefinementOutcomeKind = "prompt" | "memory" | "skill" | "subagent";
+
+export interface RefinementOutcomeEditNotice {
+  action: RefinementOutcomeAction;
+  kind: RefinementOutcomeKind;
+  id: string;
+  title?: string;
+  applied: boolean;
+  error?: string;
+}
+
+/** Safe, bounded presentation data for Prime Agent 0.8's durable refinement
+ * outcome. Private before/after contents and harness paths never cross into it. */
+export interface RefinementOutcomeNotice {
+  kind: "refinement_outcome";
+  refinementId: string;
+  summary: string;
+  scope: RefinementOutcomeScope;
+  rollbackOf?: string;
+  edits: RefinementOutcomeEditNotice[];
+}
+
+export type ConversationNotice = AgentMessageNotice | RefinementOutcomeNotice;
 
 export interface ChatMessage {
   id: string;

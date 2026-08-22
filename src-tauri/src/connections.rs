@@ -192,6 +192,16 @@ fn is_builtin(name: &str) -> bool {
         .any(|(builtin_name, _)| *builtin_name == name)
 }
 
+fn validate_executable_mcp_scope(scope: McpScope) -> Result<(), String> {
+    if scope == McpScope::Global {
+        return Ok(());
+    }
+    Err(
+        "Prime Agent 0.8 charge les serveurs MCP personnalisés uniquement depuis les réglages globaux. Recréez ce serveur avec la portée Tous les projets."
+            .to_string(),
+    )
+}
+
 fn validate_server_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > 64 {
         return Err("Le nom du serveur MCP doit contenir entre 1 et 64 caractères".to_string());
@@ -1924,6 +1934,7 @@ fn save_mcp_server_blocking(
     server: SaveMcpServerInput,
     persistence: PersistenceLock,
 ) -> Result<SaveMcpServerResult, String> {
+    validate_executable_mcp_scope(scope)?;
     validate_save_input(&server)?;
     let path = settings_path(&app, cwd, scope, true)?;
     let _guard = persistence.0.lock();
@@ -2437,6 +2448,15 @@ mod tests {
         let mut remote_cleartext = loopback_without_secret;
         remote_cleartext.url = "http://mcp.example.test/mcp".to_string();
         assert!(validate_save_input(&remote_cleartext).is_err());
+    }
+
+    #[test]
+    fn prime_agent_080_executes_only_global_custom_mcp_settings() {
+        assert!(validate_executable_mcp_scope(McpScope::Global).is_ok());
+        let error = validate_executable_mcp_scope(McpScope::Project)
+            .expect_err("project MCP settings are legacy inventory only");
+        assert!(error.contains("Prime Agent 0.8"));
+        assert!(error.contains("réglages globaux"));
     }
 
     #[test]

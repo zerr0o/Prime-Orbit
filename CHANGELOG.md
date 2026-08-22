@@ -4,6 +4,25 @@ All notable changes to Prime Orbit are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-08-22
+
+### Prime Agent 0.8.0
+
+- Pinned managed installations to the official Prime Agent `v0.8.0` tag and exact verified commit, while retaining the transactional side-by-side runtime activation used on Windows.
+- Adapted MCP configuration to Prime Agent 0.8's global-only executable server settings. New project-scoped entries are blocked, existing legacy entries remain visible for deliberate cleanup, and the OAuth endpoint-binding migration is explained in the interface.
+- Kept Linear and Notion aligned with the authoritative built-in catalog instead of allowing custom entries to override their reserved names.
+
+### Durable refinement outcomes
+
+- Added compact, expandable conversation cards for Prime Agent 0.8's persisted `refinement_outcome` messages in both live and restored sessions.
+- Deduplicated the start/end delivery pair by refinement id and exposed only bounded public fields: summary, scope, edit action, type, id, title, applied state, and error.
+- Added native sanitization that drops harness paths, rationale, metadata, and private before/after snapshots before runtime events or session history can cross into the WebView.
+
+### Validation
+
+- Added frontend and native regression coverage for live and historical refinement outcomes, safe field projection, private-data removal, and duplicate delivery.
+- Revalidated the production frontend build, complete frontend and Rust test suites, formatting, strict Clippy, and the official Prime Agent 0.8 runtime from an external working directory.
+
 ## [0.1.20] - 2026-08-22
 
 ### Desktop tray and closing
@@ -295,6 +314,7 @@ All notable changes to Prime Orbit are documented in this file.
 - TypeScript build and checks.
 - Strict Rust Clippy validation with warnings denied.
 
+[0.1.21]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.21
 [0.1.20]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.20
 [0.1.19]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.19
 [0.1.18]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.18

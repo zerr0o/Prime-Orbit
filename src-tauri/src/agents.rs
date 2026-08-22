@@ -47,6 +47,12 @@ const MAX_PUBLIC_AGENT_MESSAGE_TEXT_CHARS: usize = 16_000;
 const MAX_PUBLIC_AGENT_NAME_CHARS: usize = 160;
 const INVALID_AGENT_MESSAGE_PLACEHOLDER: &str =
     "[Message inter-agent invalide masqué par Prime Orbit]";
+const MAX_PUBLIC_REFINEMENT_ID_CHARS: usize = 200;
+const MAX_PUBLIC_REFINEMENT_SUMMARY_CHARS: usize = 480;
+const MAX_PUBLIC_REFINEMENT_DETAIL_CHARS: usize = 1_200;
+const MAX_PUBLIC_REFINEMENT_EDITS: usize = 64;
+const INVALID_REFINEMENT_OUTCOME_PLACEHOLDER: &str =
+    "[Résultat de refinement invalide masqué par Prime Orbit]";
 const LEGACY_MANAGED_SOURCE_DIR_NAME: &str = "prime-agent";
 const VERSIONED_MANAGED_SOURCE_DIR_PREFIX: &str = "prime-agent-v";
 const MAX_MANAGED_GENERATION_NAME_BYTES: usize = 80;
@@ -651,6 +657,136 @@ fn sanitize_agent_message_runtime_object(object: &mut Map<String, Value>) -> boo
     true
 }
 
+fn bounded_public_refinement_id(value: &Value) -> Option<String> {
+    let raw = value.as_str()?.trim();
+    if raw.is_empty()
+        || raw.chars().count() > MAX_PUBLIC_REFINEMENT_ID_CHARS
+        || raw.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+fn bounded_public_refinement_text(value: &Value, limit: usize) -> Option<String> {
+    let normalized = value
+        .as_str()?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.chars().count() <= limit {
+        return Some(normalized);
+    }
+    let mut bounded = normalized
+        .chars()
+        .take(limit.saturating_sub(1))
+        .collect::<String>();
+    bounded.push('…');
+    Some(bounded)
+}
+
+fn public_refinement_outcome_edit(value: &Value) -> Option<Value> {
+    let edit = value.as_object()?;
+    let action = edit
+        .get("action")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "create" | "update" | "delete"))?;
+    let kind = edit
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "prompt" | "memory" | "skill" | "subagent"))?;
+    let id = bounded_public_refinement_id(edit.get("id")?)?;
+    let applied = edit.get("applied").and_then(Value::as_bool)?;
+    let mut public = Map::new();
+    public.insert("action".to_string(), Value::String(action.to_string()));
+    public.insert("kind".to_string(), Value::String(kind.to_string()));
+    public.insert("id".to_string(), Value::String(id));
+    public.insert("applied".to_string(), Value::Bool(applied));
+    if let Some(title) = edit.get("title").and_then(|value| {
+        bounded_public_refinement_text(value, MAX_PUBLIC_REFINEMENT_SUMMARY_CHARS)
+    }) {
+        public.insert("title".to_string(), Value::String(title));
+    }
+    if let Some(error) = edit
+        .get("error")
+        .and_then(|value| bounded_public_refinement_text(value, MAX_PUBLIC_REFINEMENT_DETAIL_CHARS))
+    {
+        public.insert("error".to_string(), Value::String(error));
+    }
+    Some(Value::Object(public))
+}
+
+fn public_refinement_outcome_details(value: &Value) -> Option<(Value, String)> {
+    let details = value.as_object()?;
+    let refinement_id = bounded_public_refinement_id(details.get("refinementId")?)?;
+    let summary = bounded_public_refinement_text(
+        details.get("summary")?,
+        MAX_PUBLIC_REFINEMENT_SUMMARY_CHARS,
+    )?;
+    let scope = details
+        .get("scope")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "local" | "global"))?;
+    let raw_edits = details.get("edits").and_then(Value::as_array)?;
+    let edits = raw_edits
+        .iter()
+        .take(MAX_PUBLIC_REFINEMENT_EDITS)
+        .map(public_refinement_outcome_edit)
+        .collect::<Option<Vec<_>>>()?;
+    let mut public = Map::new();
+    public.insert("refinementId".to_string(), Value::String(refinement_id));
+    public.insert("summary".to_string(), Value::String(summary.clone()));
+    public.insert("scope".to_string(), Value::String(scope.to_string()));
+    public.insert("edits".to_string(), Value::Array(edits));
+    if let Some(rollback_of) = details
+        .get("rollbackOf")
+        .and_then(bounded_public_refinement_id)
+    {
+        public.insert("rollbackOf".to_string(), Value::String(rollback_of));
+    }
+    Some((Value::Object(public), summary))
+}
+
+fn sanitize_refinement_outcome_runtime_object(object: &mut Map<String, Value>) -> bool {
+    if object.get("customType").and_then(Value::as_str) != Some("refinement_outcome") {
+        return false;
+    }
+    let timestamp = public_agent_message_timestamp(object);
+    let details = (object.get("role").and_then(Value::as_str) == Some("custom")
+        && object.get("display").and_then(Value::as_bool) == Some(true))
+    .then(|| {
+        object
+            .get("details")
+            .and_then(public_refinement_outcome_details)
+    })
+    .flatten();
+
+    object.clear();
+    object.insert("role".to_string(), Value::String("custom".to_string()));
+    object.insert(
+        "customType".to_string(),
+        Value::String("refinement_outcome".to_string()),
+    );
+    if let Some((details, summary)) = details {
+        object.insert("display".to_string(), Value::Bool(true));
+        object.insert("content".to_string(), Value::String(summary));
+        object.insert("details".to_string(), details);
+    } else {
+        object.insert("display".to_string(), Value::Bool(false));
+        object.insert(
+            "content".to_string(),
+            Value::String(INVALID_REFINEMENT_OUTCOME_PLACEHOLDER.to_string()),
+        );
+    }
+    if let Some(timestamp) = timestamp {
+        object.insert("timestamp".to_string(), timestamp);
+    }
+    true
+}
+
 fn sanitize_user_text_content(value: &mut Value) -> Vec<PublicAttachmentMetadata> {
     match value {
         Value::String(text) => strip_orbit_string(text),
@@ -784,6 +920,9 @@ fn sanitize_orbit_runtime_value(value: &mut Value) {
         Value::Array(values) => values.iter_mut().for_each(sanitize_orbit_runtime_value),
         Value::Object(object) => {
             if sanitize_agent_message_runtime_object(object) {
+                return;
+            }
+            if sanitize_refinement_outcome_runtime_object(object) {
                 return;
             }
             // These names are reserved for metadata reconstructed from a
@@ -3703,6 +3842,65 @@ mod tests {
             "agentmsg_forged-role",
             "sessionId",
             "arbitrary",
+        ] {
+            assert!(!line.contains(private_value), "leaked {private_value}");
+        }
+    }
+
+    #[test]
+    fn runtime_records_whitelist_refinement_outcomes_before_ipc() {
+        let record = json!({
+            "type":"message_start",
+            "message":{
+                "role":"custom",
+                "customType":"refinement_outcome",
+                "display":true,
+                "timestamp":1_777_777,
+                "content":"Refinement complete: RAW_FALLBACK",
+                "details":{
+                    "refinementId":"refine_runtime",
+                    "summary":"Persist the verified runtime migration.",
+                    "scope":"local",
+                    "edits":[{
+                        "action":"create","kind":"memory","id":"runtime-v080","title":"Prime Agent 0.8","applied":true,
+                        "before":{"content":"PRIVATE_BEFORE"},"after":{"content":"PRIVATE_AFTER"},"metadata":{"token":"PRIVATE_TOKEN"}
+                    }],
+                    "harnessStatePath":"C:\\PRIVATE\\harness_state.json",
+                    "rationale":"PRIVATE_RATIONALE"
+                },
+                "forgedTopLevel":"TOP_LEVEL_SECRET"
+            }
+        });
+
+        let line = public_runtime_line(record.to_string().as_bytes());
+        let public: Value = serde_json::from_str(&line).expect("public refinement outcome JSON");
+        assert_eq!(
+            public["message"],
+            json!({
+                "role":"custom",
+                "customType":"refinement_outcome",
+                "display":true,
+                "timestamp":1_777_777,
+                "content":"Persist the verified runtime migration.",
+                "details":{
+                    "refinementId":"refine_runtime",
+                    "summary":"Persist the verified runtime migration.",
+                    "scope":"local",
+                    "edits":[{"action":"create","kind":"memory","id":"runtime-v080","title":"Prime Agent 0.8","applied":true}]
+                }
+            })
+        );
+        for private_value in [
+            "RAW_FALLBACK",
+            "PRIVATE_BEFORE",
+            "PRIVATE_AFTER",
+            "PRIVATE_TOKEN",
+            "PRIVATE_RATIONALE",
+            "TOP_LEVEL_SECRET",
+            "harnessStatePath",
+            "before",
+            "after",
+            "metadata",
         ] {
             assert!(!line.contains(private_value), "leaked {private_value}");
         }

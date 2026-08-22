@@ -64,7 +64,7 @@ Prime Agent's interactive `/login`, `/logout`, and OAuth MCP flows still run in 
 4. Let the onboarding flow detect Prime Agent, or use **Quick install** to install it from the official repository.
 5. Configure a provider, create a conversation, and start working.
 
-The 0.1.20 desktop build is validated on Windows 10/11 x64. Microsoft Edge WebView2 is normally already present on supported Windows installations.
+The 0.1.21 desktop build is validated on Windows 10/11 x64. Microsoft Edge WebView2 is normally already present on supported Windows installations.
 
 > [!IMPORTANT]
 > Prime Orbit 0.1.14 is the first updater-enabled release, so upgrades from 0.1.13 or earlier must be installed manually. Its updater payloads carry mandatory Tauri signatures, but the installers are not Authenticode-signed; Windows SmartScreen may still display an unknown-publisher warning. Verify the release SHA-256 manifest before running a manually downloaded installer.
@@ -78,7 +78,7 @@ For an existing or managed Prime Agent installation, Prime Orbit checks for:
 - Git;
 - Bash (Git Bash is supported on Windows).
 
-The managed installer clones only the official Prime Agent repository and pins Prime Agent 0.7.4 to an exact verified tag and commit. Updates are prepared and verified in a fresh side-by-side runtime before Prime Orbit selects them, so a failed build cannot replace the working generation or collide with its locked Windows files.
+The managed installer clones only the official Prime Agent repository and pins Prime Agent 0.8.0 to an exact verified tag and commit. Updates are prepared and verified in a fresh side-by-side runtime before Prime Orbit selects them, so a failed build cannot replace the working generation or collide with its locked Windows files.
 
 Prime Orbit's development and Vite 8 build toolchain has a separate Node.js 22.12 minimum, declared in `package.json` and enforced by CI.
 
@@ -184,7 +184,7 @@ Signed in-app updates use a separate release-only build and a draft-first GitHub
 
 ## Release status
 
-Prime Orbit is an early desktop release. Version 0.1.20 ships Windows x64 NSIS and MSI installers through the signed stable update channel introduced in 0.1.14. macOS and Linux code paths exist, but official binaries have not yet been validated or published.
+Prime Orbit is an early desktop release. Version 0.1.21 ships Windows x64 NSIS and MSI installers through the signed stable update channel introduced in 0.1.14. macOS and Linux code paths exist, but official binaries have not yet been validated or published.
 
 See [CHANGELOG.md](CHANGELOG.md) for release details.
 
