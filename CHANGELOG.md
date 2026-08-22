@@ -4,6 +4,24 @@ All notable changes to Prime Orbit are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-08-22
+
+### Queue cleanup
+
+- Treated a missing active daemon session as a reconciliation boundary when deleting a stale Steer or Follow-up row, so Orbit removes the orphaned local entry instead of reporting `La session Prime Agent n’est pas active dans le daemon`.
+- Kept edits and reordering fail-closed after a session leaves Prime Agent's active queue, while preserving the existing race reconciliation against authoritative state and history.
+
+### Update shutdown safety
+
+- Stopped every Orbit RPC client and the exact private managed Prime Agent daemon before installing an application update, even when no active conversation is visible.
+- Waited for the daemon socket to disappear before allowing the installer to replace and restart Prime Orbit, and cancelled the update when shutdown could not be confirmed.
+- Left external and system Prime Agent daemons untouched; only Orbit-owned versioned runtime sockets are eligible for managed shutdown.
+
+### Validation
+
+- Added bridge regressions for exact shutdown requests, socket-disappearance attestation, and bounded failure when a daemon remains reachable.
+- Revalidated 198 frontend tests, 175 native tests, TypeScript, Rust 1.88, strict Clippy, the production build, and a real isolated Prime Agent 0.8 daemon shutdown on Windows.
+
 ## [0.1.22] - 2026-08-22
 
 ### Steer and follow-up reconciliation
@@ -333,6 +351,7 @@ All notable changes to Prime Orbit are documented in this file.
 - TypeScript build and checks.
 - Strict Rust Clippy validation with warnings denied.
 
+[0.1.23]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.23
 [0.1.22]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.22
 [0.1.21]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.21
 [0.1.20]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.20
