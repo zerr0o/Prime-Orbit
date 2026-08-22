@@ -108,6 +108,8 @@ export interface ChatMessage {
   queueAccepted?: boolean;
   /** Exact payload used to reconcile the optimistic row with Prime Agent's queue. */
   queueText?: string;
+  /** Prime Agent has durably started this queued turn, but canonical history has not been reloaded yet. */
+  queueHistoryPending?: boolean;
 }
 
 export interface ActivityItem {

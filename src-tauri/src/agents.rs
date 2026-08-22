@@ -251,7 +251,15 @@ struct QueueBridgeRequest {
     lane: String,
     index: usize,
     expected_text: String,
+    expected_lane: Vec<String>,
     mutation: QueuedMessageMutation,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueMutationGuard {
+    expected_text: String,
+    expected_lane: Vec<String>,
 }
 
 struct QueueMutationOperation {
@@ -260,6 +268,7 @@ struct QueueMutationOperation {
     lane: String,
     index: usize,
     expected_text: String,
+    expected_lane: Vec<String>,
     mutation: QueuedMessageMutation,
     app_data_dir: PathBuf,
 }
@@ -2637,12 +2646,19 @@ fn mutate_agent_queue_blocking(
         lane,
         index,
         expected_text,
+        expected_lane,
         mutation,
         app_data_dir,
     } = operation;
     let conversation_id = validated_identifier(conversation_id)?;
     validate_queue_lane(&lane)?;
     validate_queued_message_text(&expected_text, "Le message attendu", true)?;
+    if expected_lane.len() > 1_024 {
+        return Err("La file attendue dépasse la taille autorisée.".to_string());
+    }
+    for text in &expected_lane {
+        validate_queued_message_text(text, "Un message de la file attendue", true)?;
+    }
     validate_queue_mutation(&mutation)?;
 
     let (launch_spec, daemon_socket, session_file, session_id, pid, started_at) = {
@@ -2699,6 +2715,7 @@ fn mutate_agent_queue_blocking(
         lane,
         index,
         expected_text,
+        expected_lane,
         mutation,
     };
     let request_json = serde_json::to_string(&request)
@@ -3382,7 +3399,7 @@ pub async fn mutate_agent_queue(
     conversation_id: String,
     lane: String,
     index: usize,
-    expected_text: String,
+    guard: QueueMutationGuard,
     mutation: QueuedMessageMutation,
 ) -> Result<QueueMutationResult, String> {
     let agents = agents.inner().clone();
@@ -3400,7 +3417,8 @@ pub async fn mutate_agent_queue(
                 conversation_id,
                 lane,
                 index,
-                expected_text,
+                expected_text: guard.expected_text,
+                expected_lane: guard.expected_lane,
                 mutation,
                 app_data_dir,
             },

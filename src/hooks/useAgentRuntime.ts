@@ -541,7 +541,56 @@ export function reconcileQueuedMessages(
     // the persisted history establishes the authoritative turn boundary.
     messages.push(message);
   }
-  return changed ? { ...conversation, messages } : conversation;
+  const deliveredIndex = deliveredQueueCandidateIndex(conversation, visibleActions);
+  if (deliveredIndex >= 0) {
+    const delivered = messages[deliveredIndex];
+    if (delivered) {
+      changed = true;
+      messages[deliveredIndex] = {
+        ...withoutQueueMetadata(delivered),
+        queueHistoryPending: true,
+      };
+    }
+  }
+  return changed ? { ...conversation, hasContent: true, messages } : conversation;
+}
+
+/** Prime Agent's `running` action phase is emitted only after the queued user
+ * message has reached message_end and is durable. Resolve one FIFO action that
+ * is no longer represented by its authoritative lane. Steering wins across
+ * lanes, matching Prime Agent's own delivery priority. */
+function deliveredQueueCandidateIndex(
+  conversation: Conversation,
+  actions: AgentSessionState["sessionActions"],
+): number {
+  const active = actions.active;
+  if (active?.kind !== "turn" || active.phase !== "running" || typeof active.label !== "string") return -1;
+  const normalizedLabel = normalizeQueuedText(active.label);
+  const activeAttachments = sanitizeAuthoritativeAttachments(actions.queueAttachments?.active ?? []);
+  if (!normalizedLabel && activeAttachments.length === 0) return -1;
+
+  for (const delivery of ["steer", "follow_up"] as const) {
+    const localCandidates = conversation.messages.flatMap((message, index) => (
+      message.queueDelivery === delivery
+      && normalizeQueuedText(message.queueText ?? message.content) === normalizedLabel
+      && sameAttachmentSet(message.attachments, activeAttachments)
+        ? [index]
+        : []
+    ));
+    if (localCandidates.length === 0) continue;
+    const laneTexts = delivery === "steer" ? actions.steering : actions.followUps;
+    const laneAttachments = delivery === "steer"
+      ? actions.queueAttachments?.steering ?? []
+      : actions.queueAttachments?.followUps ?? [];
+    const stillQueued = laneTexts.reduce((count, text, index) => (
+      normalizeQueuedText(text) === normalizedLabel
+      && sameAttachmentSet(laneAttachments[index], activeAttachments)
+        ? count + 1
+        : count
+    ), 0);
+    if (localCandidates.length > stillQueued) return localCandidates[0]!;
+  }
+  return -1;
 }
 
 function sameAttachmentSet(left: Attachment[] | undefined, right: Attachment[] | undefined) {
@@ -606,7 +655,8 @@ export function shouldReloadQueuedTranscript(
     || (actions.followUps?.length ?? 0) > 0
   ) return false;
   return conversation.messages.some((message) => (
-    message.queueDelivery && (message.queueAccepted || message.queueObserved)
+    message.queueHistoryPending
+    || (message.queueDelivery && (message.queueAccepted || message.queueObserved))
   ));
 }
 
@@ -631,6 +681,7 @@ function withoutQueueMetadata(message: ChatMessage): ChatMessage {
     queueObserved: _observed,
     queueAccepted: _accepted,
     queueText: _queueText,
+    queueHistoryPending: _historyPending,
     ...delivered
   } = message;
   return { ...delivered, status: "complete" };
@@ -669,6 +720,29 @@ export function applyAuthoritativeUserMessageStart(
         ? { attachments: authoritativeAttachments }
         : {}),
     }));
+    return { ...conversation, hasContent: true, messages };
+  }
+
+  const historyPendingCandidates = conversation.messages.flatMap((message, index) => (
+    message.role === "user"
+      && message.queueHistoryPending
+      && normalizeQueuedText(message.content) === normalized
+      && sameAttachmentSet(message.attachments, authoritativeAttachments)
+      ? [index]
+      : []
+  ));
+  if (historyPendingCandidates.length === 1) {
+    const index = historyPendingCandidates[0]!;
+    const current = conversation.messages[index]!;
+    const messages = [...conversation.messages];
+    messages[index] = withoutQueueMetadata({
+      ...current,
+      ...(authoritativeMessageId ? { entryId: authoritativeMessageId } : {}),
+      createdAt,
+      ...(!current.attachments?.length && authoritativeAttachments.length
+        ? { attachments: authoritativeAttachments }
+        : {}),
+    });
     return { ...conversation, hasContent: true, messages };
   }
 
@@ -2885,14 +2959,68 @@ export function useAgentRuntime(options: {
     if (!selectedConversation || !selectedProject) return;
     const conversationId = selectedConversation.id;
     await ensureStarted(selectedConversation, selectedProject);
-    const status = await mutateAgentQueue({ conversationId, ...input });
     const token = activeSelection.current;
     const refresh = () => {
       if (!isCurrentSelection(conversationId, token.generation)) return;
       void sendSelectionRequest(conversationId, token.generation, "get_state").catch(() => undefined);
     };
+    const initialActions = sessionActionsByConversation.current.get(conversationId)
+      ?? runtimes[conversationId]?.state?.sessionActions;
+    const expectedLane = [
+      ...(input.lane === "steering" ? initialActions?.steering ?? [] : initialActions?.followUps ?? []),
+    ];
+    const hadLocalRow = Boolean(
+      getConversationRef.current(conversationId)?.messages.some((message) => (
+        message.id === input.messageId && message.queueDelivery
+      )),
+    );
+    const reconcileMutationRace = async () => {
+      if (!isCurrentSelection(conversationId, token.generation)) return false;
+      try {
+        await sendSelectionRequest(conversationId, token.generation, "get_state");
+      } catch {
+        return false;
+      }
+      const actions = sessionActionsByConversation.current.get(conversationId);
+      if (!actions) return false;
+      let localRowWasDelivered = false;
+      updateConversation(conversationId, (conversation) => {
+        const reconciled = reconcileQueuedMessages(conversation, actions);
+        localRowWasDelivered = hadLocalRow && !reconciled.messages.some((message) => (
+          message.id === input.messageId && message.queueDelivery
+        ));
+        return reconciled;
+      });
+      window.setTimeout(() => reloadDeliveredQueueTranscript(conversationId, actions), 0);
+      if (localRowWasDelivered) return true;
+      const currentLane = input.lane === "steering" ? actions.steering : actions.followUps;
+      return !hadLocalRow
+        && (currentLane.length < expectedLane.length || currentLane[input.index] !== input.expectedText);
+    };
+
+    if (expectedLane[input.index] !== input.expectedText) {
+      const delivered = await reconcileMutationRace();
+      if (input.mutation.type === "delete" && delivered) return;
+      throw new Error("La file a changé entre-temps. Elle vient d’être resynchronisée.");
+    }
+
+    let status;
+    try {
+      status = await mutateAgentQueue({ conversationId, ...input, expectedLane });
+    } catch (error) {
+      const delivered = await reconcileMutationRace();
+      if (input.mutation.type === "delete" && delivered) return;
+      if (delivered) {
+        throw new Error("Cette instruction a déjà été livrée à Prime Agent et ne peut plus être modifiée.");
+      }
+      throw error;
+    }
     if (status !== "applied") {
-      refresh();
+      const delivered = await reconcileMutationRace();
+      if (input.mutation.type === "delete" && delivered) return;
+      if (delivered) {
+        throw new Error("Cette instruction a déjà été livrée à Prime Agent et ne peut plus être modifiée.");
+      }
       if (status === "unsupported") {
         throw new Error("Ce runtime Prime Agent ne permet pas encore de modifier sa file d’attente.");
       }
@@ -2954,7 +3082,7 @@ export function useAgentRuntime(options: {
       activePromptRuns.current.delete(conversationId);
     }
     window.setTimeout(refresh, 50);
-  }, [ensureStarted, isCurrentSelection, runtimes, selectedConversation, selectedProject, sendSelectionRequest, updateConversation]);
+  }, [ensureStarted, isCurrentSelection, reloadDeliveredQueueTranscript, runtimes, selectedConversation, selectedProject, sendSelectionRequest, updateConversation]);
 
   const retryMessage = useCallback(async (assistantMessageId: string) => {
     if (!selectedConversation) return;

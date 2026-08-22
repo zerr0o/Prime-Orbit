@@ -299,10 +299,15 @@ export async function mutateAgentQueue(input: {
   lane: "steering" | "followUp";
   index: number;
   expectedText: string;
+  expectedLane: string[];
   mutation: QueueMutation;
 }): Promise<QueueMutationStatus> {
   if (!isNative()) return "applied";
-  const result = await invoke<{ status: QueueMutationStatus }>("mutate_agent_queue", input);
+  const { expectedText, expectedLane, ...request } = input;
+  const result = await invoke<{ status: QueueMutationStatus }>("mutate_agent_queue", {
+    ...request,
+    guard: { expectedText, expectedLane },
+  });
   return result.status;
 }
 

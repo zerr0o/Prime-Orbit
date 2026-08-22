@@ -4,6 +4,25 @@ All notable changes to Prime Orbit are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.22] - 2026-08-22
+
+### Steer and follow-up reconciliation
+
+- Reconciled queued instructions against Prime Agent 0.8's complete action lifecycle instead of relying only on a live `message_start` event that may be missed during reconnects or fast transitions.
+- Promoted a queued instruction into the visible transcript when Prime Agent reports its durable `running` phase, then reloaded canonical persisted history at the next terminal boundary.
+- Preserved intentional same-text Steer and Follow-up instructions as two distinct actions, including Prime Agent's steering-first delivery priority.
+- Removed consumed instructions from the editable queue immediately, so a delivered message no longer remains stuck as `Syncing` above the composer.
+
+### Safe queue mutations
+
+- Added a full-lane snapshot precondition to queue edits and deletions so an index can never silently target a different duplicate after the queue advances.
+- Resynchronized a raced deletion through the active RPC session and treated an already delivered instruction as completed instead of surfacing the separate daemon bridge's stale-session error.
+
+### Validation
+
+- Added frontend regressions for missed user events, terminal history repair, same-text cross-lane actions, and late running snapshots.
+- Revalidated all frontend tests, TypeScript, Rust, and Prime Agent 0.8's upstream queued-action suites from an external checkout.
+
 ## [0.1.21] - 2026-08-22
 
 ### Prime Agent 0.8.0
@@ -314,6 +333,7 @@ All notable changes to Prime Orbit are documented in this file.
 - TypeScript build and checks.
 - Strict Rust Clippy validation with warnings denied.
 
+[0.1.22]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.22
 [0.1.21]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.21
 [0.1.20]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.20
 [0.1.19]: https://github.com/zerr0o/Prime-Orbit/releases/tag/v0.1.19

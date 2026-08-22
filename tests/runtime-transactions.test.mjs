@@ -861,6 +861,78 @@ test("queued messages stay separate until Prime Agent emits the authoritative us
   assert.equal(confirmedByUserEvent.messages.length, 1, "the authoritative event does not duplicate an already promoted row");
 });
 
+test("a running Prime Agent action promotes a missed queued user event and repairs it later from history", () => {
+  const prepared = beginPromptTransaction(conversation({ status: "streaming" }), {
+    message: "Delivered while Orbit was disconnected",
+    queuedPayload: "Delivered while Orbit was disconnected",
+    attachments: [],
+    messageId: "missed-user-event",
+    createdAt: "2026-08-19T10:03:00.000Z",
+    queuedDelivery: "steer",
+  });
+  const accepted = commitPromptTransaction(prepared.conversation, prepared.transaction);
+  const running = reconcileQueuedMessages(accepted, {
+    queuedCount: 0,
+    steering: [],
+    followUps: [],
+    active: { kind: "turn", phase: "running", label: "Delivered while Orbit was disconnected" },
+  });
+
+  assert.equal(running.messages[0].queueDelivery, undefined);
+  assert.equal(running.messages[0].queueHistoryPending, true);
+  assert.equal(shouldReloadQueuedTranscript(running, {
+    queuedCount: 0,
+    steering: [],
+    followUps: [],
+    active: { kind: "turn", phase: "running", label: "Delivered while Orbit was disconnected" },
+  }), false, "history replacement waits for a terminal boundary");
+  assert.equal(shouldReloadQueuedTranscript(running, {
+    queuedCount: 0,
+    steering: [],
+    followUps: [],
+  }), true, "the terminal boundary requests canonical history");
+
+  const userEvent = applyAuthoritativeUserMessageStart(
+    running,
+    "Delivered while Orbit was disconnected",
+    "2026-08-19T10:03:01.000Z",
+    [],
+    "entry-delivered",
+  );
+  assert.equal(userEvent.messages.length, 1);
+  assert.equal(userEvent.messages[0].entryId, "entry-delivered");
+  assert.equal(userEvent.messages[0].queueHistoryPending, undefined);
+});
+
+test("running action reconciliation preserves intentional same-text steer and follow-up rows", () => {
+  const followUp = beginPromptTransaction(conversation({ status: "streaming" }), {
+    message: "same instruction",
+    queuedPayload: "same instruction",
+    attachments: [],
+    messageId: "same-follow-up-active",
+    createdAt: "2026-08-19T10:03:00.000Z",
+    queuedDelivery: "follow_up",
+  });
+  const steer = beginPromptTransaction(commitPromptTransaction(followUp.conversation, followUp.transaction), {
+    message: "same instruction",
+    queuedPayload: "same instruction",
+    attachments: [],
+    messageId: "same-steer-active",
+    createdAt: "2026-08-19T10:03:01.000Z",
+    queuedDelivery: "steer",
+  });
+  const running = reconcileQueuedMessages(commitPromptTransaction(steer.conversation, steer.transaction), {
+    queuedCount: 1,
+    steering: [],
+    followUps: ["same instruction"],
+    active: { kind: "turn", phase: "running", label: "same instruction" },
+  });
+
+  assert.equal(running.messages.find((message) => message.id === "same-steer-active").queueDelivery, undefined);
+  assert.equal(running.messages.find((message) => message.id === "same-steer-active").queueHistoryPending, true);
+  assert.equal(running.messages.find((message) => message.id === "same-follow-up-active").queueDelivery, "follow_up");
+});
+
 test("authoritative attachments select the matching duplicate queue row", () => {
   const followUpAttachment = {
     id: "orbit-attachment:9b8ad0e7-8796-4a7b-9d47-82fd342d9ae8:0",
@@ -1138,7 +1210,7 @@ test("ambiguous duplicates in one lane wait for persisted history", () => {
   }), true);
 });
 
-test("a late empty queue snapshot never moves a queued user turn behind its assistant reply", () => {
+test("a late running snapshot exposes the durable user turn without moving its transcript anchor", () => {
   const initial = conversation({
     status: "streaming",
     messages: [{
@@ -1188,11 +1260,12 @@ test("a late empty queue snapshot never moves a queued user turn behind its assi
     "queued-late-snapshot",
     "assistant-current",
   ]);
-  assert.equal(lateActiveSnapshot.messages[1].queueDelivery, "follow_up");
+  assert.equal(lateActiveSnapshot.messages[1].queueDelivery, undefined);
+  assert.equal(lateActiveSnapshot.messages[1].queueHistoryPending, true);
   assert.deepEqual(
     lateActiveSnapshot.messages.filter((message) => !message.queueDelivery).map((message) => message.id),
-    ["assistant-previous", "assistant-current"],
-    "Prime Agent's late running snapshot cannot append the user row after its reply",
+    ["assistant-previous", "queued-late-snapshot", "assistant-current"],
+    "Prime Agent's running phase makes the durable user turn visible at its original anchor",
   );
 
   const reconciled = reconcileQueuedMessages(lateActiveSnapshot, {
@@ -1206,8 +1279,8 @@ test("a late empty queue snapshot never moves a queued user turn behind its assi
     "queued-late-snapshot",
     "assistant-current",
   ]);
-  assert.equal(reconciled.messages[1].queueDelivery, "follow_up");
-  assert.equal(reconciled.messages[1].queueObserved, true);
+  assert.equal(reconciled.messages[1].queueDelivery, undefined);
+  assert.equal(reconciled.messages[1].queueHistoryPending, true);
   assert.equal(shouldReloadQueuedTranscript(reconciled, {
     queuedCount: 0,
     steering: [],

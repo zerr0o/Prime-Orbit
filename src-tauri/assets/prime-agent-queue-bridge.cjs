@@ -229,6 +229,15 @@ async function main() {
       : request.lane === "followUp"
         ? state.data?.sessionActions?.followUps
         : undefined;
+    const visibleQueue = Array.isArray(queue)
+      ? queue.map((text) => parseOrbitAttachmentEnvelope(text)?.visible ?? text)
+      : [];
+    if (!Array.isArray(request.expectedLane)
+        || request.expectedLane.length !== visibleQueue.length
+        || request.expectedLane.some((text, index) => text !== visibleQueue[index])) {
+      process.stdout.write(JSON.stringify({ status: "rejected" }));
+      return;
+    }
     const rawExpectedText = Array.isArray(queue) ? queue[request.index] : undefined;
     if (typeof rawExpectedText !== "string") {
       process.stdout.write(JSON.stringify({ status: "rejected" }));
