@@ -4,6 +4,18 @@ All notable changes to Prime Orbit are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-08-24
+
+### External links
+
+- Enabled the scoped opener command so links inside conversations open in the system browser again; the capability previously carried the URL scope without enabling the underlying command.
+- Added a system-browser fallback for http(s) transcript links when the native opener fails.
+
+### Queue reliability
+
+- Recognized delivered instructions whose running label Prime Agent truncates through compactRlmText; long prompts no longer remain stuck in the queue tray.
+- Repaired delivered queue rows whenever an authoritative state snapshot arrives or the conversation is selected, removing the need to press refresh state after delivery happened in another conversation or window.
+
 ## [0.1.24] - 2026-08-22
 
 ### Conversation state reliability
