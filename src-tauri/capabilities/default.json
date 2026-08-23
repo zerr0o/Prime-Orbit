@@ -7,6 +7,14 @@
     "core:default",
     "core:webview:allow-create-webview-window",
     "dialog:allow-open",
-    "opener:allow-default-urls"
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "mailto:*" },
+        { "url": "tel:*" },
+        { "url": "http://*" },
+        { "url": "https://*" }
+      ]
+    }
   ]
 }

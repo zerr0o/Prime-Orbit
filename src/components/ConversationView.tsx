@@ -691,7 +691,14 @@ const Transcript = memo(function Transcript({ conversation, project, onSuggestio
     const target = classifyConversationLink(href);
     try {
       if (target.kind === "external") {
-        await openUrl(target.url);
+        try {
+          await openUrl(target.url);
+        } catch (openError) {
+          // The native opener can be unavailable (ACL or runtime); fall back
+          // to the WebView shell for http(s), like the other link surfaces.
+          if (!/^https?:/i.test(target.url)) throw openError;
+          window.open(target.url, "_blank", "noopener,noreferrer");
+        }
         return;
       }
       if (target.kind === "anchor") {
