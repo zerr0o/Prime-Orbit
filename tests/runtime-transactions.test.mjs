@@ -1489,3 +1489,27 @@ test("falls back to the same user-message ordinal when display text was normaliz
     "entry-1",
   );
 });
+
+test("a truncated compactRlmText active label still promotes a long delivered queued prompt", () => {
+  const longText = "L".repeat(300);
+  const prepared = beginPromptTransaction(conversation({ status: "streaming" }), {
+    message: longText,
+    queuedPayload: longText,
+    attachments: [],
+    messageId: "long-queued",
+    createdAt: "2026-08-19T10:04:00.000Z",
+    queuedDelivery: "follow_up",
+  });
+  const accepted = commitPromptTransaction(prepared.conversation, prepared.transaction);
+  // Prime Agent compacts active.label through compactRlmText: 157 chars + "...".
+  const compacted = `${longText.slice(0, 157)}...`;
+  const running = reconcileQueuedMessages(accepted, {
+    queuedCount: 0,
+    steering: [],
+    followUps: [],
+    active: { kind: "turn", phase: "running", label: compacted },
+  });
+
+  assert.equal(running.messages[0].queueDelivery, undefined, "the delivered row must leave the queue tray");
+  assert.equal(running.messages[0].queueHistoryPending, true);
+});

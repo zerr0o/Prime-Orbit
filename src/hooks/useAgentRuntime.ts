@@ -559,6 +559,18 @@ export function reconcileQueuedMessages(
  * message has reached message_end and is durable. Resolve one FIFO action that
  * is no longer represented by its authoritative lane. Steering wins across
  * lanes, matching Prime Agent's own delivery priority. */
+/** Prime Agent compacts `active.label` through compactRlmText: whitespace is
+ * collapsed and prompts longer than 160 characters end with a literal "...".
+ * Local rows hold the full text, so equality alone would miss every long
+ * delivered prompt and leave its row stuck in the queue tray. */
+function matchesActiveLabel(localText: string, normalizedLabel: string): boolean {
+  const normalized = normalizeQueuedText(localText);
+  if (normalized === normalizedLabel) return true;
+  if (!normalizedLabel.endsWith("...")) return false;
+  const prefix = normalizedLabel.slice(0, -3);
+  return prefix.length > 0 && normalized.startsWith(prefix);
+}
+
 function deliveredQueueCandidateIndex(
   conversation: Conversation,
   actions: AgentSessionState["sessionActions"],
@@ -572,7 +584,7 @@ function deliveredQueueCandidateIndex(
   for (const delivery of ["steer", "follow_up"] as const) {
     const localCandidates = conversation.messages.flatMap((message, index) => (
       message.queueDelivery === delivery
-      && normalizeQueuedText(message.queueText ?? message.content) === normalizedLabel
+      && matchesActiveLabel(message.queueText ?? message.content, normalizedLabel)
       && sameAttachmentSet(message.attachments, activeAttachments)
         ? [index]
         : []
@@ -1569,6 +1581,13 @@ export function useAgentRuntime(options: {
         state: sessionState,
       },
     }));
+    // An authoritative snapshot is also a healing opportunity: when delivered
+    // queue rows are still waiting for their persisted turn, refresh the
+    // transcript now instead of waiting for the user to press refresh.
+    window.setTimeout(() => {
+      if (!isCurrentSelection(conversationId, activeSelection.current.generation)) return;
+      reloadDeliveredQueueTranscript(conversationId, sessionState.sessionActions);
+    }, 0);
     updateConversation(conversationId, (conversation) => {
       const reconciled = reconcileQueuedMessages({
         ...conversation,
@@ -2787,7 +2806,13 @@ export function useAgentRuntime(options: {
       }));
     }
     void loadLocalConversationHistory(selectedConversation, selectedProject, token.generation).catch(() => undefined);
-  }, [active, loadLocalConversationHistory, selectedConversation?.id, selectedConversation?.sessionId, selectedConversation?.sessionPath, selectedProject?.id, selectedProject?.path, updateConversation]);
+    // Selecting a conversation is the last reliable moment to reconcile queue
+    // rows whose delivery completed while another conversation was focused.
+    window.setTimeout(() => {
+      const actions = sessionActionsByConversation.current.get(selectedConversation.id);
+      reloadDeliveredQueueTranscript(selectedConversation.id, actions);
+    }, 0);
+  }, [active, loadLocalConversationHistory, reloadDeliveredQueueTranscript, selectedConversation?.id, selectedConversation?.sessionId, selectedConversation?.sessionPath, selectedProject?.id, selectedProject?.path, updateConversation]);
 
   useEffect(() => {
     if (!active || !selectedConversation || !selectedProject || !detection) return;
