@@ -778,6 +778,60 @@ const Transcript = memo(function Transcript({ conversation, project, onSuggestio
   );
 }, areTranscriptPropsEqual);
 
+const ignoreReadOnlyAction = async () => undefined;
+
+/** Reuses the production transcript presentation without exposing project-file
+ * links, retry, fork, queue, or runtime controls for an unattached session. */
+export function ReadOnlyTranscript({ messages, sessionId }: { messages: ChatMessage[]; sessionId: string }) {
+  const { language } = useI18n();
+  const viewport = useRef<HTMLDivElement>(null);
+  const [linkError, setLinkError] = useState<string>();
+  const entries = useMemo(() => buildTranscriptEntries(messages), [messages]);
+
+  useLayoutEffect(() => {
+    const node = viewport.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [sessionId]);
+
+  const openReadOnlyLink = useCallback(async (href: string) => {
+    setLinkError(undefined);
+    const target = classifyConversationLink(href);
+    try {
+      if (target.kind === "external") {
+        try {
+          await openUrl(target.url);
+        } catch (openError) {
+          if (!/^https?:/i.test(target.url)) throw openError;
+          window.open(target.url, "_blank", "noopener,noreferrer");
+        }
+        return;
+      }
+      if (target.kind === "anchor") {
+        document.getElementById(target.id)?.scrollIntoView({ behavior: "smooth", block: "center" });
+        return;
+      }
+      setLinkError(bi(
+        language,
+        "Ajoutez d’abord le dossier à Prime Orbit pour ouvrir les liens vers ses fichiers.",
+        "Add the folder to Prime Orbit before opening links to its files.",
+      ));
+    } catch (error) {
+      setLinkError(error instanceof Error ? error.message : String(error));
+    }
+  }, [language]);
+
+  return (
+    <div className="transcript-viewport saved-session-transcript" ref={viewport}>
+      <div className="transcript-content">
+        {entries.map((entry) => entry.kind === "message"
+          ? <MessageItem key={entry.message.id} message={entry.message} onOpenLink={openReadOnlyLink} onRetryMessage={ignoreReadOnlyAction} onForkMessage={ignoreReadOnlyAction} readOnly />
+          : <AssistantTurn key={entry.id} messages={entry.messages} onOpenLink={openReadOnlyLink} onRetryMessage={ignoreReadOnlyAction} onForkMessage={ignoreReadOnlyAction} readOnly />)}
+        {linkError ? <div className="transcript-link-error" role="alert"><CircleAlert size={15} /><span>{linkError}</span><IconButton label={bi(language, "Fermer l’erreur", "Dismiss error")} onClick={() => setLinkError(undefined)}><X size={14} /></IconButton></div> : null}
+      </div>
+    </div>
+  );
+}
+
 function ConversationLoadError({ conversation, onRetry }: { conversation: Conversation; onRetry: () => Promise<void> }) {
   const { language } = useI18n();
   const titleId = `conversation-load-error-title-${conversation.id}`;
@@ -1157,7 +1211,7 @@ const RefinementOutcomeItem = memo(function RefinementOutcomeItem({ message }: {
   );
 });
 
-const MessageItem = memo(function MessageItem({ message, onOpenLink, onRetryMessage, onForkMessage, showTools = true }: { message: ChatMessage; onOpenLink: (href: string) => Promise<void>; onRetryMessage: (assistantMessageId: string) => Promise<void>; onForkMessage: (assistantMessageId: string) => Promise<void>; showTools?: boolean }) {
+const MessageItem = memo(function MessageItem({ message, onOpenLink, onRetryMessage, onForkMessage, showTools = true, readOnly = false }: { message: ChatMessage; onOpenLink: (href: string) => Promise<void>; onRetryMessage: (assistantMessageId: string) => Promise<void>; onForkMessage: (assistantMessageId: string) => Promise<void>; showTools?: boolean; readOnly?: boolean }) {
   const { language, locale } = useI18n();
   const isUser = message.role === "user";
   const isSystem = message.role === "system";
@@ -1181,8 +1235,8 @@ const MessageItem = memo(function MessageItem({ message, onOpenLink, onRetryMess
         {message.role === "assistant" && message.status === "complete" && message.content.trim() ? (
           <footer className="message-actions">
             <IconButton label={bi(language, "Copier la réponse", "Copy response")} onClick={() => void navigator.clipboard.writeText(message.content)}><Copy size={14} /></IconButton>
-            <IconButton label={bi(language, "Réutiliser le texte dans le composeur", "Reuse text in the composer")} onClick={() => void onRetryMessage(message.id)}><RefreshCw size={14} /></IconButton>
-            <IconButton label={bi(language, "Créer une branche depuis ce tour", "Branch from this turn")} onClick={() => void onForkMessage(message.id)}><GitBranch size={14} /></IconButton>
+            {!readOnly ? <IconButton label={bi(language, "Réutiliser le texte dans le composeur", "Reuse text in the composer")} onClick={() => void onRetryMessage(message.id)}><RefreshCw size={14} /></IconButton> : null}
+            {!readOnly ? <IconButton label={bi(language, "Créer une branche depuis ce tour", "Branch from this turn")} onClick={() => void onForkMessage(message.id)}><GitBranch size={14} /></IconButton> : null}
             <span />
             {message.durationMs ? <small><Clock3 size={12} /> {formatDuration(message.durationMs)}</small> : null}
             {message.usage?.total ? <small>{compactNumber(message.usage.total, locale)} tokens</small> : null}
@@ -1198,6 +1252,7 @@ interface AssistantTurnProps {
   onOpenLink: (href: string) => Promise<void>;
   onRetryMessage: (assistantMessageId: string) => Promise<void>;
   onForkMessage: (assistantMessageId: string) => Promise<void>;
+  readOnly?: boolean;
 }
 
 export function haveSameMessageReferences(previous: readonly ChatMessage[], next: readonly ChatMessage[]) {
@@ -1208,10 +1263,11 @@ function areAssistantTurnPropsEqual(previous: AssistantTurnProps, next: Assistan
   return haveSameMessageReferences(previous.messages, next.messages)
     && previous.onOpenLink === next.onOpenLink
     && previous.onRetryMessage === next.onRetryMessage
-    && previous.onForkMessage === next.onForkMessage;
+    && previous.onForkMessage === next.onForkMessage
+    && previous.readOnly === next.readOnly;
 }
 
-const AssistantTurn = memo(function AssistantTurn({ messages, onOpenLink, onRetryMessage, onForkMessage }: AssistantTurnProps) {
+const AssistantTurn = memo(function AssistantTurn({ messages, onOpenLink, onRetryMessage, onForkMessage, readOnly = false }: AssistantTurnProps) {
   const { language, locale } = useI18n();
   const firstMessage = messages[0]!;
   const model = [...messages].reverse().find((message) => message.model)?.model;
@@ -1245,8 +1301,8 @@ const AssistantTurn = memo(function AssistantTurn({ messages, onOpenLink, onRetr
         {!isActive && actionMessage ? (
           <footer className="message-actions">
             <IconButton label={bi(language, "Copier la réponse", "Copy response")} onClick={() => void navigator.clipboard.writeText(copyText)}><Copy size={14} /></IconButton>
-            <IconButton label={bi(language, "Réutiliser le texte dans le composeur", "Reuse text in the composer")} onClick={() => void onRetryMessage(actionMessage.id)}><RefreshCw size={14} /></IconButton>
-            <IconButton label={bi(language, "Créer une branche depuis ce tour", "Branch from this turn")} onClick={() => void onForkMessage(actionMessage.id)}><GitBranch size={14} /></IconButton>
+            {!readOnly ? <IconButton label={bi(language, "Réutiliser le texte dans le composeur", "Reuse text in the composer")} onClick={() => void onRetryMessage(actionMessage.id)}><RefreshCw size={14} /></IconButton> : null}
+            {!readOnly ? <IconButton label={bi(language, "Créer une branche depuis ce tour", "Branch from this turn")} onClick={() => void onForkMessage(actionMessage.id)}><GitBranch size={14} /></IconButton> : null}
             <span />
             {durationMs > 0 ? <small><Clock3 size={12} /> {formatDuration(durationMs)}</small> : null}
             {totalTokens > 0 ? <small>{compactNumber(totalTokens, locale)} tokens</small> : null}

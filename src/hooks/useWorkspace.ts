@@ -30,6 +30,99 @@ function pathIdentity(path: string) {
   return path.replace(/\\/g, "/").replace(/\/+$/, "").toLocaleLowerCase();
 }
 
+function importedConversation(
+  session: PrimeAgentSessionSummary,
+  projectId: string,
+  thinkingLevel: Conversation["thinkingLevel"],
+  manualOrder: number,
+): Conversation {
+  const timestamp = session.updatedAtMs > 0
+    ? new Date(session.updatedAtMs).toISOString()
+    : session.createdAt && !Number.isNaN(Date.parse(session.createdAt))
+      ? new Date(session.createdAt).toISOString()
+      : new Date().toISOString();
+  const title = session.sessionName?.trim()
+    || session.firstMessage?.trim()
+    || `Session Prime Agent ${session.sessionId.slice(-8)}`;
+  return {
+    id: newId("conversation"),
+    projectId,
+    manualOrder,
+    title: title.slice(0, 120),
+    createdAt: session.createdAt && !Number.isNaN(Date.parse(session.createdAt))
+      ? new Date(session.createdAt).toISOString()
+      : timestamp,
+    updatedAt: timestamp,
+    pinned: false,
+    archived: session.catalogStatus === "archived" || session.catalogStatus === "crash",
+    status: "offline",
+    sessionPath: session.sessionPath,
+    sessionId: session.sessionId,
+    thinkingLevel,
+    hasContent: session.messageCount > 0,
+    draft: "",
+    messages: [],
+    activities: [],
+  };
+}
+
+export function attachCatalogSession(
+  current: PersistedAppState,
+  session: PrimeAgentSessionSummary,
+): { state: PersistedAppState; conversationId: string } {
+  if (!session.folderAvailable) {
+    throw new Error("The Prime Agent session folder is unavailable");
+  }
+  const projectIdentity = pathIdentity(session.cwd);
+  let project = current.projects.find((item) => pathIdentity(item.path) === projectIdentity);
+  let projects = current.projects;
+  const timestamp = new Date().toISOString();
+  if (!project) {
+    project = {
+      id: newId("project"),
+      manualOrder: nextHeadOrder(current.projects),
+      name: pathName(session.cwd),
+      path: session.cwd,
+      color: PROJECT_COLORS[current.projects.length % PROJECT_COLORS.length]!,
+      createdAt: timestamp,
+      lastOpenedAt: timestamp,
+      pinned: false,
+      permissionPreset: current.preferences.defaultPermissionPreset,
+    };
+    projects = [project, ...current.projects];
+  }
+  const sessionPath = pathIdentity(session.sessionPath);
+  const existing = current.conversations.find((conversation) =>
+    (conversation.sessionPath && pathIdentity(conversation.sessionPath) === sessionPath)
+    || conversation.sessionId === session.sessionId);
+  const conversation = existing
+    ? { ...existing, projectId: project.id, archived: false }
+    : {
+        ...importedConversation(
+          session,
+          project.id,
+          current.preferences.defaultThinking,
+          nextHeadOrder(current.conversations.filter((item) => item.projectId === project.id)),
+        ),
+        archived: false,
+      };
+  const conversations = existing
+    ? current.conversations.map((item) => item.id === existing.id ? conversation : item)
+    : [conversation, ...current.conversations];
+  return {
+    conversationId: conversation.id,
+    state: {
+      ...current,
+      projects: projects.map((item) => item.id === project.id
+        ? { ...item, lastOpenedAt: timestamp }
+        : item),
+      conversations,
+      selectedProjectId: project.id,
+      selectedConversationId: conversation.id,
+    },
+  };
+}
+
 function saveRetryDelay(attempt: number) {
   return Math.min(SAVE_RETRY_BASE_MS * 2 ** Math.min(attempt, 16), SAVE_RETRY_MAX_MS);
 }
@@ -468,47 +561,31 @@ export function useWorkspace() {
       const nextOrderByProject = new Map<string, number>();
       for (const session of sessions) {
         // Child/RLM sessions belong in supervision, not as top-level chats.
-        if (session.rlmDepth > 0 || session.parentSessionPath) continue;
+        if (session.rlmDepth > 0 || session.parentSessionPath || session.catalogStatus === "draft") continue;
         const project = projectsByPath.get(pathIdentity(session.cwd));
         const sessionPath = pathIdentity(session.sessionPath);
         if (!project || knownPaths.has(sessionPath) || knownSessionIds.has(session.sessionId)) continue;
-        const timestamp = session.updatedAtMs > 0
-          ? new Date(session.updatedAtMs).toISOString()
-          : session.createdAt && !Number.isNaN(Date.parse(session.createdAt))
-            ? new Date(session.createdAt).toISOString()
-            : new Date().toISOString();
         const currentHead = nextOrderByProject.get(project.id)
           ?? nextHeadOrder(current.conversations.filter((item) => item.projectId === project.id));
         nextOrderByProject.set(project.id, currentHead - 1);
-        const title = session.sessionName?.trim()
-          || session.firstMessage?.trim()
-          || `Session Prime Agent ${session.sessionId.slice(-8)}`;
-        additions.push({
-          id: newId("conversation"),
-          projectId: project.id,
-          manualOrder: currentHead,
-          title: title.slice(0, 120),
-          createdAt: session.createdAt && !Number.isNaN(Date.parse(session.createdAt))
-            ? new Date(session.createdAt).toISOString()
-            : timestamp,
-          updatedAt: timestamp,
-          pinned: false,
-          archived: false,
-          status: "offline",
-          sessionPath: session.sessionPath,
-          sessionId: session.sessionId,
-          thinkingLevel: current.preferences.defaultThinking,
-          hasContent: session.messageCount > 0,
-          draft: "",
-          messages: [],
-          activities: [],
-        });
+        additions.push(importedConversation(session, project.id, current.preferences.defaultThinking, currentHead));
         knownPaths.add(sessionPath);
         knownSessionIds.add(session.sessionId);
       }
       return additions.length ? { ...current, conversations: [...additions, ...current.conversations] } : current;
     });
   }, []);
+
+  const openCatalogSession = useCallback((session: PrimeAgentSessionSummary) => {
+    let selectedConversationId: string | undefined;
+    setState((current) => {
+      const attached = attachCatalogSession(current, session);
+      selectedConversationId = attached.conversationId;
+      return attached.state;
+    });
+    if (selectedConversationId) setView("chat");
+    return selectedConversationId;
+  }, [setState]);
 
   const preserveConversationReference = useCallback((conversationId: string, title: string) => {
     const preservedId = newId("conversation");
@@ -664,6 +741,7 @@ export function useWorkspace() {
     openProjectConversation,
     createConversation,
     importPrimeAgentSessions,
+    openCatalogSession,
     preserveConversationReference,
     discardConversationReference,
     selectConversation,

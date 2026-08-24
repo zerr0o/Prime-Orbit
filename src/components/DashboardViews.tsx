@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
+  ArrowLeft,
   ArrowRight,
   Blocks,
   Bot,
   Check,
   ChevronDown,
   ChevronRight,
+  CircleAlert,
   Clock3,
   Cloud,
   Code2,
@@ -41,17 +43,19 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { deleteMcpServer, inspectPrimeAgentConnections, openPrimeAgentTerminal, readModelsJson, saveMcpServer, saveModelsJson, savePrimeAgentDefaults } from "../lib/bridge";
+import { deleteMcpServer, inspectPrimeAgentConnections, loadCatalogSessionHistory, openPrimeAgentTerminal, readModelsJson, saveMcpServer, saveModelsJson, savePrimeAgentDefaults } from "../lib/bridge";
 import { appUpdateProgressPercent } from "../lib/app-updater";
 import { isCompleteModelReference, loadRlmPreferences, patchRlmPreferences, RLM_PREFERENCES_STORAGE_KEY, supportsRlmThinking, type RlmPreferences, type RlmThinkingPreference } from "../lib/rlm-preferences";
 import { modelReference, toggleFavoriteModelRef } from "../lib/model-favorites";
 import { useDismissableLayer } from "../hooks/useDismissableLayer";
 import { useI18n } from "../i18n";
 import packageMetadata from "../../package.json";
-import type { AppUpdateState, AppView, Conversation, McpAuthKind, McpScope, McpServerSummary, ModelInfo, OllamaHealth, PersistedAppState, PrimeAgentConnections, PrimeAgentDefaults, Project, RuntimeDetection, SettingsSectionId, ThinkingLevel } from "../types";
-import { Badge, Button, EmptyState, Modal, Switch } from "./Ui";
+import type { AppUpdateState, AppView, Conversation, McpAuthKind, McpScope, McpServerSummary, ModelInfo, OllamaHealth, PersistedAppState, PrimeAgentConnections, PrimeAgentDefaults, PrimeAgentSessionSummary, Project, RuntimeDetection, SessionHistoryResult, SettingsSectionId, ThinkingLevel } from "../types";
+import { Badge, Button, EmptyState, IconButton, Modal, Switch } from "./Ui";
 import { ReleaseNotesMarkdown } from "./ReleaseNotesMarkdown";
 import { ModelPickerPopover } from "./ModelPickerPopover";
+import { ReadOnlyTranscript } from "./ConversationView";
+import { mapAgentMessages } from "../hooks/useAgentRuntime";
 
 interface HomeViewProps {
   projects: Project[];
@@ -132,15 +136,168 @@ export function ProjectsView({ projects, conversations, onProject, onOpenProject
   );
 }
 
-export function RunsView({ projects, conversations, onConversation }: { projects: Project[]; conversations: Conversation[]; onConversation: (id: string) => void }) {
+export type SessionCatalogFilter = "all" | "active" | "attention" | "external" | "archived";
+
+export interface SessionCatalogRow {
+  key: string;
+  session?: PrimeAgentSessionSummary;
+  conversation?: Conversation;
+  project?: Project;
+  title: string;
+  detail: string;
+  cwd: string;
+  updatedAt: string;
+  external: boolean;
+  archived: boolean;
+  active: boolean;
+  attention: boolean;
+}
+
+const catalogPathIdentity = (value: string) => value.replace(/\\/g, "/").replace(/\/+$/, "").toLocaleLowerCase();
+
+export function sessionCatalogRows(projects: Project[], conversations: Conversation[], sessions: PrimeAgentSessionSummary[]): SessionCatalogRow[] {
+  const projectsByPath = new Map(projects.map((project) => [catalogPathIdentity(project.path), project]));
+  const conversationsByPath = new Map(conversations.flatMap((conversation) => conversation.sessionPath
+    ? [[catalogPathIdentity(conversation.sessionPath), conversation] as const]
+    : []));
+  const conversationsById = new Map(conversations.flatMap((conversation) => conversation.sessionId
+    ? [[conversation.sessionId, conversation] as const]
+    : []));
+  const matchedConversations = new Set<string>();
+  const knownSessionPaths = new Set<string>();
+  const knownSessionIds = new Set<string>();
+  const uniqueSessions = [...sessions]
+    .sort((left, right) => right.updatedAtMs - left.updatedAtMs)
+    .filter((session) => {
+      const path = catalogPathIdentity(session.sessionPath);
+      if (knownSessionPaths.has(path) || knownSessionIds.has(session.sessionId)) return false;
+      knownSessionPaths.add(path);
+      knownSessionIds.add(session.sessionId);
+      return true;
+    });
+  const rows = uniqueSessions.map((session): SessionCatalogRow => {
+    const conversation = conversationsByPath.get(catalogPathIdentity(session.sessionPath))
+      ?? conversationsById.get(session.sessionId);
+    if (conversation) matchedConversations.add(conversation.id);
+    const project = conversation
+      ? projects.find((item) => item.id === conversation.projectId)
+      : projectsByPath.get(catalogPathIdentity(session.cwd));
+    const active = Boolean(
+      conversation && ["starting", "streaming", "tool", "queued"].includes(conversation.status)
+      || session.sessionState === "active" && !["completed", "archived", "crash"].includes(session.catalogStatus),
+    );
+    const archived = session.catalogStatus === "archived" || session.catalogStatus === "crash" || Boolean(conversation?.archived);
+    return {
+      key: `session:${session.catalogKey}`,
+      session,
+      conversation,
+      project,
+      title: conversation?.title || session.sessionName?.trim() || session.firstMessage?.trim() || `Prime Agent ${session.sessionId.slice(-8)}`,
+      detail: conversation?.activities.at(-1)?.title || session.agentSummary || session.firstMessage || "",
+      cwd: session.cwd,
+      updatedAt: new Date(session.updatedAtMs || Date.parse(session.createdAt ?? "") || 0).toISOString(),
+      external: !project,
+      archived,
+      active,
+      attention: conversation?.status === "error" || session.catalogStatus === "needs_input" || session.catalogStatus === "crash",
+    };
+  });
+  for (const conversation of conversations) {
+    if (matchedConversations.has(conversation.id) || conversation.hasContent === false) continue;
+    const project = projects.find((item) => item.id === conversation.projectId);
+    const active = ["starting", "streaming", "tool", "queued"].includes(conversation.status);
+    rows.push({
+      key: `orbit:${conversation.id}`,
+      conversation,
+      project,
+      title: conversation.title,
+      detail: conversation.activities.at(-1)?.title ?? "",
+      cwd: project?.path ?? "",
+      updatedAt: conversation.updatedAt,
+      external: false,
+      archived: conversation.archived,
+      active,
+      attention: conversation.status === "error",
+    });
+  }
+  return rows.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
+export function filterSessionCatalogRows(rows: SessionCatalogRow[], filter: SessionCatalogFilter, search: string) {
+  const normalizedSearch = search.trim().toLocaleLowerCase();
+  return rows.filter((row) => {
+    const matchesFilter = filter === "all"
+      || (filter === "active" && row.active)
+      || (filter === "attention" && row.attention)
+      || (filter === "external" && row.external)
+      || (filter === "archived" && row.archived);
+    if (!matchesFilter) return false;
+    if (!normalizedSearch) return true;
+    return `${row.title} ${row.detail} ${row.cwd} ${row.session?.sessionId ?? ""}`.toLocaleLowerCase().includes(normalizedSearch);
+  });
+}
+
+export function RunsView({ projects, conversations, sessions, loading, error, onRefresh, onConversation, onSession }: { projects: Project[]; conversations: Conversation[]; sessions: PrimeAgentSessionSummary[]; loading: boolean; error?: string; onRefresh: () => void; onConversation: (id: string) => void; onSession: (session: PrimeAgentSessionSummary) => void }) {
   const { t } = useI18n();
-  const [filter, setFilter] = useState<"all" | "active" | "error">("all");
-  const runs = [...conversations].filter((conversation) => !conversation.archived && conversation.hasContent !== false && (filter === "all" || (filter === "active" ? ["streaming", "tool", "queued", "starting"].includes(conversation.status) : conversation.status === "error"))).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const [filter, setFilter] = useState<SessionCatalogFilter>("all");
+  const [search, setSearch] = useState("");
+  const normalizedSearch = search.trim().toLocaleLowerCase();
+  const rows = useMemo(() => filterSessionCatalogRows(
+    sessionCatalogRows(projects, conversations, sessions),
+    filter,
+    search,
+  ), [conversations, filter, projects, search, sessions]);
   return (
     <div className="page-scroll standard-page">
-      <PageHeader eyebrow={t("runs.eyebrow")} title={t("runs.title")} description={t("runs.description")} />
-      <div className="page-tools"><div className="segmented"><button type="button" className={filter === "all" ? "is-active" : ""} onClick={() => setFilter("all")}>{t("runs.all")}</button><button type="button" className={filter === "active" ? "is-active" : ""} onClick={() => setFilter("active")}>{t("runs.active")}</button><button type="button" className={filter === "error" ? "is-active" : ""} onClick={() => setFilter("error")}>{t("runs.verify")}</button></div></div>
-      <div className="runs-table"><header><span>{t("runs.conversation")}</span><span>{t("runs.project")}</span><span>{t("runs.state")}</span><span>{t("runs.model")}</span><span>{t("runs.updated")}</span><span /></header>{runs.map((conversation) => { const project = projects.find((item) => item.id === conversation.projectId); return <button type="button" key={conversation.id} data-context-type="conversation" data-context-id={conversation.id} aria-haspopup="menu" onClick={() => onConversation(conversation.id)}><span className="run-title-cell"><i className={`conversation-status status-${conversation.status}`} /><span><strong>{conversation.title}</strong><small>{conversation.activities.at(-1)?.title ?? t("common.ready")}</small></span></span><span><span className="project-color" style={{ background: project?.color }} />{project?.name}</span><span><Badge tone={conversation.status === "error" ? "danger" : ["streaming", "tool", "starting", "queued"].includes(conversation.status) ? "accent" : "neutral"}>{runStatus(conversation.status, t)}</Badge></span><span className="mono">{shortModel(conversation.model) ?? t("common.default")}</span><span>{relativeTime(conversation.updatedAt, t)}</span><ChevronRight size={15} /></button>; })}</div>
+      <PageHeader eyebrow={t("runs.eyebrow")} title={t("runs.title")} description={t("runs.description")} actions={<Button variant="secondary" loading={loading} onClick={onRefresh}><RefreshCw size={15} />{t("common.refresh")}</Button>} />
+      <div className="page-tools session-catalog-tools">
+        <div className="large-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t("runs.search")} /></div>
+        <div className="segmented session-catalog-filters">
+          {(["all", "active", "attention", "external", "archived"] as const).map((item) => <button type="button" key={item} className={filter === item ? "is-active" : ""} onClick={() => setFilter(item)}>{t(`runs.${item}`)}</button>)}
+        </div>
+      </div>
+      {error ? <div className="connection-notice is-error" role="alert"><CircleAlert size={15} /><span>{error}</span><button type="button" onClick={onRefresh} aria-label={t("common.refresh")}><RefreshCw size={14} /></button></div> : null}
+      {rows.length ? <div className="runs-table session-catalog-table"><header><span>{t("runs.conversation")}</span><span>{t("runs.project")}</span><span>{t("runs.state")}</span><span>{t("runs.origin")}</span><span>{t("runs.updated")}</span><span /></header>{rows.map((row) => {
+        const status = row.conversation
+          ? runStatus(row.conversation.status, t)
+          : row.active ? t("status.streaming") : catalogStatusLabel(row.session?.catalogStatus, t);
+        const statusTone = row.attention ? "danger" : row.active ? "accent" : row.archived ? "warning" : "neutral";
+        return <button type="button" key={row.key} data-context-type={row.conversation ? "conversation" : undefined} data-context-id={row.conversation?.id} aria-haspopup={row.conversation ? "menu" : undefined} onClick={() => row.session ? onSession(row.session) : row.conversation && onConversation(row.conversation.id)}><span className="run-title-cell"><i className={`conversation-status ${row.active ? "status-streaming" : row.attention ? "status-error" : "status-offline"}`} /><span><strong>{row.title}</strong><small>{row.detail || row.session?.sessionId}</small></span></span><span title={row.cwd}><span className="project-color" style={{ background: row.project?.color ?? "var(--text-faint)" }} />{row.project?.name ?? folderName(row.cwd)}</span><span><Badge tone={statusTone}>{status}</Badge></span><span><Badge tone={row.external ? "info" : "neutral"}>{row.external ? t("runs.externalClient") : "Prime Orbit"}</Badge></span><span>{relativeTime(row.updatedAt, t)}</span><ChevronRight size={15} /></button>;
+      })}</div> : <EmptyState icon={<Search size={25} />} title={t("runs.empty")} description={normalizedSearch ? t("runs.emptySearch") : t("runs.emptyDefault")} />}
+    </div>
+  );
+}
+
+export function SavedSessionView({ session, onBack, onAddProject }: { session: PrimeAgentSessionSummary; onBack: () => void; onAddProject: (session: PrimeAgentSessionSummary) => void }) {
+  const { t } = useI18n();
+  const [history, setHistory] = useState<SessionHistoryResult>();
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+  const [generation, setGeneration] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(undefined);
+    setHistory(undefined);
+    void loadCatalogSessionHistory(session.catalogKey, session.sessionId)
+      .then((result) => { if (!cancelled) setHistory(result); })
+      .catch((reason) => { if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason)); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [generation, session.catalogKey, session.sessionId]);
+  const messages = useMemo(() => mapAgentMessages(history?.messages ?? []), [history?.messages]);
+  const title = session.sessionName?.trim() || session.firstMessage?.trim() || `Prime Agent ${session.sessionId.slice(-8)}`;
+  return (
+    <div className="saved-session-page">
+      <header className="saved-session-header">
+        <IconButton label={t("runs.back")} onClick={onBack}><ArrowLeft size={18} /></IconButton>
+        <div><p className="eyebrow">{t("runs.readOnly")}</p><h1>{title}</h1><span>{session.cwd}</span></div>
+        <div className="saved-session-actions"><Badge tone={session.catalogStatus === "archived" || session.catalogStatus === "crash" ? "warning" : "info"}>{catalogStatusLabel(session.catalogStatus, t)}</Badge>{session.folderAvailable ? <Button variant="primary" onClick={() => onAddProject(session)}><FolderOpen size={15} />{t("runs.addFolder")}</Button> : <Badge tone="danger">{t("runs.folderUnavailable")}</Badge>}</div>
+      </header>
+      {history?.warning ? <div className="saved-session-warning"><Info size={15} /><span>{history.warning}</span></div> : null}
+      <section className="saved-session-body">
+        {loading ? <div className="saved-session-loading"><LoaderCircle className="spin" size={24} /><span>{t("runs.loading")}</span></div> : error ? <EmptyState icon={<CircleAlert size={26} />} title={t("runs.loadFailed")} description={error}><Button variant="secondary" onClick={() => setGeneration((current) => current + 1)}><RefreshCw size={15} />{t("common.refresh")}</Button></EmptyState> : messages.length ? <ReadOnlyTranscript messages={messages} sessionId={session.sessionId} /> : <EmptyState icon={<FileJson2 size={26} />} title={t("runs.noPublicMessages")} description={t("runs.noPublicMessagesText")} />}
+      </section>
     </div>
   );
 }
@@ -750,6 +907,10 @@ function SettingRow({ title, description, children }: React.PropsWithChildren<{ 
 function SecurityPrinciple({ icon, title, text }: { icon: React.ReactNode; title: string; text: string }) { return <article><span>{icon}</span><div><strong>{title}</strong><p>{text}</p></div></article>; }
 function GitBranchIcon() { return <Code2 size={18} />; }
 function runStatus(status: Conversation["status"], t: ReturnType<typeof useI18n>["t"]) { return t(`status.${status}` as `status.${Conversation["status"]}`); }
+function catalogStatusLabel(status: PrimeAgentSessionSummary["catalogStatus"] | undefined, t: ReturnType<typeof useI18n>["t"]) {
+  return t(`runs.status.${status ?? "saved"}` as `runs.status.${PrimeAgentSessionSummary["catalogStatus"]}`);
+}
+function folderName(path: string) { return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path; }
 function shortModel(model?: string) { return model?.includes("/") ? model.slice(model.indexOf("/") + 1) : model; }
 function shortPath(path: string) { const parts = path.split(/[\\/]/).filter(Boolean); return parts.length > 3 ? `…/${parts.slice(-2).join("/")}` : parts.join("/"); }
 function relativeTime(value: string, t: ReturnType<typeof useI18n>["t"]) { const delta = Date.now() - new Date(value).getTime(); const minutes = Math.max(1, Math.round(delta / 60_000)); if (minutes < 60) return t("time.minutesAgo", { count: minutes }); const hours = Math.round(minutes / 60); if (hours < 24) return t("time.hoursAgo", { count: hours }); const days = Math.round(hours / 24); return t("time.daysAgo", { count: days }); }

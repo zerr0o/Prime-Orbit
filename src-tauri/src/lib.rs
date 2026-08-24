@@ -97,6 +97,7 @@ pub fn run() {
         .manage(HtmlExportState::default())
         .manage(InstallState::default())
         .manage(PersistenceLock::default())
+        .manage(session_history::SessionCatalogState::default())
         .manage(UpdateManager::default())
         .manage(notifications::PlanAttentionState::default())
         .manage(plan_mode::PlanDocumentState::default())
@@ -117,6 +118,7 @@ pub fn run() {
             agents::restart_agent,
             agents::list_running_agents,
             session_history::load_session_history,
+            session_history::load_catalog_session_history,
             session_history::list_prime_agent_sessions,
             storage::load_app_state,
             storage::save_app_state,

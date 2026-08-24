@@ -547,6 +547,8 @@ export interface AttachmentReadResult {
 }
 
 export interface PrimeAgentSessionSummary {
+  /** Opaque native attestation used to open this exact catalog entry. */
+  catalogKey: string;
   sessionPath: string;
   sessionId: string;
   cwd: string;
@@ -557,6 +559,11 @@ export interface PrimeAgentSessionSummary {
   parentSessionPath?: string;
   createdAt?: string;
   updatedAtMs: number;
+  sessionState?: "active" | "archived" | "crash";
+  agentSummary?: string;
+  agentTaskState?: "needs_input" | "completed";
+  catalogStatus: "saved" | "needs_input" | "completed" | "archived" | "crash" | "draft";
+  folderAvailable: boolean;
 }
 
 export interface GitChange {

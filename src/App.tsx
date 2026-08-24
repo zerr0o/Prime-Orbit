@@ -34,7 +34,7 @@ import {
   releaseAllConversationAttachmentDrafts,
   releaseConversationAttachmentDrafts,
 } from "./components/ConversationView";
-import { ConnectionsView, HomeView, Onboarding, ProjectsView, RunsView, SettingsView } from "./components/DashboardViews";
+import { ConnectionsView, HomeView, Onboarding, ProjectsView, RunsView, SavedSessionView, SettingsView } from "./components/DashboardViews";
 import { GlobalRail, ProjectSidebar } from "./components/Navigation";
 import { Button, IconButton, Modal, Skeleton } from "./components/Ui";
 import { useAgentRuntime } from "./hooks/useAgentRuntime";
@@ -65,7 +65,7 @@ import { loadRlmPreferences, snapshotRlmPreferences } from "./lib/rlm-preference
 import { runtimeNoticeToast, type RuntimeNoticeToast } from "./lib/runtime-notices";
 import { printShortcutDisposition } from "./lib/app-shortcuts";
 import { conversationMoveTarget } from "./lib/conversation-context";
-import type { AppView, Conversation, ExtensionUiRequest, GitChange, OllamaHealth, PersistedAppState, PrimeAgentDefaults, Project, RuntimeDetection, SettingsSectionId } from "./types";
+import type { AppView, Conversation, ExtensionUiRequest, GitChange, OllamaHealth, PersistedAppState, PrimeAgentDefaults, PrimeAgentSessionSummary, Project, RuntimeDetection, SettingsSectionId } from "./types";
 
 interface InstallState {
   running: boolean;
@@ -102,6 +102,7 @@ function App() {
     openProjectConversation,
     createConversation,
     importPrimeAgentSessions,
+    openCatalogSession,
     preserveConversationReference,
     discardConversationReference,
     selectConversation,
@@ -116,26 +117,44 @@ function App() {
     flushWorkspaceState,
   } = workspace;
 
+  const [sessionCatalog, setSessionCatalog] = useState<PrimeAgentSessionSummary[]>([]);
+  const [sessionCatalogLoading, setSessionCatalogLoading] = useState(false);
+  const [sessionCatalogError, setSessionCatalogError] = useState<string>();
+  const [savedSessionReader, setSavedSessionReader] = useState<PrimeAgentSessionSummary>();
+  const catalogGeneration = useRef(0);
+  const catalogLastRefreshedAt = useRef(0);
+  const refreshSessionCatalog = useCallback(async (force = false) => {
+    if (!loaded) return;
+    const now = Date.now();
+    if (!force && now - catalogLastRefreshedAt.current < 30_000) return;
+    const generation = ++catalogGeneration.current;
+    setSessionCatalogLoading(true);
+    setSessionCatalogError(undefined);
+    try {
+      const sessions = await listPrimeAgentSessions(state.projects.map((project) => project.path));
+      if (catalogGeneration.current !== generation) return;
+      catalogLastRefreshedAt.current = Date.now();
+      setSessionCatalog(sessions);
+      importPrimeAgentSessions(sessions);
+    } catch (error) {
+      if (catalogGeneration.current === generation) {
+        setSessionCatalogError(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      if (catalogGeneration.current === generation) setSessionCatalogLoading(false);
+    }
+  }, [importPrimeAgentSessions, loaded, state.projects]);
+
   useEffect(() => {
     if (!loaded) return;
-    let cancelled = false;
-    const refreshCatalog = async () => {
-      try {
-        const sessions = await listPrimeAgentSessions(state.projects.map((project) => project.path));
-        if (!cancelled) importPrimeAgentSessions(sessions);
-      } catch {
-        // The catalog is additive and optional. Runtime diagnostics remain in
-        // Settings; a transient scan failure must not block the workspace.
-      }
-    };
-    const onFocus = () => void refreshCatalog();
-    void refreshCatalog();
+    void refreshSessionCatalog(true);
+    const onFocus = () => void refreshSessionCatalog(false);
     window.addEventListener("focus", onFocus);
     return () => {
-      cancelled = true;
+      catalogGeneration.current += 1;
       window.removeEventListener("focus", onFocus);
     };
-  }, [importPrimeAgentSessions, loaded, state.projects]);
+  }, [loaded, refreshSessionCatalog]);
   const [detection, setDetection] = useState<RuntimeDetection>();
   const primeAgentDefaultsGeneration = useRef(0);
   const [primeAgentDefaults, setPrimeAgentDefaults] = useState<PrimeAgentDefaultsState>({ loading: false });
@@ -409,6 +428,31 @@ function App() {
     );
   }, [detection?.version, globalDefaultModel, openProjectConversation]);
 
+  const navigateToView = useCallback((next: AppView) => {
+    if (next !== "runs") setSavedSessionReader(undefined);
+    setView(next);
+  }, [setView]);
+
+  const openCatalogEntry = useCallback((session: PrimeAgentSessionSummary) => {
+    const normalizedCwd = session.cwd.replace(/\\/g, "/").replace(/\/+$/, "").toLocaleLowerCase();
+    const belongsToOrbit = state.projects.some((project) => (
+      project.path.replace(/\\/g, "/").replace(/\/+$/, "").toLocaleLowerCase() === normalizedCwd
+    ));
+    if (belongsToOrbit && session.folderAvailable) {
+      setSavedSessionReader(undefined);
+      openCatalogSession(session);
+      return;
+    }
+    setSavedSessionReader(session);
+  }, [openCatalogSession, state.projects]);
+
+  const addCatalogSessionProject = useCallback((session: PrimeAgentSessionSummary) => {
+    if (!session.folderAvailable) return;
+    setSavedSessionReader(undefined);
+    openCatalogSession(session);
+    void refreshSessionCatalog(true);
+  }, [openCatalogSession, refreshSessionCatalog]);
+
   const archiveConversationAndStop = useCallback((conversationId: string) => {
     void stopAgent(conversationId)
       .then(async () => {
@@ -671,7 +715,7 @@ function App() {
   const extensionRequest = agent.extensionRequest;
   return (
     <div className="app-shell">
-      <GlobalRail view={view} onView={setView} onOpenProject={() => void openProject()} onCommandPalette={() => setCommandPalette(true)} activeRuns={activeRuns} />
+      <GlobalRail view={view} onView={navigateToView} onOpenProject={() => void openProject()} onCommandPalette={() => setCommandPalette(true)} activeRuns={activeRuns} />
       {showProjectSidebar ? (
         <ProjectSidebar
           projects={state.projects}
@@ -695,9 +739,12 @@ function App() {
         />
       ) : null}
       <main className={`app-content ${showProjectSidebar ? "has-sidebar" : ""} ${bottomDock ? "has-dock" : ""}`}>
-        {view === "home" ? <HomeView projects={state.projects} conversations={state.conversations} detection={detection} onView={setView} onProject={resumeProject} onConversation={selectConversation} onOpenProject={() => void openProject()} onNewConversation={newConversation} /> : null}
+        {view === "home" ? <HomeView projects={state.projects} conversations={state.conversations} detection={detection} onView={navigateToView} onProject={resumeProject} onConversation={selectConversation} onOpenProject={() => void openProject()} onNewConversation={newConversation} /> : null}
         {view === "projects" ? <ProjectsView projects={state.projects} conversations={state.conversations} onProject={resumeProject} onOpenProject={() => void openProject()} onDeleteProject={(project) => setProjectToDelete(project)} /> : null}
-        {view === "runs" ? <RunsView projects={state.projects} conversations={state.conversations} onConversation={selectConversation} /> : null}
+        {view === "runs" ? savedSessionReader
+          ? <SavedSessionView session={savedSessionReader} onBack={() => setSavedSessionReader(undefined)} onAddProject={addCatalogSessionProject} />
+          : <RunsView projects={state.projects} conversations={state.conversations} sessions={sessionCatalog} loading={sessionCatalogLoading} error={sessionCatalogError} onRefresh={() => void refreshSessionCatalog(true)} onConversation={selectConversation} onSession={openCatalogEntry} />
+          : null}
         {view === "connections" ? <ConnectionsView models={agent.models} projectPath={terminalProjectPath} ollamaHealth={ollamaHealth?.result} ollamaHealthChecking={Boolean(ollamaHealth?.checking)} onCheckOllama={recheckOllama} onOpenSetup={openSetup} /> : null}
         {view === "settings" ? <SettingsView section={settingsSection} onSectionChange={setSettingsSection} state={state} setState={updateState} detection={detection} installState={installState} appUpdate={appUpdater.state} models={agent.models} primeAgentDefaults={primeAgentDefaults.value} primeAgentDefaultsLoading={primeAgentDefaults.loading} primeAgentDefaultsError={primeAgentDefaults.error} onPrimeAgentDefaultsChange={applyPrimeAgentDefaults} onRefreshDetection={refreshDetection} onInstall={installPrimeAgent} onCheckAppUpdate={checkAppUpdate} onDownloadAppUpdate={downloadAvailableAppUpdate} onInstallAppUpdate={() => requestAppUpdateInstall(false)} /> : null}
         {view === "chat" && selectedProject && selectedConversation ? (

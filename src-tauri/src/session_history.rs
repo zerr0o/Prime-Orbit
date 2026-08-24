@@ -3,16 +3,21 @@ use crate::{
     paths::canonicalize,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsStr,
     fs::{self, File, Metadata},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
+    sync::Arc,
     time::SystemTime,
 };
 use tauri::{AppHandle, Manager};
+use uuid::Uuid;
 
 use crate::session_lease::resolve_agent_dir;
 
@@ -99,6 +104,7 @@ pub struct SessionHistoryResult {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionCatalogEntry {
+    pub catalog_key: String,
     pub session_path: String,
     pub session_id: String,
     pub cwd: String,
@@ -113,7 +119,42 @@ pub struct SessionCatalogEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
     pub updated_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_task_state: Option<String>,
+    pub catalog_status: String,
+    pub folder_available: bool,
+    #[serde(skip)]
+    header_fingerprint: String,
 }
+
+#[derive(Debug, Clone)]
+struct CachedCatalogEntry {
+    stamp: FileStamp,
+    entry: SessionCatalogEntry,
+}
+
+#[derive(Debug, Clone)]
+struct CatalogAttestation {
+    path: PathBuf,
+    root: PathBuf,
+    session_id: String,
+    cwd: String,
+    stamp: FileStamp,
+    header_fingerprint: String,
+}
+
+#[derive(Debug, Default)]
+struct SessionCatalogInner {
+    files: HashMap<PathBuf, CachedCatalogEntry>,
+    attestations: HashMap<String, CatalogAttestation>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionCatalogState(Arc<Mutex<SessionCatalogInner>>);
 
 fn catalog_text(value: &Value, limit: usize) -> Option<String> {
     let text = match value {
@@ -153,7 +194,14 @@ fn catalog_text(value: &Value, limit: usize) -> Option<String> {
     }
 }
 
-fn scan_catalog_entry(path: &Path) -> Option<SessionCatalogEntry> {
+fn catalog_header_fingerprint(header: &Value) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(header).unwrap_or_default())
+    )
+}
+
+fn scan_catalog_entry_with_key(path: &Path, catalog_key: String) -> Option<SessionCatalogEntry> {
     let metadata = fs::symlink_metadata(path).ok()?;
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
@@ -168,6 +216,9 @@ fn scan_catalog_entry(path: &Path) -> Option<SessionCatalogEntry> {
     let mut session_name = None;
     let mut first_message = None;
     let mut message_count = 0_usize;
+    let mut session_state = None;
+    let mut agent_summary = None;
+    let mut agent_task_state = None;
     let mut entries = 0_usize;
     loop {
         line.clear();
@@ -211,6 +262,35 @@ fn scan_catalog_entry(path: &Path) -> Option<SessionCatalogEntry> {
                 .filter(|name| !name.is_empty())
                 .map(|name| name.chars().take(160).collect());
         }
+        if kind == Some("session_state") {
+            session_state = value
+                .get("state")
+                .and_then(|state| string_field(state, "status"))
+                .filter(|status| matches!(*status, "active" | "archived" | "crash" | "sleep"))
+                .map(|status| {
+                    if status == "sleep" {
+                        "archived"
+                    } else {
+                        status
+                    }
+                    .to_string()
+                });
+        }
+        if kind == Some("agent_status") {
+            if let Some(status) = value.get("status") {
+                agent_summary = status
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .map(|summary| summary.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .filter(|summary| !summary.is_empty())
+                    .map(|summary| summary.chars().take(240).collect());
+                agent_task_state = status
+                    .get("taskState")
+                    .and_then(Value::as_str)
+                    .filter(|state| matches!(*state, "needs_input" | "completed"))
+                    .map(str::to_string);
+            }
+        }
         if kind == Some("message") {
             message_count = message_count.saturating_add(1);
             if first_message.is_none()
@@ -236,7 +316,18 @@ fn scan_catalog_entry(path: &Path) -> Option<SessionCatalogEntry> {
         .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
         .unwrap_or(0);
+    let catalog_status = match session_state.as_deref() {
+        Some("archived") => "archived",
+        Some("crash") => "crash",
+        _ if message_count == 0 => "draft",
+        _ if agent_task_state.as_deref() == Some("needs_input") => "needs_input",
+        _ if agent_task_state.as_deref() == Some("completed") => "completed",
+        _ => "saved",
+    }
+    .to_string();
+    let folder_available = fs::metadata(&cwd).is_ok_and(|metadata| metadata.is_dir());
     Some(SessionCatalogEntry {
+        catalog_key,
         session_path: canonicalize(path).ok()?.to_string_lossy().into_owned(),
         session_id,
         cwd,
@@ -247,36 +338,147 @@ fn scan_catalog_entry(path: &Path) -> Option<SessionCatalogEntry> {
         parent_session_path: string_field(&header, "parentSession").map(str::to_string),
         created_at: string_field(&header, "timestamp").map(str::to_string),
         updated_at_ms,
+        session_state,
+        agent_summary,
+        agent_task_state,
+        catalog_status,
+        folder_available,
+        header_fingerprint: catalog_header_fingerprint(&header),
     })
+}
+
+#[cfg(test)]
+fn scan_catalog_entry(path: &Path) -> Option<SessionCatalogEntry> {
+    scan_catalog_entry_with_key(path, Uuid::new_v4().to_string())
+}
+
+fn expand_configured_path(home: &Path, cwd: &Path, configured: &OsStr) -> PathBuf {
+    let text = configured.to_string_lossy();
+    if text == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(relative) = text.strip_prefix("~/").or_else(|| text.strip_prefix("~\\")) {
+        return home.join(relative);
+    }
+    let path = PathBuf::from(configured);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn catalog_session_roots(home: &Path, project_paths: &[String]) -> HashSet<PathBuf> {
+    // Keep the default root in the catalog even when a newer runtime uses an
+    // override: it can still contain valid sessions created before that
+    // configuration changed.
+    let mut roots = HashSet::from([home.join(".prime").join("agent").join("sessions")]);
+    let mut working_directories = project_paths
+        .iter()
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .collect::<HashSet<_>>();
+    working_directories.insert(std::env::current_dir().unwrap_or_else(|_| home.to_path_buf()));
+
+    let session_dir = std::env::var_os("PRIME_AGENT_SESSION_DIR")
+        .or_else(|| std::env::var_os("PRIME_AGENT_CODING_AGENT_SESSION_DIR"))
+        .or_else(|| std::env::var_os("PI_SESSION_DIR"))
+        .or_else(|| std::env::var_os("PI_CODING_AGENT_SESSION_DIR"));
+    if let Some(configured) = session_dir.as_deref() {
+        for cwd in &working_directories {
+            roots.insert(expand_configured_path(home, cwd, configured));
+        }
+        return roots;
+    }
+
+    let configured_agent_dir = std::env::var_os("PRIME_AGENT_CODING_AGENT_DIR")
+        .or_else(|| std::env::var_os("PI_CODING_AGENT_DIR"));
+    if let Some(configured) = configured_agent_dir.as_deref() {
+        for cwd in &working_directories {
+            roots.insert(resolve_agent_dir(home, cwd, Some(configured)).join("sessions"));
+        }
+    }
+    roots
+}
+
+fn cached_or_scanned_catalog_entry(
+    state: &SessionCatalogState,
+    path: &Path,
+) -> Option<(PathBuf, CachedCatalogEntry)> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_SESSION_BYTES
+    {
+        return None;
+    }
+    let canonical = canonicalize(path).ok()?;
+    let stamp = FileStamp::from_metadata(&metadata);
+    let cached = state.0.lock().files.get(&canonical).cloned();
+    if cached.as_ref().is_some_and(|cached| cached.stamp == stamp) {
+        let mut cached = cached.expect("checked cached catalog entry");
+        cached.entry.folder_available =
+            fs::metadata(&cached.entry.cwd).is_ok_and(|metadata| metadata.is_dir());
+        return Some((canonical, cached));
+    }
+    let catalog_key = cached
+        .as_ref()
+        .map(|cached| cached.entry.catalog_key.clone())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let entry = scan_catalog_entry_with_key(path, catalog_key)?;
+    Some((canonical, CachedCatalogEntry { stamp, entry }))
+}
+
+fn is_visible_catalog_session(session: &SessionCatalogEntry) -> bool {
+    session.message_count > 0 && session.rlm_depth == 0 && session.parent_session_path.is_none()
 }
 
 fn list_session_catalog(
     app: &AppHandle,
+    state: &SessionCatalogState,
     project_paths: Vec<String>,
 ) -> Result<Vec<SessionCatalogEntry>, String> {
     let home = app
         .path()
         .home_dir()
         .map_err(|error| format!("Impossible de localiser les sessions Prime Agent: {error}"))?;
-    let configured = std::env::var_os("PRIME_AGENT_CODING_AGENT_DIR")
-        .or_else(|| std::env::var_os("PI_CODING_AGENT_DIR"));
-    let mut roots = project_paths
-        .into_iter()
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .map(|cwd| resolve_agent_dir(&home, &cwd, configured.as_deref()).join("sessions"))
-        .collect::<HashSet<_>>();
-    if roots.is_empty() {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
-        roots.insert(resolve_agent_dir(&home, &cwd, configured.as_deref()).join("sessions"));
-    }
+    let roots = catalog_session_roots(&home, &project_paths);
     let mut sessions = Vec::new();
-    let mut known_paths = HashSet::new();
+    let mut next_files = HashMap::new();
+    let mut attestations = HashMap::new();
     for root in roots {
-        let entries = match fs::read_dir(&root) {
+        let root_metadata = match fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "Impossible d’inspecter {}: {error}",
+                    root.display()
+                ))
+            }
+        };
+        if !root_metadata.is_dir() {
+            continue;
+        }
+        let canonical_root = match canonicalize(&root) {
+            Ok(root) => root,
+            Err(error) => {
+                return Err(format!(
+                    "Impossible de résoudre {}: {error}",
+                    root.display()
+                ))
+            }
+        };
+        let entries = match fs::read_dir(&canonical_root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(format!("Impossible de lire {}: {error}", root.display())),
+            Err(error) => {
+                return Err(format!(
+                    "Impossible de lire {}: {error}",
+                    canonical_root.display()
+                ))
+            }
         };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -285,24 +487,59 @@ fn list_session_catalog(
                 .and_then(|value| value.to_str())
                 .is_some_and(|value| value.eq_ignore_ascii_case("jsonl"))
             {
-                if let Some(session) = scan_catalog_entry(&path) {
-                    if known_paths.insert(session.session_path.clone()) {
-                        sessions.push(session);
+                if let Some((canonical, cached)) = cached_or_scanned_catalog_entry(state, &path) {
+                    if !canonical.starts_with(&canonical_root) {
+                        continue;
                     }
+                    let session = cached.entry.clone();
+                    let stamp = cached.stamp;
+                    let header_fingerprint = cached.entry.header_fingerprint.clone();
+                    next_files.insert(canonical.clone(), cached);
+                    if !is_visible_catalog_session(&session) {
+                        continue;
+                    }
+                    attestations.insert(
+                        session.catalog_key.clone(),
+                        CatalogAttestation {
+                            path: canonical,
+                            root: canonical_root.clone(),
+                            session_id: session.session_id.clone(),
+                            cwd: session.cwd.clone(),
+                            stamp,
+                            header_fingerprint,
+                        },
+                    );
+                    sessions.push(session);
                 }
             }
         }
     }
     sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
+    let mut known_paths = HashSet::new();
+    let mut known_ids = HashSet::new();
+    sessions.retain(|session| {
+        known_paths.insert(session.session_path.clone())
+            && known_ids.insert(session.session_id.clone())
+    });
+    let visible_keys = sessions
+        .iter()
+        .map(|session| session.catalog_key.as_str())
+        .collect::<HashSet<_>>();
+    attestations.retain(|key, _| visible_keys.contains(key.as_str()));
+    let mut catalog = state.0.lock();
+    catalog.files = next_files;
+    catalog.attestations = attestations;
     Ok(sessions)
 }
 
 #[tauri::command]
 pub async fn list_prime_agent_sessions(
     app: AppHandle,
+    state: tauri::State<'_, SessionCatalogState>,
     project_paths: Vec<String>,
 ) -> Result<Vec<SessionCatalogEntry>, String> {
-    crate::run_blocking(move || list_session_catalog(&app, project_paths)).await
+    let state = state.inner().clone();
+    crate::run_blocking(move || list_session_catalog(&app, &state, project_paths)).await
 }
 
 #[derive(Debug, Clone)]
@@ -1658,12 +1895,15 @@ fn build_public_messages(entries: &[ParsedEntry]) -> Result<(Vec<Value>, bool), 
     Ok((messages, truncated))
 }
 
-fn load_once(
+fn load_once_validated<F>(
     path: &Path,
-    expected_session_id: Option<&str>,
-    project_path: &Path,
     home: &Path,
-) -> Result<(SessionHistoryResult, FileStamp), String> {
+    inventory_project_path: Option<&Path>,
+    validate: F,
+) -> Result<(SessionHistoryResult, FileStamp), String>
+where
+    F: FnOnce(&Value, &Path) -> Result<Option<String>, String>,
+{
     let before = fs::metadata(path)
         .map(|metadata| FileStamp::from_metadata(&metadata))
         .map_err(|error| format!("Impossible d’inspecter la session: {error}"))?;
@@ -1674,33 +1914,30 @@ fn load_once(
         ));
     }
     let parsed = parse_session(path)?;
-    let header_warning = validate_header(
-        &parsed.header,
-        path,
-        expected_session_id,
-        project_path,
-        home,
-    )?;
+    let header_warning = validate(&parsed.header, path)?;
     let (messages, message_output_truncated) = build_public_messages(&parsed.entries)?;
     let (mut refinements, mut harness_entries, mut refinement_output_truncated) =
         public_refinement_records(&parsed.entries);
     let header_id = string_field(&parsed.header, "id")
         .expect("validate_header accepted a session without an id");
-    let inventory_warning = match read_harness_inventory(
-        home,
-        &path.to_string_lossy(),
-        header_id,
-        &project_path.to_string_lossy(),
-    ) {
-        Ok(inventory) => {
-            overlay_harness_inventory(
-                &mut harness_entries,
-                inventory,
-                &mut refinement_output_truncated,
-            );
-            false
-        }
-        Err(_) => true,
+    let inventory_warning = match inventory_project_path {
+        Some(project_path) => match read_harness_inventory(
+            home,
+            &path.to_string_lossy(),
+            header_id,
+            &project_path.to_string_lossy(),
+        ) {
+            Ok(inventory) => {
+                overlay_harness_inventory(
+                    &mut harness_entries,
+                    inventory,
+                    &mut refinement_output_truncated,
+                );
+                false
+            }
+            Err(_) => true,
+        },
+        None => false,
     };
     bound_refinement_output(
         &mut refinements,
@@ -1759,6 +1996,23 @@ fn load_once(
     ))
 }
 
+fn load_once(
+    path: &Path,
+    expected_session_id: Option<&str>,
+    project_path: &Path,
+    home: &Path,
+) -> Result<(SessionHistoryResult, FileStamp), String> {
+    load_once_validated(path, home, Some(project_path), |header, session_path| {
+        validate_header(
+            header,
+            session_path,
+            expected_session_id,
+            project_path,
+            home,
+        )
+    })
+}
+
 fn load_session_history_blocking(
     session_path: String,
     expected_session_id: Option<String>,
@@ -1798,6 +2052,137 @@ pub async fn load_session_history(
         load_session_history_blocking(session_path, expected_session_id, project_path, home)
     })
     .await
+}
+
+fn validate_catalog_header(
+    header: &Value,
+    expected_session_id: &str,
+    attested_cwd: &str,
+    expected_fingerprint: &str,
+) -> Result<Option<String>, String> {
+    if string_field(header, "type") != Some("session") {
+        return Err("Le fichier ne contient pas un en-tête de session Prime Agent".to_string());
+    }
+    header_version(header)?;
+    let header_id = string_field(header, "id")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "L’en-tête de session ne contient pas d’identifiant".to_string())?;
+    if header_id != expected_session_id {
+        return Err("La session ne correspond plus à l’entrée du catalogue".to_string());
+    }
+    if string_field(header, "cwd") != Some(attested_cwd) {
+        return Err(
+            "Le dossier de la session ne correspond plus à l’entrée du catalogue".to_string(),
+        );
+    }
+    if catalog_header_fingerprint(header) != expected_fingerprint {
+        return Err(
+            "L’empreinte de la session ne correspond plus à l’entrée du catalogue".to_string(),
+        );
+    }
+    Ok((!fs::metadata(attested_cwd).is_ok_and(|metadata| metadata.is_dir())).then(|| {
+        "Le dossier de travail d’origine est inaccessible; l’historique reste consultable en lecture seule."
+            .to_string()
+    }))
+}
+
+fn load_catalog_once(
+    path: &Path,
+    expected_session_id: &str,
+    attested_cwd: &str,
+    expected_fingerprint: &str,
+    home: &Path,
+) -> Result<(SessionHistoryResult, FileStamp), String> {
+    load_once_validated(path, home, None, |header, _| {
+        validate_catalog_header(
+            header,
+            expected_session_id,
+            attested_cwd,
+            expected_fingerprint,
+        )
+    })
+}
+
+fn load_catalog_session_history_blocking(
+    attestation: CatalogAttestation,
+    expected_session_id: String,
+    home: PathBuf,
+) -> Result<SessionHistoryResult, String> {
+    let expected_session_id = validate_identifier(Some(expected_session_id))?
+        .ok_or_else(|| "L’identifiant de session est requis".to_string())?;
+    if expected_session_id != attestation.session_id {
+        return Err("La session ne correspond pas à l’entrée du catalogue".to_string());
+    }
+    let (path, initial_stamp) =
+        validate_session_file(attestation.path.to_string_lossy().into_owned())?;
+    if path != attestation.path || !path.starts_with(&attestation.root) {
+        return Err("Le fichier de session ne correspond plus à l’entrée du catalogue".to_string());
+    }
+    if initial_stamp.len < attestation.stamp.len
+        || (initial_stamp.len == attestation.stamp.len
+            && initial_stamp.modified != attestation.stamp.modified)
+    {
+        return Err(
+            "Le fichier de session a été remplacé depuis l’actualisation du catalogue".to_string(),
+        );
+    }
+    let (first, first_after) = load_catalog_once(
+        &path,
+        &expected_session_id,
+        &attestation.cwd,
+        &attestation.header_fingerprint,
+        &home,
+    )?;
+    if initial_stamp == first_after {
+        return Ok(first);
+    }
+    let (second, second_after) = load_catalog_once(
+        &path,
+        &expected_session_id,
+        &attestation.cwd,
+        &attestation.header_fingerprint,
+        &home,
+    )?;
+    if first_after != second_after {
+        return Err(
+            "La session est encore en cours de modification; réessayez dans un instant".to_string(),
+        );
+    }
+    Ok(second)
+}
+
+#[tauri::command]
+pub async fn load_catalog_session_history(
+    app: AppHandle,
+    state: tauri::State<'_, SessionCatalogState>,
+    catalog_key: String,
+    expected_session_id: String,
+) -> Result<SessionHistoryResult, String> {
+    validate_catalog_key(&catalog_key)?;
+    let attestation = state
+        .0
+        .lock()
+        .attestations
+        .get(&catalog_key)
+        .cloned()
+        .ok_or_else(|| {
+            "Cette session n’est plus attestée par le catalogue. Actualisez la liste puis réessayez."
+                .to_string()
+        })?;
+    let home = app
+        .path()
+        .home_dir()
+        .map_err(|error| format!("Impossible de localiser le dossier utilisateur: {error}"))?;
+    crate::run_blocking(move || {
+        load_catalog_session_history_blocking(attestation, expected_session_id, home)
+    })
+    .await
+}
+
+fn validate_catalog_key(catalog_key: &str) -> Result<(), String> {
+    Uuid::parse_str(catalog_key)
+        .map(|_| ())
+        .map_err(|_| "La clé du catalogue Prime Agent est invalide".to_string())
 }
 
 #[cfg(test)]
@@ -1851,6 +2236,20 @@ mod tests {
                 self.project.to_string_lossy().into_owned(),
                 self.home.clone(),
             )
+        }
+
+        fn catalog_attestation(&self) -> CatalogAttestation {
+            let entry = scan_catalog_entry(&self.session).expect("catalog entry");
+            let metadata = fs::metadata(&self.session).expect("session metadata");
+            CatalogAttestation {
+                path: canonicalize(&self.session).expect("canonical session"),
+                root: canonicalize(self.session.parent().expect("session root"))
+                    .expect("canonical root"),
+                session_id: self.session_id.clone(),
+                cwd: self.project.to_string_lossy().into_owned(),
+                stamp: FileStamp::from_metadata(&metadata),
+                header_fingerprint: entry.header_fingerprint,
+            }
         }
 
         fn write_harness_state(&self, scope: &str, memory_entries: Value) {
@@ -2378,6 +2777,207 @@ mod tests {
         assert_eq!(entry.message_count, 2);
         assert_eq!(entry.rlm_depth, 0);
         assert_eq!(Path::new(&entry.cwd), fixture.project);
+        assert_eq!(entry.catalog_status, "saved");
+        assert!(entry.folder_available);
+        assert!(Uuid::parse_str(&entry.catalog_key).is_ok());
+    }
+
+    #[test]
+    fn catalogs_persistent_lifecycle_and_attention_state() {
+        let fixture = Fixture::new(&[
+            json!({"type":"message","id":"one","parentId":null,"message":{"role":"user","content":"question"}}),
+            json!({"type":"agent_status","id":"attention","parentId":"one","status":{"taskState":"needs_input","summary":"  Choose   a provider  "}}),
+            json!({"type":"session_state","id":"state","parentId":"attention","state":{"status":"active"}}),
+        ]);
+        let entry = scan_catalog_entry(&fixture.session).expect("catalog entry");
+        assert_eq!(entry.catalog_status, "needs_input");
+        assert_eq!(entry.agent_task_state.as_deref(), Some("needs_input"));
+        assert_eq!(entry.agent_summary.as_deref(), Some("Choose a provider"));
+        assert_eq!(entry.session_state.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn keeps_catalog_keys_stable_until_a_file_changes_and_reuses_them_afterward() {
+        let fixture = Fixture::new(&[json!({
+            "type":"message","id":"one","parentId":null,
+            "message":{"role":"user","content":"initial"}
+        })]);
+        let state = SessionCatalogState::default();
+        let (_, first) = cached_or_scanned_catalog_entry(&state, &fixture.session).unwrap();
+        state
+            .0
+            .lock()
+            .files
+            .insert(canonicalize(&fixture.session).unwrap(), first.clone());
+        let (_, cached) = cached_or_scanned_catalog_entry(&state, &fixture.session).unwrap();
+        assert_eq!(cached.entry.catalog_key, first.entry.catalog_key);
+        assert_eq!(cached.entry.message_count, 1);
+        assert!(cached.entry.folder_available);
+        fs::remove_dir_all(&fixture.project).unwrap();
+        let (_, missing_folder) =
+            cached_or_scanned_catalog_entry(&state, &fixture.session).unwrap();
+        assert!(!missing_folder.entry.folder_available);
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&fixture.session)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type":"message","id":"two","parentId":"one",
+                "message":{"role":"assistant","content":"updated"}
+            })
+        )
+        .unwrap();
+        drop(file);
+        let (_, refreshed) = cached_or_scanned_catalog_entry(&state, &fixture.session).unwrap();
+        assert_eq!(refreshed.entry.catalog_key, first.entry.catalog_key);
+        assert_eq!(refreshed.entry.message_count, 2);
+    }
+
+    #[test]
+    fn rejects_forged_catalog_keys_before_attestation_lookup() {
+        assert!(validate_catalog_key("not-a-catalog-key").is_err());
+        assert!(validate_catalog_key("../../outside.jsonl").is_err());
+        assert!(validate_catalog_key(&Uuid::new_v4().to_string()).is_ok());
+    }
+
+    #[test]
+    fn excludes_empty_drafts_and_child_sessions_from_the_global_catalog() {
+        let draft = Fixture::new(&[]);
+        let draft_entry = scan_catalog_entry(&draft.session).expect("draft entry");
+        assert_eq!(draft_entry.catalog_status, "draft");
+        assert!(!is_visible_catalog_session(&draft_entry));
+
+        let child = Fixture::new(&[json!({
+            "type":"message","id":"one","parentId":null,
+            "message":{"role":"user","content":"child work"}
+        })]);
+        let mut file = File::create(&child.session).expect("rewrite child session");
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type":"session","version":3,"id":child.session_id,"cwd":child.project,
+                "rlmDepth":1,"parentSession":child.session.parent().unwrap().join("parent.jsonl")
+            })
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type":"message","id":"one","parentId":null,
+                "message":{"role":"user","content":"child work"}
+            })
+        )
+        .unwrap();
+        drop(file);
+        let child_entry = scan_catalog_entry(&child.session).expect("child entry");
+        assert!(!is_visible_catalog_session(&child_entry));
+    }
+
+    #[test]
+    fn loads_an_attested_external_session_after_its_working_folder_disappears() {
+        let fixture = Fixture::new(&[json!({
+            "type":"message","id":"one","parentId":null,
+            "message":{"role":"user","content":"history remains readable"}
+        })]);
+        let attestation = fixture.catalog_attestation();
+        fs::remove_dir_all(&fixture.project).expect("remove original project");
+        let history = load_catalog_session_history_blocking(
+            attestation,
+            fixture.session_id.clone(),
+            fixture.home.clone(),
+        )
+        .expect("read missing-folder session");
+        assert!(serde_json::to_string(&history.messages)
+            .unwrap()
+            .contains("history remains readable"));
+        assert!(history
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("inaccessible")));
+        assert!(history.read_only);
+    }
+
+    #[test]
+    fn rejects_forged_catalog_identity_and_paths_outside_the_attested_root() {
+        let fixture = Fixture::new(&[json!({
+            "type":"message","id":"one","parentId":null,
+            "message":{"role":"user","content":"protected"}
+        })]);
+        let attestation = fixture.catalog_attestation();
+        let wrong_id = load_catalog_session_history_blocking(
+            attestation.clone(),
+            "different-session".to_string(),
+            fixture.home.clone(),
+        )
+        .unwrap_err();
+        assert!(wrong_id.contains("catalogue"));
+
+        let outside = fixture._temp.path().join("outside.jsonl");
+        fs::copy(&fixture.session, &outside).expect("copy outside root");
+        let mut outside_attestation = attestation;
+        outside_attestation.path = canonicalize(&outside).expect("canonical outside path");
+        outside_attestation.stamp = FileStamp::from_metadata(&fs::metadata(&outside).unwrap());
+        let outside_error = load_catalog_session_history_blocking(
+            outside_attestation,
+            fixture.session_id.clone(),
+            fixture.home.clone(),
+        )
+        .unwrap_err();
+        assert!(outside_error.contains("fichier de session"));
+    }
+
+    #[test]
+    fn rejects_replaced_or_oversized_catalog_files() {
+        let fixture = Fixture::new(&[json!({
+            "type":"message","id":"one","parentId":null,
+            "message":{"role":"user","content":"original"}
+        })]);
+        let attestation = fixture.catalog_attestation();
+        let mut replacement = File::create(&fixture.session).expect("replace session");
+        writeln!(
+            replacement,
+            "{}",
+            json!({
+                "type":"session","version":3,"id":fixture.session_id,"cwd":fixture.project,
+                "replacement":true
+            })
+        )
+        .unwrap();
+        writeln!(
+            replacement,
+            "{}",
+            json!({
+                "type":"message","id":"one","parentId":null,
+                "message":{"role":"user","content":"replacement with a different immutable header"}
+            })
+        )
+        .unwrap();
+        drop(replacement);
+        let replacement_error = load_catalog_session_history_blocking(
+            attestation,
+            fixture.session_id.clone(),
+            fixture.home.clone(),
+        )
+        .unwrap_err();
+        assert!(replacement_error.contains("remplacé") || replacement_error.contains("empreinte"));
+
+        let oversized = Fixture::new(&[json!({
+            "type":"message","id":"one","parentId":null,
+            "message":{"role":"user","content":"too large"}
+        })]);
+        File::options()
+            .write(true)
+            .open(&oversized.session)
+            .unwrap()
+            .set_len(MAX_SESSION_BYTES + 1)
+            .unwrap();
+        assert!(scan_catalog_entry(&oversized.session).is_none());
     }
 
     #[test]

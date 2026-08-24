@@ -393,6 +393,19 @@ export async function loadSessionHistory(
   });
 }
 
+/** Loads only a session returned by the current native catalog. The renderer
+ * never supplies a filesystem path for this read-only route. */
+export async function loadCatalogSessionHistory(
+  catalogKey: string,
+  expectedSessionId: string,
+): Promise<SessionHistoryResult> {
+  if (!isNative()) return { messages: [], refinements: [], harnessEntries: [], readOnly: true, truncated: false };
+  return invoke<SessionHistoryResult>("load_catalog_session_history", {
+    catalogKey,
+    expectedSessionId,
+  });
+}
+
 export type HarnessScope = "local" | "global";
 export type HarnessKind = "prompt" | "memory" | "skill" | "subagent";
 export type HarnessOpenTarget = "file" | "folder";

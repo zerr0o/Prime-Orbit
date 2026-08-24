@@ -560,7 +560,7 @@ function dropClass(target: DropTarget | undefined, kind: DragItem["kind"], id: s
 const NAV_COPY = {
   "nav.home": ["Accueil", "Home"],
   "nav.projects": ["Projets", "Projects"],
-  "nav.runs": ["Exécutions", "Runs"],
+  "nav.runs": ["Conversations Prime Agent", "Prime Agent conversations"],
   "nav.connections": ["Connexions", "Connections"],
   "nav.main": ["Navigation principale", "Main navigation"],
   "nav.brandHome": ["Prime Orbit — Accueil", "Prime Orbit — Home"],
