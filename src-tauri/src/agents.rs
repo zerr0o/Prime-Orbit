@@ -133,6 +133,7 @@ struct RunningAgent {
     info: RunningAgentInfo,
     append_system_prompt: Option<String>,
     pending_extension_ui_requests: Vec<PendingExtensionUiRecord>,
+    _plan_extension_guard: Option<Arc<fs::File>>,
     daemon_socket: Option<PathBuf>,
     launch_spec: LaunchSpec,
     child: Arc<Mutex<Child>>,
@@ -236,6 +237,7 @@ struct SpawnedRpcAgent {
     stdout: ChildStdout,
     stderr: ChildStderr,
     exit_emitted: Arc<AtomicBool>,
+    _plan_extension_guard: Option<Arc<fs::File>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -628,18 +630,19 @@ fn emit_runtime_line(
     };
     match target {
         Some(route) => {
-            let delivered = route
-                .owner
-                .as_deref()
-                .is_some_and(|owner| app.emit_to(owner, event_name, event).is_ok());
-            if !delivered {
-                if let Some(request_id) = route.plan_attention_request_id {
-                    let _ = crate::notifications::notify_plan_attention_from_runtime(
-                        app,
-                        conversation_id,
-                        &request_id,
-                    );
-                }
+            // Delivery acknowledgement from Tauri does not prove that a live
+            // renderer listener received the event. Always invoke the native
+            // notifier for blocking Plan requests; its own all-WebView focus
+            // check and process-wide request-key dedupe suppress duplicates.
+            if let Some(request_id) = route.plan_attention_request_id.as_deref() {
+                let _ = crate::notifications::notify_plan_attention_from_runtime(
+                    app,
+                    conversation_id,
+                    request_id,
+                );
+            }
+            if let Some(owner) = route.owner.as_deref() {
+                let _ = app.emit_to(owner, event_name, event);
             }
         }
         None => {
@@ -2359,10 +2362,12 @@ fn spawn_rpc_agent(
     daemon_socket: Option<&Path>,
     launch_spec: &LaunchSpec,
 ) -> Result<SpawnedRpcAgent, String> {
-    let plan_extension = if runtime_mode == AgentRuntimeMode::Plan {
-        Some(crate::plan_mode::ensure_plan_extension(app)?)
+    let (plan_extension, plan_extension_guard) = if runtime_mode == AgentRuntimeMode::Plan {
+        let path = crate::plan_mode::ensure_plan_extension(app)?;
+        let guard = crate::plan_mode::lock_plan_extension_for_launch(&path)?;
+        (Some(path), Some(guard))
     } else {
-        None
+        (None, None)
     };
     let arguments = rpc_launch_arguments(
         session_path,
@@ -2421,6 +2426,7 @@ fn spawn_rpc_agent(
         stdout,
         stderr,
         exit_emitted: Arc::new(AtomicBool::new(false)),
+        _plan_extension_guard: plan_extension_guard,
     })
 }
 
@@ -2606,6 +2612,7 @@ fn start_agent_blocking(
             info: info.clone(),
             append_system_prompt,
             pending_extension_ui_requests: Vec::new(),
+            _plan_extension_guard: spawned._plan_extension_guard.clone(),
             daemon_socket,
             launch_spec,
             child: Arc::clone(&spawned.child),
@@ -2729,6 +2736,13 @@ fn rpc_starts_busy_operation(payload_type: Option<&str>) -> bool {
     matches!(payload_type, Some("prompt" | "compact" | "refine"))
 }
 
+fn runtime_mode_matches_expected(
+    actual: AgentRuntimeMode,
+    expected: Option<AgentRuntimeMode>,
+) -> bool {
+    expected.is_none_or(|expected| actual == expected)
+}
+
 fn send_rpc_blocking(
     agents: AgentsState,
     attachments: AttachmentCache,
@@ -2736,6 +2750,7 @@ fn send_rpc_blocking(
     conversation_id: String,
     app_data_dir: PathBuf,
     mut payload: Value,
+    expected_runtime_mode: Option<AgentRuntimeMode>,
 ) -> Result<(), String> {
     let conversation_id = validated_identifier(conversation_id)?;
     if !payload.is_object() {
@@ -2756,6 +2771,12 @@ fn send_rpc_blocking(
         let agent = map
             .get_mut(&conversation_id)
             .ok_or_else(|| format!("Aucun Prime Agent actif pour {conversation_id}"))?;
+        if !runtime_mode_matches_expected(agent.info.runtime_mode, expected_runtime_mode) {
+            return Err(
+                "Le runtime Prime Agent actif ne correspond plus au mode attendu de la conversation."
+                    .to_string(),
+            );
+        }
         if agent.restarting {
             return Err(
                 "Prime Agent redémarre pour cette conversation. Réessayez dans un instant."
@@ -3462,6 +3483,7 @@ fn restart_agent_blocking(
                 info: info.clone(),
                 append_system_prompt: snapshot.append_system_prompt,
                 pending_extension_ui_requests: Vec::new(),
+                _plan_extension_guard: spawned._plan_extension_guard.clone(),
                 daemon_socket: snapshot.daemon_socket,
                 launch_spec: snapshot.launch_spec,
                 child: Arc::clone(&spawned.child),
@@ -3729,6 +3751,7 @@ pub async fn send_rpc(
     exports: tauri::State<'_, crate::exports::HtmlExportState>,
     conversation_id: String,
     payload: Value,
+    expected_runtime_mode: Option<AgentRuntimeMode>,
 ) -> Result<(), String> {
     let agents = agents.inner().clone();
     let attachments = attachments.inner().clone();
@@ -3762,6 +3785,7 @@ pub async fn send_rpc(
             conversation_id,
             app_data_dir,
             payload,
+            expected_runtime_mode,
         )
     })
     .await?;
@@ -4058,9 +4082,9 @@ mod tests {
         mark_resource_reload_unknown, owner_may_send, parsed_extension_ui_request,
         public_runtime_line, release_owner_lease_state, requested_launch_option_update,
         restart_slot_matches, rpc_launch_arguments, rpc_starts_busy_operation, runtime_busy_state,
-        runtime_launch_options, runtime_session_id, runtime_session_path,
-        should_emit_resources_reloaded, terminal_clears_pending_extension_ui, validate_queue_lane,
-        validate_queue_mutation, validate_reload_result, wait_for_child_until,
+        runtime_launch_options, runtime_mode_matches_expected, runtime_session_id,
+        runtime_session_path, should_emit_resources_reloaded, terminal_clears_pending_extension_ui,
+        validate_queue_lane, validate_queue_mutation, validate_reload_result, wait_for_child_until,
         waiter_may_remove_slot, AgentOperations, AgentResourcesReloadedEvent, AgentRuntimeMode,
         AgentsState, DirectSessionOperationKind, DirectSessionOperationRuntimeEvent,
         LaunchOptionUpdate, LaunchSpec, QueuedMessageMutation, ReloadAgentResourcesResult,
@@ -4501,6 +4525,23 @@ mod tests {
         ] {
             assert!(!line.contains(private_value), "leaked {private_value}");
         }
+    }
+
+    #[test]
+    fn prompt_runtime_expectation_fails_closed_on_mode_races() {
+        assert!(runtime_mode_matches_expected(AgentRuntimeMode::Plan, None));
+        assert!(runtime_mode_matches_expected(
+            AgentRuntimeMode::Plan,
+            Some(AgentRuntimeMode::Plan)
+        ));
+        assert!(!runtime_mode_matches_expected(
+            AgentRuntimeMode::Normal,
+            Some(AgentRuntimeMode::Plan)
+        ));
+        assert!(!runtime_mode_matches_expected(
+            AgentRuntimeMode::Plan,
+            Some(AgentRuntimeMode::Normal)
+        ));
     }
 
     #[test]

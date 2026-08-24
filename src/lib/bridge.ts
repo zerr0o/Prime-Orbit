@@ -288,9 +288,17 @@ export async function releaseAgent(conversationId: string): Promise<boolean> {
   return invoke<boolean>("release_agent", { conversationId });
 }
 
-export async function sendRpc(conversationId: string, payload: Record<string, unknown>): Promise<void> {
+export async function sendRpc(
+  conversationId: string,
+  payload: Record<string, unknown>,
+  options: { expectedRuntimeMode?: AgentRuntimeMode } = {},
+): Promise<void> {
   if (!isNative()) return;
-  await invoke("send_rpc", { conversationId, payload });
+  await invoke("send_rpc", {
+    conversationId,
+    payload,
+    expectedRuntimeMode: options.expectedRuntimeMode,
+  });
 }
 
 /** Replays unanswered extension dialogs after a renderer reload or owner handoff. */

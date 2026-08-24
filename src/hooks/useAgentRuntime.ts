@@ -2113,7 +2113,7 @@ export function useAgentRuntime(options: {
           id: `plan-apply-${pending.handoffId}`,
           type: "prompt",
           message,
-        });
+        }, { expectedRuntimeMode: "normal" });
         updateConversation(conversationId, {
           hasContent: true,
           updatedAt: now(),
@@ -3437,6 +3437,9 @@ export function useAgentRuntime(options: {
         return;
       }
       const attachmentPayload = promptAttachmentPayload(attachments);
+      const expectedRuntimeMode = runtimeModeForConversationPlan(
+        getConversationRef.current(conversationId) ?? beforeStart,
+      );
       try {
         await sendRpc(conversationId, {
           id: uid("prompt"),
@@ -3446,7 +3449,7 @@ export function useAgentRuntime(options: {
           ...(forceQueued
             ? { streamingBehavior: effectiveDelivery === "steer" ? "steer" : "followUp" }
             : {}),
-        });
+        }, { expectedRuntimeMode });
         updateConversation(conversationId, (conversation) => commitPromptTransaction(conversation, prepared.transaction));
         if (forceQueued) {
           const token = activeSelection.current;

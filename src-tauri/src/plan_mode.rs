@@ -14,7 +14,9 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 use tauri::AppHandle;
 
@@ -47,12 +49,7 @@ pub(crate) struct WritePlanDocumentResult {
 
 pub(crate) fn ensure_plan_extension(app: &AppHandle) -> Result<PathBuf, String> {
     let runtime_root = app_data_dir(app)?.join("runtime");
-    fs::create_dir_all(&runtime_root).map_err(|error| {
-        format!(
-            "Impossible de créer le dossier de l’extension Plan {}: {error}",
-            runtime_root.display()
-        )
-    })?;
+    ensure_plain_directory(&runtime_root)?;
     ensure_plan_extension_in(&runtime_root)
 }
 
@@ -63,6 +60,50 @@ fn ensure_plan_extension_in(runtime_root: &Path) -> Result<PathBuf, String> {
         write_atomic(&extension, PLAN_EXTENSION_BYTES)?;
     }
     Ok(extension)
+}
+
+/// Opens the verified embedded extension with a Windows share mode that allows
+/// Prime Agent to read it but prevents replacement, writes, and deletion for
+/// the complete lifetime of the spawned Plan process.
+pub(crate) fn lock_plan_extension_for_launch(path: &Path) -> Result<Arc<fs::File>, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("Impossible de vérifier {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("L’extension Plan doit être un fichier physique régulier.".to_string());
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("Impossible de verrouiller {}: {error}", path.display()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("Impossible de vérifier le verrou Plan: {error}"))?;
+    if !opened.is_file() || opened.len() != PLAN_EXTENSION_BYTES.len() as u64 {
+        return Err("L’extension Plan verrouillée a une taille inattendue.".to_string());
+    }
+    let mut bytes = Vec::with_capacity(PLAN_EXTENSION_BYTES.len());
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("Impossible de relire l’extension Plan verrouillée: {error}"))?;
+    if bytes != PLAN_EXTENSION_BYTES {
+        return Err(
+            "L’extension Plan verrouillée ne correspond pas au binaire embarqué.".to_string(),
+        );
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("Impossible de réinitialiser le verrou Plan: {error}"))?;
+    Ok(Arc::new(file))
 }
 
 fn validate_plan_id(value: &str) -> Result<String, String> {
@@ -285,8 +326,8 @@ pub(crate) async fn write_plan_document(
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_plan_extension_in, slugify_title, validate_markdown, write_plan_document_in,
-        PLAN_EXTENSION_BYTES, PLAN_EXTENSION_FILE_NAME,
+        ensure_plan_extension_in, lock_plan_extension_for_launch, slugify_title, validate_markdown,
+        write_plan_document_in, PLAN_EXTENSION_BYTES, PLAN_EXTENSION_FILE_NAME,
     };
     use std::fs;
 
@@ -298,7 +339,11 @@ mod tests {
         assert_eq!(fs::read(&extension).unwrap(), PLAN_EXTENSION_BYTES);
         fs::write(&extension, b"tampered").unwrap();
         ensure_plan_extension_in(temporary.path()).unwrap();
-        assert_eq!(fs::read(extension).unwrap(), PLAN_EXTENSION_BYTES);
+        assert_eq!(fs::read(&extension).unwrap(), PLAN_EXTENSION_BYTES);
+        let guard = lock_plan_extension_for_launch(&extension).unwrap();
+        #[cfg(windows)]
+        assert!(fs::write(&extension, b"race replacement").is_err());
+        drop(guard);
     }
 
     #[test]
