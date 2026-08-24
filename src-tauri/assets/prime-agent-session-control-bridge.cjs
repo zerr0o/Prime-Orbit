@@ -54,7 +54,7 @@ function validOwnedClientDescriptor(descriptor, socketPath) {
   return descriptor
     && typeof descriptor === "object"
     && !Array.isArray(descriptor)
-    && descriptor.version === 1
+    && (descriptor.version === 1 || descriptor.version === 2)
     && descriptor.supervisorSocketPath === socketPath
     && descriptor.lifecycle === "ready"
     && Number.isInteger(descriptor.pid)
@@ -167,7 +167,9 @@ function validRequest(request) {
     && typeof request === "object"
     && !Array.isArray(request)
     && ((request.action === "shutdown" && Object.keys(request).length === 1)
-      || ((request.action === "reload" || request.action === "resume_queue") && validSessionTarget(request)));
+      || ((request.action === "inspect_owned_session"
+        || request.action === "reload"
+        || request.action === "resume_queue") && validSessionTarget(request)));
 }
 
 function selectSession(sessions, request) {
@@ -193,6 +195,29 @@ function busyReason(state) {
 
 function unsupported(reason) {
   return { status: "unsupported", supported: false, reason };
+}
+
+async function inspectOwnedSession(client, request, hello, ownedDescriptor) {
+  if (!validRequest(request)) throw new Error("Requête d’inspection Prime Agent invalide.");
+  if (!Number.isInteger(hello?.protocol?.version) || hello.protocol.version < SUPPORTED_PROTOCOL_VERSION) {
+    return unsupported("daemon_protocol");
+  }
+  if (!ownedDescriptor) {
+    return { status: "inactive", supported: true };
+  }
+
+  const list = await client.request({ type: "list", all: true, includeClientOwned: true }, 5_000);
+  if (!list.success) throw new Error(list.error || "Prime Agent a refusé de lister les sessions.");
+  const sessions = Array.isArray(list.data?.sessions) ? list.data.sessions : [];
+  const session = selectSession(sessions, request);
+  if (!session?.activeSessionId) {
+    return { status: "inactive", supported: true };
+  }
+  return {
+    status: "active",
+    supported: true,
+    activeSessionId: session.activeSessionId,
+  };
 }
 
 function isReloadResponseTimeout(error) {
@@ -372,9 +397,11 @@ async function main() {
   try {
     await client.connect(3_000);
     const hello = await client.waitForHello(3_000);
-    const result = request.action === "resume_queue"
-      ? await resumeQueuedWork(client, request, hello)
-      : await reloadAgentResources(client, request, hello);
+    const result = request.action === "inspect_owned_session"
+      ? await inspectOwnedSession(client, request, hello, ownedDescriptor)
+      : request.action === "resume_queue"
+        ? await resumeQueuedWork(client, request, hello)
+        : await reloadAgentResources(client, request, hello);
     process.stdout.write(JSON.stringify(result));
   } finally {
     client.close();
@@ -390,6 +417,7 @@ module.exports = {
   busyReason,
   createOwnedRequestIdSeed,
   daemonDescriptorKey,
+  inspectOwnedSession,
   isReloadResponseTimeout,
   readOwnedClientDescriptor,
   reloadAgentResources,

@@ -21,15 +21,12 @@ new Function("module", "exports", "require", buildResult.outputFiles[0].text)(
 const {
   activeStatusForSessionActions,
   applyAuthoritativeUserMessageStart,
-  applyQueueMutationSnapshot,
   applyRuntimeCompactingState,
-  beginPromptTransaction,
   compactResponseDisposition,
   compactionEndPresentation,
   commitPlanRuntimeModeTransition,
   canResumePendingPlanFinalization,
   conversationStatusForSessionSnapshot,
-  commitPromptTransaction,
   conversationHasPlanHandoff,
   conversationPlanState,
   planDocumentForReview,
@@ -51,19 +48,16 @@ const {
   isRecoverableRuntimeBootstrapError,
   mapAgentMessages,
   mergeHistoricalAttachmentPreviews,
-  normalizeConnectingPromptDelivery,
+  resolveNativePromptDelivery,
   promptAttachmentPayload,
   reconcileLocalTranscriptAfterRpc,
-  reconcileQueuedMessages,
   reconcileRpcTranscript,
   recordedPlanResponseValue,
-  rollbackPromptTransaction,
   selectForkEntryId,
   shouldApplyHistoryResponse,
   shouldEnterLocalHistoryLoading,
-  shouldClearPromptRunAfterQueueDeletion,
   shouldConsumeConversationResponse,
-  shouldReloadQueuedTranscript,
+  stripLegacyOrbitQueueRows,
   shouldRecoverIdleSessionState,
   shouldApplySessionStateResponse,
   shouldScheduleTerminalStateReconciliation,
@@ -324,10 +318,12 @@ test("an idle bootstrap snapshot cannot erase a prompt admission still in progre
 });
 
 test("a prompt submitted while only connecting starts normally instead of entering follow-up", () => {
-  assert.equal(normalizeConnectingPromptDelivery("starting", "follow_up", false), undefined);
-  assert.equal(normalizeConnectingPromptDelivery("starting", "steer", false), undefined);
-  assert.equal(normalizeConnectingPromptDelivery("starting", "follow_up", true), "follow_up");
-  assert.equal(normalizeConnectingPromptDelivery("streaming", "steer", true), "steer");
+  assert.equal(resolveNativePromptDelivery("starting", "follow_up", false), undefined);
+  assert.equal(resolveNativePromptDelivery("starting", "steer", false), undefined);
+  assert.equal(resolveNativePromptDelivery("starting", "follow_up", true), "follow_up");
+  assert.equal(resolveNativePromptDelivery("streaming", undefined, true), "steer");
+  assert.equal(resolveNativePromptDelivery("tool", undefined, true, true), "follow_up");
+  assert.equal(resolveNativePromptDelivery("tool", "steer", true, true), "follow_up");
 });
 
 const idleSessionSnapshot = (overrides = {}) => ({
@@ -347,7 +343,7 @@ test("uses only a quiescent daemon state snapshot as an idle recovery boundary",
   assert.equal(isAuthoritativeIdleSessionSnapshot(idleSessionSnapshot({ isCompacting: true })), false);
   assert.equal(isAuthoritativeIdleSessionSnapshot(idleSessionSnapshot({
     sessionActions: { queuedCount: 1, steering: [], followUps: ["next"] },
-  })), false);
+  })), true, "a preserved native queue is idle until Prime Agent activates an action");
   assert.equal(isAuthoritativeIdleSessionSnapshot(idleSessionSnapshot({
     sessionActions: {
       queuedCount: 0,
@@ -382,6 +378,13 @@ test("an active daemon session action remains visible and forces queued prompt d
     },
   }), "idle", false), "tool");
   assert.equal(activeStatusForSessionActions(idleSessionSnapshot().sessionActions), undefined);
+  const preservedQueue = idleSessionSnapshot({
+    sessionActions: { queuedCount: 1, steering: ["resume me"], followUps: [] },
+  });
+  assert.equal(sessionActionsHaveWork(preservedQueue.sessionActions), false);
+  assert.equal(activeStatusForSessionActions(preservedQueue.sessionActions), undefined);
+  assert.equal(conversationStatusForSessionSnapshot(preservedQueue, "streaming", false), "idle");
+  assert.equal(resolveNativePromptDelivery("idle", undefined, sessionActionsHaveWork(preservedQueue.sessionActions)), undefined);
 });
 
 test("rejects an idle snapshot requested before a newer prompt or lifecycle epoch", () => {
@@ -440,14 +443,11 @@ test("an authoritative idle snapshot closes orphaned Python tools and their runn
   assert.equal(recovered.activities[0].status, "success");
   assert.equal(recovered.lastError, undefined);
 
-  const next = beginPromptTransaction(recovered, {
-    message: "This must start a normal turn",
-    attachments: [],
-    messageId: "user-after-recovery",
-    createdAt: "2026-08-21T11:29:18.000Z",
-  });
-  assert.equal(next.conversation.status, "streaming");
-  assert.equal(next.conversation.messages.at(-1).queueDelivery, undefined);
+  assert.equal(
+    resolveNativePromptDelivery(recovered.status, undefined, false),
+    undefined,
+    "the next prompt starts a normal native turn after authoritative recovery",
+  );
 });
 
 test("goal prompt responses stay scoped to their mutation, including late failures", () => {
@@ -556,38 +556,17 @@ test("keeps compaction visible when start races the first get_state response", (
   assert.equal(endedBeforeState.state, undefined);
 });
 
-test("clears a phantom prompt run only after the last compact-time queue row is deleted", () => {
-  const queued = {
-    id: "queued-1",
-    role: "user",
-    content: "Continue after compact",
-    createdAt: "2026-08-20T14:23:50.000Z",
-    status: "complete",
-    queueDelivery: "follow_up",
-  };
-  const deleted = { type: "delete" };
-  const emptyActions = { queuedCount: 0, steering: [], followUps: [] };
+test("removes renderer-owned queue artifacts without touching native transcript rows", () => {
+  const cleaned = stripLegacyOrbitQueueRows(conversation({
+    messages: [
+      { id: "legacy-queue", role: "user", content: "Queued", status: "complete", queueDelivery: "steer" },
+      { id: "legacy-pending", role: "user", content: "Pending", status: "pending" },
+      { id: "native-user", role: "user", content: "Native", status: "complete", entryId: "entry-native" },
+      { id: "assistant", role: "assistant", content: "Done", status: "complete" },
+    ],
+  }));
 
-  assert.equal(shouldClearPromptRunAfterQueueDeletion(deleted, [], emptyActions, false), true);
-  assert.equal(
-    shouldClearPromptRunAfterQueueDeletion(deleted, [queued], emptyActions, false),
-    false,
-    "another local queue row still owns the optimistic run marker",
-  );
-  assert.equal(
-    shouldClearPromptRunAfterQueueDeletion(deleted, [], { ...emptyActions, followUps: ["later"] }, false),
-    false,
-    "Prime Agent still has queued work even if the local row disappeared",
-  );
-  assert.equal(
-    shouldClearPromptRunAfterQueueDeletion(deleted, [], emptyActions, true),
-    false,
-    "a real agent_start/agent_end lifecycle must not be cleared by queue editing",
-  );
-  assert.equal(
-    shouldClearPromptRunAfterQueueDeletion({ type: "move", direction: 1 }, [], emptyActions, false),
-    false,
-  );
+  assert.deepEqual(cleaned.messages.map((message) => message.id), ["native-user", "assistant"]);
 });
 
 test("persists a bounded thumbnail without native handles or legacy full image payloads", () => {
@@ -882,6 +861,23 @@ test("restores a durable Prime Agent 0.8 refinement outcome as a typed notice", 
   assert.equal(mapped[0].notice.refinementId, "refine_history");
 });
 
+test("does not invent cancellation for a persisted tool call without a result", () => {
+  const [message] = mapAgentMessages([{
+    id: "assistant-plan-questions",
+    role: "assistant",
+    content: [{
+      type: "toolCall",
+      id: "question-live",
+      name: "prime_orbit_plan_question",
+      arguments: { prompt: "Choose a stack", options: [{ label: "Vite", value: "vite" }] },
+    }],
+    timestamp: 1_787_610_374_546,
+  }]);
+
+  assert.equal(message.tools[0].status, "unresolved");
+  assert.equal(message.tools[0].endedAt, undefined);
+});
+
 test("deduplicates structured and canonical legacy agent messages in restored history", () => {
   const canonical = [
     "[from child:reviewer]",
@@ -933,797 +929,50 @@ function conversation(overrides = {}) {
   };
 }
 
-test("a failed prompt rolls back its exact optimistic message and conversation metadata", () => {
-  const original = conversation();
-  const prepared = beginPromptTransaction(original, {
-    message: "Inspect the project",
-    attachments: [],
-    messageId: "user-local-1",
-    createdAt: "2026-08-19T10:01:00.000Z",
-  });
-
-  assert.equal(prepared.conversation.messages.length, 1);
-  assert.equal(prepared.conversation.messages[0].status, "pending");
-  assert.equal(prepared.conversation.status, "streaming");
-  assert.equal(prepared.conversation.draft, original.draft, "a newer composer draft must never be cleared by the IPC transaction");
-  assert.notEqual(prepared.conversation.title, original.title);
-
-  assert.deepEqual(
-    rollbackPromptTransaction(prepared.conversation, prepared.transaction),
-    original,
-  );
-});
-
-test("a successful prompt confirms only its pending local message", () => {
-  const prepared = beginPromptTransaction(conversation(), {
-    message: "Inspect the project",
-    attachments: [],
-    messageId: "user-local-1",
-    createdAt: "2026-08-19T10:01:00.000Z",
-  });
-  const withConcurrentAssistant = {
-    ...prepared.conversation,
-    messages: [
-      ...prepared.conversation.messages,
-      { id: "assistant-1", role: "assistant", content: "Working", createdAt: "2026-08-19T10:01:01.000Z", status: "streaming" },
-    ],
-  };
-
-  const committed = commitPromptTransaction(withConcurrentAssistant, prepared.transaction);
-  assert.equal(committed.messages[0].status, "complete");
-  assert.equal(committed.messages[1].status, "streaming");
-});
-
-test("rollback removes the ghost without overwriting newer runtime or draft state", () => {
-  const prepared = beginPromptTransaction(conversation(), {
-    message: "Inspect the project",
-    attachments: [],
-    messageId: "user-local-1",
-    createdAt: "2026-08-19T10:01:00.000Z",
-  });
-  const concurrent = {
-    ...prepared.conversation,
-    status: "tool",
-    draft: "a newer draft",
-    title: "Renamed elsewhere",
-    updatedAt: "2026-08-19T10:02:00.000Z",
-  };
-
-  const rolledBack = rollbackPromptTransaction(concurrent, prepared.transaction);
-  assert.equal(rolledBack.messages.length, 0);
-  assert.equal(rolledBack.status, "tool");
-  assert.equal(rolledBack.draft, "a newer draft");
-  assert.equal(rolledBack.title, "Renamed elsewhere");
-  assert.equal(rolledBack.updatedAt, "2026-08-19T10:02:00.000Z");
-});
-
-test("successive follow-ups remain queued while earlier work is still pending", () => {
-  const first = beginPromptTransaction(conversation({ status: "streaming" }), {
-    message: "First follow-up",
-    attachments: [],
-    messageId: "user-follow-up-1",
-    createdAt: "2026-08-19T10:03:00.000Z",
-  });
-  assert.equal(first.conversation.status, "queued");
-  assert.equal(first.conversation.messages[0].queueDelivery, "follow_up");
-
-  const second = beginPromptTransaction(first.conversation, {
-    message: "Second follow-up",
-    attachments: [],
-    messageId: "user-follow-up-2",
-    createdAt: "2026-08-19T10:04:00.000Z",
-  });
-  assert.equal(second.transaction.previous.status, "queued");
-  assert.equal(second.conversation.status, "queued");
-});
-
-test("a message submitted while compaction owns the session is a follow-up, not a concurrent prompt", () => {
-  const prepared = beginPromptTransaction(conversation({ status: "tool" }), {
-    message: "Continue after compaction",
-    attachments: [],
-    messageId: "user-during-compaction",
-    createdAt: "2026-08-19T10:04:15.000Z",
-  });
-
-  assert.equal(prepared.conversation.status, "queued");
-  assert.equal(prepared.conversation.messages[0].queueDelivery, "follow_up");
-  assert.equal(prepared.conversation.messages[0].queueObserved, false);
-});
-
-test("a rapid second submission is queued even before the running status rerenders", () => {
-  const prepared = beginPromptTransaction(conversation({ status: "idle" }), {
-    message: "Rapid follow-up",
-    attachments: [],
-    messageId: "user-rapid-follow-up",
-    createdAt: "2026-08-19T10:04:30.000Z",
-    forceQueued: true,
-  });
-
-  assert.equal(prepared.conversation.status, "queued");
-  assert.equal(prepared.conversation.messages[0].queueDelivery, "follow_up");
-  assert.equal(prepared.conversation.messages[0].queueObserved, false);
-});
-
-test("an explicit steer submission stays in the immediate lane", () => {
-  const prepared = beginPromptTransaction(conversation({ status: "streaming" }), {
-    message: "Use this constraint now",
-    attachments: [],
-    messageId: "user-steer",
-    createdAt: "2026-08-19T10:04:45.000Z",
-    queuedDelivery: "steer",
-  });
-
-  assert.equal(prepared.conversation.messages[0].queueDelivery, "steer");
-  assert.equal(prepared.conversation.messages[0].queueText, "Use this constraint now");
-});
-
-test("an accepted steer consumed before its first snapshot requests terminal history repair", () => {
-  const prepared = beginPromptTransaction(conversation({ status: "streaming" }), {
-    message: "Use this constraint now",
-    queuedPayload: "Use this constraint now",
-    attachments: [],
-    messageId: "steer-consumed-fast",
-    createdAt: "2026-08-19T10:04:50.000Z",
-    queuedDelivery: "steer",
-  });
-  const terminalActions = {
-    queuedCount: 0,
-    steering: [],
-    followUps: [],
-  };
-
-  assert.equal(
-    shouldReloadQueuedTranscript(prepared.conversation, terminalActions),
-    false,
-    "a local row is not durable until Prime Agent accepts the prompt",
-  );
-  const accepted = commitPromptTransaction(prepared.conversation, prepared.transaction);
-  const neverObserved = reconcileQueuedMessages(accepted, terminalActions);
-  assert.equal(neverObserved.messages[0].queueAccepted, true);
-  assert.equal(neverObserved.messages[0].queueObserved, false);
-  assert.equal(
-    shouldReloadQueuedTranscript(neverObserved, terminalActions),
-    true,
-    "RPC acceptance plus an empty terminal snapshot must repair a missed queue-to-active transition",
-  );
-  assert.equal(shouldReloadQueuedTranscript(neverObserved, {
-    ...terminalActions,
-    active: { kind: "turn", phase: "running", label: "Use this constraint now" },
-  }), false, "persisted history is not applied over an active run");
-});
-
-test("queued messages stay separate until Prime Agent emits the authoritative user event", () => {
-  const prepared = beginPromptTransaction(conversation({ status: "streaming" }), {
-    message: "Wait for the current run",
-    queuedPayload: "Wait for the current run",
-    attachments: [],
-    messageId: "queued-1",
-    createdAt: "2026-08-19T10:03:00.000Z",
-  });
-  const accepted = commitPromptTransaction(prepared.conversation, prepared.transaction);
-  assert.equal(accepted.messages[0].queueAccepted, true);
-  const observed = reconcileQueuedMessages(accepted, {
-    queuedCount: 1,
-    steering: [],
-    followUps: ["Wait for the current run"],
-  });
-  assert.equal(observed.messages[0].queueObserved, true);
-  assert.equal(observed.messages[0].queueDelivery, "follow_up");
-
-  const terminalSnapshot = reconcileQueuedMessages(observed, {
-    queuedCount: 0,
-    steering: [],
-    followUps: [],
-  });
-  assert.equal(terminalSnapshot.messages[0].queueDelivery, "follow_up");
-  assert.equal(terminalSnapshot.messages[0].queueObserved, true);
-
-  const activeSnapshot = reconcileQueuedMessages(terminalSnapshot, {
-    queuedCount: 0,
-    steering: [],
-    followUps: [],
-    active: {
-      kind: "turn",
-      phase: "preparing",
-      label: "Wait for the current run",
-    },
-  });
-  assert.equal(activeSnapshot.messages[0].queueDelivery, "follow_up");
-  assert.equal(activeSnapshot.messages[0].queueObserved, true);
-
-  const delivered = applyAuthoritativeUserMessageStart(
-    activeSnapshot,
-    "Wait for the current run",
-    "2026-08-19T10:03:01.000Z",
-  );
-  assert.equal(delivered.messages[0].queueDelivery, undefined);
-  assert.equal(delivered.messages[0].queueObserved, undefined);
-  assert.equal(delivered.messages[0].queueAccepted, undefined);
-  const confirmedByUserEvent = applyAuthoritativeUserMessageStart(
-    delivered,
-    "Wait for the current run",
-    "2026-08-19T10:03:01.000Z",
-  );
-  assert.equal(confirmedByUserEvent.messages.length, 1, "the authoritative event does not duplicate an already promoted row");
-});
-
-test("a running Prime Agent action promotes a missed queued user event and repairs it later from history", () => {
-  const prepared = beginPromptTransaction(conversation({ status: "streaming" }), {
-    message: "Delivered while Orbit was disconnected",
-    queuedPayload: "Delivered while Orbit was disconnected",
-    attachments: [],
-    messageId: "missed-user-event",
-    createdAt: "2026-08-19T10:03:00.000Z",
-    queuedDelivery: "steer",
-  });
-  const accepted = commitPromptTransaction(prepared.conversation, prepared.transaction);
-  const running = reconcileQueuedMessages(accepted, {
-    queuedCount: 0,
-    steering: [],
-    followUps: [],
-    active: { kind: "turn", phase: "running", label: "Delivered while Orbit was disconnected" },
-  });
-
-  assert.equal(running.messages[0].queueDelivery, undefined);
-  assert.equal(running.messages[0].queueHistoryPending, true);
-  assert.equal(shouldReloadQueuedTranscript(running, {
-    queuedCount: 0,
-    steering: [],
-    followUps: [],
-    active: { kind: "turn", phase: "running", label: "Delivered while Orbit was disconnected" },
-  }), false, "history replacement waits for a terminal boundary");
-  assert.equal(shouldReloadQueuedTranscript(running, {
-    queuedCount: 0,
-    steering: [],
-    followUps: [],
-  }), true, "the terminal boundary requests canonical history");
-
-  const userEvent = applyAuthoritativeUserMessageStart(
-    running,
-    "Delivered while Orbit was disconnected",
-    "2026-08-19T10:03:01.000Z",
-    [],
-    "entry-delivered",
-  );
-  assert.equal(userEvent.messages.length, 1);
-  assert.equal(userEvent.messages[0].entryId, "entry-delivered");
-  assert.equal(userEvent.messages[0].queueHistoryPending, undefined);
-});
-
-test("running action reconciliation preserves intentional same-text steer and follow-up rows", () => {
-  const followUp = beginPromptTransaction(conversation({ status: "streaming" }), {
-    message: "same instruction",
-    queuedPayload: "same instruction",
-    attachments: [],
-    messageId: "same-follow-up-active",
-    createdAt: "2026-08-19T10:03:00.000Z",
-    queuedDelivery: "follow_up",
-  });
-  const steer = beginPromptTransaction(commitPromptTransaction(followUp.conversation, followUp.transaction), {
-    message: "same instruction",
-    queuedPayload: "same instruction",
-    attachments: [],
-    messageId: "same-steer-active",
-    createdAt: "2026-08-19T10:03:01.000Z",
-    queuedDelivery: "steer",
-  });
-  const running = reconcileQueuedMessages(commitPromptTransaction(steer.conversation, steer.transaction), {
-    queuedCount: 1,
-    steering: [],
-    followUps: ["same instruction"],
-    active: { kind: "turn", phase: "running", label: "same instruction" },
-  });
-
-  assert.equal(running.messages.find((message) => message.id === "same-steer-active").queueDelivery, undefined);
-  assert.equal(running.messages.find((message) => message.id === "same-steer-active").queueHistoryPending, true);
-  assert.equal(running.messages.find((message) => message.id === "same-follow-up-active").queueDelivery, "follow_up");
-});
-
-test("authoritative attachments select the matching duplicate queue row", () => {
-  const followUpAttachment = {
-    id: "orbit-attachment:9b8ad0e7-8796-4a7b-9d47-82fd342d9ae8:0",
-    name: "follow-up.pdf",
-    mimeType: "application/pdf",
-    size: 101,
-    isImage: false,
-    attachmentHandle: "follow-up-capability",
-  };
-  const steerAttachment = {
-    id: "orbit-attachment:7dc622c6-e8be-4104-8f78-528d28f5ec04:0",
-    name: "steer.pdf",
-    mimeType: "application/pdf",
-    size: 202,
-    isImage: false,
-    attachmentHandle: "steer-capability",
-  };
-  const followUp = beginPromptTransaction(conversation({ status: "streaming" }), {
-    message: "same constraint",
-    queuedPayload: "same constraint",
-    attachments: [followUpAttachment],
-    messageId: "duplicate-follow-up",
-    createdAt: "2026-08-19T10:05:00.000Z",
-    queuedDelivery: "follow_up",
-  });
-  const steer = beginPromptTransaction(
-    commitPromptTransaction(followUp.conversation, followUp.transaction),
-    {
-      message: "same constraint",
-      queuedPayload: "same constraint",
-      attachments: [steerAttachment],
-      messageId: "duplicate-steer",
-      createdAt: "2026-08-19T10:06:00.000Z",
-      queuedDelivery: "steer",
-    },
-  );
-  const accepted = commitPromptTransaction(steer.conversation, steer.transaction);
-  const delivered = applyAuthoritativeUserMessageStart(
-    accepted,
-    "same constraint",
-    "2026-08-19T10:07:00.000Z",
-    [durableAttachmentMetadata(steerAttachment)],
-    "entry-steer",
-  );
-
-  assert.equal(delivered.messages.find((message) => message.id === "duplicate-follow-up").queueDelivery, "follow_up");
-  const deliveredSteer = delivered.messages.find((message) => message.id === "duplicate-steer");
-  assert.equal(deliveredSteer.queueDelivery, undefined);
-  assert.equal(deliveredSteer.entryId, "entry-steer");
-  assert.equal(deliveredSteer.attachments[0].name, "steer.pdf");
-  assert.equal("attachmentHandle" in deliveredSteer.attachments[0], false);
-});
-
-test("authoritative attachments never consume a different same-text local row", () => {
-  const localAttachment = {
-    id: "orbit-attachment:9b8ad0e7-8796-4a7b-9d47-82fd342d9ae8:0",
-    name: "local.pdf",
-    mimeType: "application/pdf",
-    size: 101,
-    isImage: false,
-    attachmentHandle: "local-capability",
-  };
-  const otherWindowAttachment = {
-    id: "orbit-attachment:7dc622c6-e8be-4104-8f78-528d28f5ec04:0",
-    name: "other-window.pdf",
-    mimeType: "application/pdf",
-    size: 202,
-    isImage: false,
-  };
-  const local = beginPromptTransaction(conversation({ status: "streaming" }), {
-    message: "same cross-window text",
-    queuedPayload: "same cross-window text",
-    attachments: [localAttachment],
-    messageId: "local-queued-row",
-    createdAt: "2026-08-19T10:05:00.000Z",
-    queuedDelivery: "steer",
-  });
-  const delivered = applyAuthoritativeUserMessageStart(
-    commitPromptTransaction(local.conversation, local.transaction),
-    "same cross-window text",
-    "2026-08-19T10:06:00.000Z",
-    [otherWindowAttachment],
-    "entry-other-window",
-  );
-
-  assert.equal(delivered.messages.find((message) => message.id === "local-queued-row").queueDelivery, "steer");
-  const authoritative = delivered.messages.find((message) => message.id === "entry-other-window");
-  assert.equal(authoritative.queueDelivery, undefined);
-  assert.equal(authoritative.attachments[0].name, "other-window.pdf");
-});
-
-test("a text-only event never consumes a same-text queued attachment", () => {
-  const attachment = {
-    id: "orbit-attachment:9b8ad0e7-8796-4a7b-9d47-82fd342d9ae8:0",
-    name: "queued.pdf",
-    mimeType: "application/pdf",
-    size: 101,
-    isImage: false,
-    attachmentHandle: "queued-capability",
-  };
-  const queued = beginPromptTransaction(conversation({ status: "streaming" }), {
-    message: "same text-only content",
-    queuedPayload: "same text-only content",
-    attachments: [attachment],
-    messageId: "queued-with-attachment",
-    createdAt: "2026-08-19T10:05:00.000Z",
-    queuedDelivery: "steer",
-  });
-  const delivered = applyAuthoritativeUserMessageStart(
-    commitPromptTransaction(queued.conversation, queued.transaction),
-    "same text-only content",
-    "2026-08-19T10:06:00.000Z",
-    [],
-    "entry-text-only",
-  );
-
-  assert.equal(delivered.messages.find((message) => message.id === "queued-with-attachment").queueDelivery, "steer");
-  assert.equal(delivered.messages.find((message) => message.id === "entry-text-only").attachments, undefined);
-});
-
-test("non-queued fallbacks never merge a same-text event with different attachments", () => {
-  const localAttachment = {
-    id: "orbit-attachment:9b8ad0e7-8796-4a7b-9d47-82fd342d9ae8:0",
-    name: "a.pdf",
-    mimeType: "application/pdf",
-    size: 101,
-    isImage: false,
-  };
-  const authoritativeAttachment = {
-    id: "orbit-attachment:7dc622c6-e8be-4104-8f78-528d28f5ec04:0",
-    name: "b.pdf",
-    mimeType: "application/pdf",
-    size: 202,
-    isImage: false,
-  };
-  const localMessage = {
-    id: "local-non-queued",
-    role: "user",
-    content: "same prompt",
-    createdAt: "2026-08-19T10:05:00.000Z",
-    status: "complete",
-    attachments: [localAttachment],
-  };
-  const delivered = applyAuthoritativeUserMessageStart(
-    conversation({ messages: [localMessage] }),
-    "same prompt",
-    "2026-08-19T10:06:00.000Z",
-    [authoritativeAttachment],
-    "entry-other-window",
-  );
-
-  assert.deepEqual(delivered.messages.map((message) => message.id), ["local-non-queued", "entry-other-window"]);
-  assert.equal(delivered.messages[0].attachments[0].name, "a.pdf");
-  assert.equal(delivered.messages[1].attachments[0].name, "b.pdf");
-
-  const pending = applyAuthoritativeUserMessageStart(
-    conversation({ messages: [{ ...localMessage, status: "pending" }] }),
-    "same prompt",
-    "2026-08-19T10:06:00.000Z",
-    [authoritativeAttachment],
-    "entry-other-window-pending",
-  );
-  assert.deepEqual(pending.messages.map((message) => message.id), ["local-non-queued", "entry-other-window-pending"]);
-  assert.equal(pending.messages[0].status, "pending");
-});
-
-test("ambiguous identical non-queued echoes append instead of stealing another window's row", () => {
-  const localRows = ["window-a", "window-b"].map((id, index) => ({
-    id,
-    role: "user",
-    content: "identical cross-window prompt",
-    createdAt: `2026-08-19T10:0${index + 5}:00.000Z`,
-    status: "pending",
-  }));
-  const delivered = applyAuthoritativeUserMessageStart(
-    conversation({ messages: localRows }),
-    "identical cross-window prompt",
-    "2026-08-19T10:07:00.000Z",
-    [],
-    "entry-authoritative",
-  );
-
-  assert.deepEqual(delivered.messages.map((message) => message.id), [
-    "window-a",
-    "window-b",
-    "entry-authoritative",
-  ]);
-  assert.deepEqual(delivered.messages.slice(0, 2).map((message) => message.status), ["pending", "pending"]);
-
-  const persistedCollision = applyAuthoritativeUserMessageStart(
-    conversation({ messages: [{ ...localRows[0], status: "complete", entryId: "entry-window-a" }] }),
-    "identical cross-window prompt",
-    "2026-08-19T10:08:00.000Z",
-    [],
-    "entry-window-b",
-  );
-  assert.deepEqual(persistedCollision.messages.map((message) => message.entryId), [
-    "entry-window-a",
-    "entry-window-b",
-  ]);
-});
-
-test("steer priority resolves one duplicate across lanes without swapping the follow-up", () => {
-  const followUp = beginPromptTransaction(conversation({ status: "streaming" }), {
-    message: "same text",
-    queuedPayload: "same text",
-    attachments: [],
-    messageId: "same-follow-up",
-    createdAt: "2026-08-19T10:05:00.000Z",
-    queuedDelivery: "follow_up",
-  });
-  const steer = beginPromptTransaction(
-    commitPromptTransaction(followUp.conversation, followUp.transaction),
-    {
-      message: "same text",
-      queuedPayload: "same text",
-      attachments: [],
-      messageId: "same-steer",
-      createdAt: "2026-08-19T10:06:00.000Z",
-      queuedDelivery: "steer",
-    },
-  );
-  const delivered = applyAuthoritativeUserMessageStart(
-    commitPromptTransaction(steer.conversation, steer.transaction),
+test("authoritative user events remain distinct by Prime Agent identity", () => {
+  const first = applyAuthoritativeUserMessageStart(
+    conversation(),
     "same text",
-    "2026-08-19T10:07:00.000Z",
+    "2026-08-19T10:01:00.000Z",
     [],
-    "entry-steer-no-attachment",
+    "entry-first",
   );
-
-  assert.equal(delivered.messages.find((message) => message.id === "same-follow-up").queueDelivery, "follow_up");
-  assert.equal(delivered.messages.find((message) => message.id === "same-steer").queueDelivery, undefined);
-});
-
-test("ambiguous duplicates in one lane wait for persisted history", () => {
-  const first = beginPromptTransaction(conversation({ status: "streaming" }), {
-    message: "identical steer",
-    queuedPayload: "identical steer",
-    attachments: [],
-    messageId: "ambiguous-first",
-    createdAt: "2026-08-19T10:05:00.000Z",
-    queuedDelivery: "steer",
-  });
-  const second = beginPromptTransaction(
-    commitPromptTransaction(first.conversation, first.transaction),
-    {
-      message: "identical steer",
-      queuedPayload: "identical steer",
-      attachments: [],
-      messageId: "ambiguous-second",
-      createdAt: "2026-08-19T10:06:00.000Z",
-      queuedDelivery: "steer",
-    },
-  );
-  const delivered = applyAuthoritativeUserMessageStart(
-    commitPromptTransaction(second.conversation, second.transaction),
-    "identical steer",
-    "2026-08-19T10:07:00.000Z",
+  const second = applyAuthoritativeUserMessageStart(
+    first,
+    "same text",
+    "2026-08-19T10:02:00.000Z",
     [],
-    "entry-ambiguous",
+    "entry-second",
+  );
+  const duplicate = applyAuthoritativeUserMessageStart(
+    second,
+    "same text",
+    "2026-08-19T10:02:00.000Z",
+    [],
+    "entry-second",
   );
 
-  assert.deepEqual(
-    delivered.messages.filter((message) => message.queueDelivery).map((message) => message.id),
-    ["ambiguous-first", "ambiguous-second"],
-  );
-  assert.deepEqual(
-    delivered.messages.filter((message) => !message.queueDelivery).map((message) => message.id),
-    ["entry-ambiguous"],
-  );
-  assert.equal(shouldReloadQueuedTranscript(delivered, {
-    queuedCount: 0,
-    steering: [],
-    followUps: [],
-  }), true);
+  assert.deepEqual(second.messages.map((message) => message.entryId), ["entry-first", "entry-second"]);
+  assert.equal(duplicate.messages.length, 2);
 });
 
-test("a late running snapshot exposes the durable user turn without moving its transcript anchor", () => {
-  const initial = conversation({
-    status: "streaming",
-    messages: [{
-      id: "assistant-previous",
-      role: "assistant",
-      content: "Previous answer",
-      createdAt: "2026-08-19T10:02:00.000Z",
-      status: "complete",
-    }],
-  });
-  const prepared = beginPromptTransaction(initial, {
-    message: "ca va ?",
-    queuedPayload: "ca va ?",
-    attachments: [],
-    messageId: "queued-late-snapshot",
-    createdAt: "2026-08-19T10:03:00.000Z",
-  });
-  const accepted = commitPromptTransaction(prepared.conversation, prepared.transaction);
-  const observed = reconcileQueuedMessages(accepted, {
-    queuedCount: 1,
-    steering: [],
-    followUps: ["ca va ?"],
-  });
-  const withReply = {
-    ...observed,
-    messages: [...observed.messages, {
-      id: "assistant-current",
-      role: "assistant",
-      content: "Ca va très bien.",
-      createdAt: "2026-08-19T10:03:01.000Z",
-      status: "complete",
-    }],
-  };
+test("RPC history removes legacy local queue rows instead of reconciling them", () => {
+  const current = [
+    { id: "legacy", role: "user", content: "queued", status: "complete", queueDelivery: "follow_up" },
+  ];
+  const rpc = [
+    { id: "entry-native", entryId: "entry-native", role: "user", content: "queued", status: "complete" },
+  ];
 
-  const lateActiveSnapshot = reconcileQueuedMessages(withReply, {
-    queuedCount: 0,
-    steering: [],
-    followUps: [],
-    active: {
-      kind: "turn",
-      phase: "running",
-      label: "ca va ?",
-    },
-  });
-  assert.deepEqual(lateActiveSnapshot.messages.map((message) => message.id), [
-    "assistant-previous",
-    "queued-late-snapshot",
-    "assistant-current",
-  ]);
-  assert.equal(lateActiveSnapshot.messages[1].queueDelivery, undefined);
-  assert.equal(lateActiveSnapshot.messages[1].queueHistoryPending, true);
-  assert.deepEqual(
-    lateActiveSnapshot.messages.filter((message) => !message.queueDelivery).map((message) => message.id),
-    ["assistant-previous", "queued-late-snapshot", "assistant-current"],
-    "Prime Agent's running phase makes the durable user turn visible at its original anchor",
-  );
-
-  const reconciled = reconcileQueuedMessages(lateActiveSnapshot, {
-    queuedCount: 0,
-    steering: [],
-    followUps: [],
-  });
-
-  assert.deepEqual(reconciled.messages.map((message) => message.id), [
-    "assistant-previous",
-    "queued-late-snapshot",
-    "assistant-current",
-  ]);
-  assert.equal(reconciled.messages[1].queueDelivery, undefined);
-  assert.equal(reconciled.messages[1].queueHistoryPending, true);
-  assert.equal(shouldReloadQueuedTranscript(reconciled, {
-    queuedCount: 0,
-    steering: [],
-    followUps: [],
-  }), true, "the persisted session must resolve the missing delivery boundary");
-  assert.equal(shouldReloadQueuedTranscript(reconciled, {
-    queuedCount: 0,
-    steering: [],
-    followUps: [],
-  }, true), false, "a queue repair must never rehydrate a pre-compaction transcript");
-  assert.equal(shouldReloadQueuedTranscript(reconciled, {
-    queuedCount: 1,
-    steering: [],
-    followUps: ["ca va ?"],
-  }), false, "an item that is still queued must not be removed by a history refresh");
+  assert.deepEqual(reconcileRpcTranscript(current, rpc), rpc);
+  assert.deepEqual(reconcileRpcTranscript(current, []), []);
 });
 
-test("a terminal queue history response cannot overwrite a newer prompt or run", () => {
-  assert.equal(shouldApplyHistoryResponse(undefined, 4, true), true, "normal bootstrap history is not queue-guarded");
-  assert.equal(shouldApplyHistoryResponse(4, 4, false), true, "an unchanged idle transcript accepts its repair");
-  assert.equal(shouldApplyHistoryResponse(4, 5, false), false, "a newer prompt invalidates the old snapshot");
-  assert.equal(shouldApplyHistoryResponse(4, 4, true), false, "a newly active run invalidates the old snapshot");
+test("a terminal history response cannot overwrite a newer prompt or run", () => {
+  assert.equal(shouldApplyHistoryResponse(4, 4, false), true);
+  assert.equal(shouldApplyHistoryResponse(4, 5, false), false);
+  assert.equal(shouldApplyHistoryResponse(4, 4, true), false);
 });
-
-test("an accepted follow-up waits for Prime Agent's user event when the first queue snapshot lags", () => {
-  const prepared = beginPromptTransaction(conversation({ status: "streaming" }), {
-    message: "Fast follow-up",
-    queuedPayload: "Fast follow-up",
-    attachments: [],
-    messageId: "queued-fast",
-    createdAt: "2026-08-19T10:03:00.000Z",
-  });
-  const accepted = commitPromptTransaction(prepared.conversation, prepared.transaction);
-  const laggingSnapshot = reconcileQueuedMessages(accepted, {
-    queuedCount: 0,
-    steering: [],
-    followUps: [],
-  });
-  assert.equal(laggingSnapshot.messages[0].queueDelivery, "follow_up");
-
-  const delivered = applyAuthoritativeUserMessageStart(
-    laggingSnapshot,
-    "Fast follow-up",
-    "2026-08-19T10:03:01.000Z",
-  );
-  assert.equal(delivered.messages[0].queueDelivery, undefined);
-  assert.equal(delivered.messages[0].queueAccepted, undefined);
-});
-
-test("queued follow-ups move beside their own assistant turn instead of grouping above all replies", () => {
-  const initial = conversation({
-    status: "streaming",
-    messages: [{
-      id: "assistant-initial",
-      role: "assistant",
-      content: "Initial answer",
-      createdAt: "2026-08-19T10:02:00.000Z",
-      status: "complete",
-    }],
-  });
-  const first = beginPromptTransaction(initial, {
-    message: "First queued turn",
-    queuedPayload: "First queued turn",
-    attachments: [],
-    messageId: "queued-first",
-    createdAt: "2026-08-19T10:03:00.000Z",
-  });
-  const firstAccepted = commitPromptTransaction(first.conversation, first.transaction);
-  const second = beginPromptTransaction(firstAccepted, {
-    message: "Second queued turn",
-    queuedPayload: "Second queued turn",
-    attachments: [],
-    messageId: "queued-second",
-    createdAt: "2026-08-19T10:04:00.000Z",
-  });
-  const bothAccepted = commitPromptTransaction(second.conversation, second.transaction);
-
-  const firstDelivered = applyAuthoritativeUserMessageStart(
-    bothAccepted,
-    "First queued turn",
-    "2026-08-19T10:05:00.000Z",
-  );
-  const afterFirstReply = {
-    ...firstDelivered,
-    messages: [...firstDelivered.messages, {
-      id: "assistant-first",
-      role: "assistant",
-      content: "First queued answer",
-      createdAt: "2026-08-19T10:05:01.000Z",
-      status: "complete",
-    }],
-  };
-  const secondDelivered = applyAuthoritativeUserMessageStart(
-    afterFirstReply,
-    "Second queued turn",
-    "2026-08-19T10:06:00.000Z",
-  );
-  const final = {
-    ...secondDelivered,
-    messages: [...secondDelivered.messages, {
-      id: "assistant-second",
-      role: "assistant",
-      content: "Second queued answer",
-      createdAt: "2026-08-19T10:06:01.000Z",
-      status: "complete",
-    }],
-  };
-
-  assert.deepEqual(final.messages.map((message) => [message.role, message.content]), [
-    ["assistant", "Initial answer"],
-    ["user", "First queued turn"],
-    ["assistant", "First queued answer"],
-    ["user", "Second queued turn"],
-    ["assistant", "Second queued answer"],
-  ]);
-});
-
-test("queue mutations preserve duplicate indexes and update the authoritative snapshot", () => {
-  const attachment = {
-    id: "orbit-attachment:9b8ad0e7-8796-4a7b-9d47-82fd342d9ae8:0",
-    name: "queued.txt",
-    mimeType: "text/plain",
-    size: 12,
-    isImage: false,
-  };
-  const actions = {
-    queuedCount: 3,
-    steering: ["same"],
-    followUps: ["same", "later"],
-    queueAttachments: {
-      steering: [[]],
-      followUps: [[attachment], []],
-    },
-  };
-  const edited = applyQueueMutationSnapshot(actions, "followUp", 0, "same", {
-    type: "replace",
-    text: "edited",
-    lane: "followUp",
-  });
-  assert.deepEqual(edited.followUps, ["edited", "later"]);
-  assert.deepEqual(edited.steering, ["same"]);
-  assert.deepEqual(edited.queueAttachments.followUps, [[attachment], []]);
-
-  const deleted = applyQueueMutationSnapshot(edited, "steering", 0, "same", { type: "delete" });
-  assert.deepEqual(deleted.steering, []);
-  assert.equal(deleted.queuedCount, 2);
-
-  const movedLane = applyQueueMutationSnapshot(deleted, "followUp", 0, "edited", {
-    type: "replace",
-    text: "steered edit",
-    lane: "steering",
-  });
-  assert.deepEqual(movedLane.steering, ["steered edit"]);
-  assert.deepEqual(movedLane.queueAttachments.steering, [[attachment]]);
-  assert.deepEqual(movedLane.queueAttachments.followUps, [[]]);
-});
-
 test("extension requests with the same id remain distinct across conversations and duplicate events update in place", () => {
   const first = {
     id: "request-1",
@@ -1774,28 +1023,4 @@ test("falls back to the same user-message ordinal when display text was normaliz
     selectForkEntryId(messages, "assistant-1", [{ entryId: "entry-1", text: "[attachment] Local attachment prompt" }]),
     "entry-1",
   );
-});
-
-test("a truncated compactRlmText active label still promotes a long delivered queued prompt", () => {
-  const longText = "L".repeat(300);
-  const prepared = beginPromptTransaction(conversation({ status: "streaming" }), {
-    message: longText,
-    queuedPayload: longText,
-    attachments: [],
-    messageId: "long-queued",
-    createdAt: "2026-08-19T10:04:00.000Z",
-    queuedDelivery: "follow_up",
-  });
-  const accepted = commitPromptTransaction(prepared.conversation, prepared.transaction);
-  // Prime Agent compacts active.label through compactRlmText: 157 chars + "...".
-  const compacted = `${longText.slice(0, 157)}...`;
-  const running = reconcileQueuedMessages(accepted, {
-    queuedCount: 0,
-    steering: [],
-    followUps: [],
-    active: { kind: "turn", phase: "running", label: compacted },
-  });
-
-  assert.equal(running.messages[0].queueDelivery, undefined, "the delivered row must leave the queue tray");
-  assert.equal(running.messages[0].queueHistoryPending, true);
 });

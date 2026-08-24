@@ -134,6 +134,11 @@ export type ReloadAgentResourcesResult =
   | { status: "pending"; supported: true; reason: "timeout" }
   | { status: "unsupported"; supported: false; reason: "runtime_kind" | "daemon_protocol" | "daemon_command" };
 
+export type ResumeAgentQueueResult =
+  | { status: "resumed"; supported: true }
+  | { status: "unavailable"; supported: true; reason: "inactive_session" }
+  | { status: "unsupported"; supported: false; reason: "runtime_kind" | "daemon_protocol" | "daemon_command" };
+
 export interface AgentResourcesReloadedEvent {
   conversationId: string;
 }
@@ -358,6 +363,12 @@ export async function restartAgent(
 export async function reloadAgentResources(conversationId: string): Promise<ReloadAgentResourcesResult> {
   if (!isNative()) return { status: "unsupported", supported: false, reason: "runtime_kind" };
   return invoke<ReloadAgentResourcesResult>("reload_agent_resources", { conversationId });
+}
+
+/** Re-arms Prime Agent's own queued-input scheduler after an explicit abort. */
+export async function resumeAgentQueue(conversationId: string): Promise<ResumeAgentQueueResult> {
+  if (!isNative()) return { status: "unsupported", supported: false, reason: "runtime_kind" };
+  return invoke<ResumeAgentQueueResult>("resume_agent_queue", { conversationId });
 }
 
 export async function listenToAgentRestarts(

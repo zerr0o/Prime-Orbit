@@ -40,7 +40,6 @@ import {
   MoreHorizontal,
   Paperclip,
   Pause,
-  Pencil,
   PanelRightClose,
   PanelRightOpen,
   Play,
@@ -148,11 +147,11 @@ interface ConversationViewProps {
   planRequest?: PendingExtensionUiRequest;
   onPlanMode: (mode: "normal" | "plan") => Promise<void>;
   onRetryPlanFinalization: (conversationId: string) => Promise<void>;
+  onRecoverPlanQuestions: () => Promise<void>;
   onAnswerPlanRequest: (request: PendingExtensionUiRequest, response: Record<string, unknown>) => Promise<void>;
   onToggleInspector: () => void;
   onDraftChange: (draft: string) => void;
   onSend: (message: string, attachments: Attachment[], delivery?: "steer" | "follow_up") => Promise<void>;
-  onMutateQueuedMessage: (input: { messageId: string; lane: "steering" | "followUp"; index: number; expectedText: string; mutation: { type: "delete" } | { type: "replace"; text: string; lane: "steering" | "followUp" } }) => Promise<void>;
   onRetryMessage: (assistantMessageId: string) => Promise<void>;
   onAbort: () => Promise<void>;
   onModel: (model: ModelInfo) => Promise<void>;
@@ -368,7 +367,7 @@ export function continueComposerMarkdownList(
 }
 
 export function ConversationView(props: ConversationViewProps) {
-  const { project, conversation, models, favoriteModels, commands, stats, sessionState, goalMutation, isCompacting: runtimeCompacting = false, isRefining = false, refinements, harnessEntries, schedules = [], heartbeat, heartbeats = [], subagents = [], observedSubagent, inspectorOpen, changes, resourceReloadSupported, planRequest, onPlanMode, onRetryPlanFinalization, onAnswerPlanRequest, onToggleInspector, onDraftChange, onSend, onMutateQueuedMessage, onRetryMessage, onAbort, onModel, onToggleFavoriteModel, onThinking, onRunCommand, onObserveSubagent, onForkMessage, onCloneSession, onNewWindow, onOpenTerminal } = props;
+  const { project, conversation, models, favoriteModels, commands, stats, sessionState, goalMutation, isCompacting: runtimeCompacting = false, isRefining = false, refinements, harnessEntries, schedules = [], heartbeat, heartbeats = [], subagents = [], observedSubagent, inspectorOpen, changes, resourceReloadSupported, planRequest, onPlanMode, onRetryPlanFinalization, onRecoverPlanQuestions, onAnswerPlanRequest, onToggleInspector, onDraftChange, onSend, onRetryMessage, onAbort, onModel, onToggleFavoriteModel, onThinking, onRunCommand, onObserveSubagent, onForkMessage, onCloneSession, onNewWindow, onOpenTerminal } = props;
   const { language } = useI18n();
   const isCompacting = runtimeCompacting || Boolean(sessionState?.isCompacting);
   const isRunning = !isCompacting && isConversationTurnActive(conversation.status);
@@ -381,6 +380,14 @@ export function ConversationView(props: ConversationViewProps) {
   const [restartDialogOpen, setRestartDialogOpen] = useState(false);
   const [restartBusy, setRestartBusy] = useState(false);
   const [restartError, setRestartError] = useState<string>();
+  const [missingPlanDialogVisible, setMissingPlanDialogVisible] = useState(false);
+  const [planRecoveryBusy, setPlanRecoveryBusy] = useState(false);
+  const [planRecoveryError, setPlanRecoveryError] = useState<string>();
+  const unresolvedPlanQuestions = unresolvedPlanQuestionCount(conversation);
+  const expectsPlanDialog = !planRequest
+    && isRunning
+    && unresolvedPlanQuestions > 0
+    && (conversationPlan.phase === "planning" || conversationPlan.phase === "question");
   // Draft persistence updates the parent conversation object while the user is
   // typing. Stable event bridges let the transcript ignore those updates
   // without retaining callbacks that captured an older conversation.
@@ -398,7 +405,32 @@ export function ConversationView(props: ConversationViewProps) {
     setRestartDialogOpen(false);
     setRestartBusy(false);
     setRestartError(undefined);
+    setMissingPlanDialogVisible(false);
+    setPlanRecoveryBusy(false);
+    setPlanRecoveryError(undefined);
   }, [conversation.id]);
+  useEffect(() => {
+    if (!expectsPlanDialog) {
+      setMissingPlanDialogVisible(false);
+      setPlanRecoveryError(undefined);
+      return;
+    }
+    const timeout = window.setTimeout(() => setMissingPlanDialogVisible(true), 1_200);
+    return () => window.clearTimeout(timeout);
+  }, [expectsPlanDialog, unresolvedPlanQuestions]);
+
+  const recoverMissingPlanDialogs = useCallback(async () => {
+    if (planRecoveryBusy) return;
+    setPlanRecoveryBusy(true);
+    setPlanRecoveryError(undefined);
+    try {
+      await onRecoverPlanQuestions();
+      setPlanRecoveryBusy(false);
+    } catch (error) {
+      setPlanRecoveryError(error instanceof Error ? error.message : String(error));
+      setPlanRecoveryBusy(false);
+    }
+  }, [onRecoverPlanQuestions, planRecoveryBusy]);
 
   const confirmEmergencyRestart = useCallback(async () => {
     if (restartBusy) return;
@@ -453,6 +485,26 @@ export function ConversationView(props: ConversationViewProps) {
             project={project}
             onAnswer={onAnswerPlanRequest}
           />
+        ) : missingPlanDialogVisible ? (
+          <section className="plan-interaction plan-dialog-recovery" role="alert" aria-busy={planRecoveryBusy}>
+            <header className="plan-interaction-header">
+              <span className="plan-interaction-icon" aria-hidden="true"><RefreshCw size={18} /></span>
+              <div>
+                <strong>{bi(language, "Questions Plan à reconnecter", "Plan questions need reconnection")}</strong>
+                <p>{bi(
+                  language,
+                  `${unresolvedPlanQuestions} question${unresolvedPlanQuestions > 1 ? "s sont" : " est"} encore bloquée${unresolvedPlanQuestions > 1 ? "s" : ""} dans Prime Agent, mais leur formulaire n’a pas survécu à l’ancienne connexion.`,
+                  `${unresolvedPlanQuestions} question${unresolvedPlanQuestions === 1 ? " is" : "s are"} still blocked in Prime Agent, but the form did not survive the previous connection.`,
+                )}</p>
+              </div>
+              <Badge tone="warning">{bi(language, "Récupération", "Recovery")}</Badge>
+            </header>
+            <footer className="plan-question-footer">
+              <small>{bi(language, "Prime Orbit annule uniquement les appels orphelins puis laisse Prime Agent reprendre son instruction native.", "Prime Orbit cancels only the orphaned calls, then lets Prime Agent resume its native instruction.")}</small>
+              <Button variant="primary" loading={planRecoveryBusy} onClick={() => void recoverMissingPlanDialogs()}><RefreshCw size={14} />{bi(language, "Relancer les questions", "Ask the questions again")}</Button>
+            </footer>
+            {planRecoveryError ? <p className="plan-interaction-error" role="alert"><CircleAlert size={14} />{planRecoveryError}</p> : null}
+          </section>
         ) : planFinalizing ? (
           <div className={`plan-finalizing ${conversation.status === "error" ? "is-error" : ""}`} role={conversation.status === "error" ? "alert" : "status"}>
             {conversation.status === "error" ? <CircleAlert size={16} /> : <LoaderCircle size={16} className="spin" />}
@@ -475,7 +527,6 @@ export function ConversationView(props: ConversationViewProps) {
           isRefining={isRefining}
           onDraftChange={onDraftChange}
           onSend={onSend}
-          onMutateQueuedMessage={onMutateQueuedMessage}
           onAbort={onAbort}
           onModel={onModel}
           onToggleFavoriteModel={onToggleFavoriteModel}
@@ -593,8 +644,6 @@ function SessionActionsPopover({ sessionState, resourceReloadSupported, onChoose
   const { language } = useI18n();
   const [busyAction, setBusyAction] = useState<string>();
   const [actionError, setActionError] = useState<string>();
-  const steeringMode = sessionState?.steeringMode ?? "one-at-a-time";
-  const followUpMode = sessionState?.followUpMode ?? "one-at-a-time";
   const runAction = async (type: string, fields?: Record<string, unknown>, keepOpen?: boolean) => {
     if (busyAction) return;
     setBusyAction(type);
@@ -623,8 +672,6 @@ function SessionActionsPopover({ sessionState, resourceReloadSupported, onChoose
           void runAction(action.type, action.fields, action.keepOpen);
         }}
       />
-      <QueueModeRow icon={<Layers3 size={15} />} title={bi(language, "Orienter le travail en cours", "Steer current work")} detail={bi(language, "Livré après les outils du tour actuel, avant le prochain appel au modèle.", "Delivered after the current turn's tools, before the next model call.")} mode={steeringMode} language={language} onMode={(mode) => void runAction("set_steering_mode", { mode }, true)} />
-      <QueueModeRow icon={<Clock3 size={15} />} title={bi(language, "Démarrer un nouveau tour ensuite", "Start a follow-up turn")} detail={bi(language, "Attend la fin complète de l’exécution, puis démarre un nouveau tour utilisateur.", "Waits for the run to finish, then starts a new user turn.")} mode={followUpMode} language={language} onMode={(mode) => void runAction("set_follow_up_mode", { mode }, true)} />
       <div className="popover-separator" />
       <div className="popover-label">{bi(language, "Diagnostic", "Diagnostics")}</div>
       <button type="button" disabled={Boolean(busyAction)} onClick={() => void runAction("get_state")}><RefreshCw size={15} /><span><strong>{bi(language, "Actualiser l’état", "Refresh state")}</strong><small>{bi(language, "Relire l’état sans interrompre Prime Agent", "Read state again without interrupting Prime Agent")}</small></span>{busyAction === "get_state" ? <LoaderCircle size={14} className="spin" /> : null}</button>
@@ -1115,6 +1162,14 @@ export function isConversationTurnActive(status: Conversation["status"]): boolea
   return status === "streaming" || status === "tool" || status === "queued";
 }
 
+export function unresolvedPlanQuestionCount(conversation: Pick<Conversation, "messages">): number {
+  return conversation.messages.reduce((count, message) => (
+    count + (message.tools ?? []).filter((tool) => (
+      tool.name === "prime_orbit_plan_question" && tool.status === "unresolved"
+    )).length
+  ), 0);
+}
+
 export function isConversationMaintenanceBlocked(status: Conversation["status"]): boolean {
   return status === "starting" || isConversationTurnActive(status);
 }
@@ -1463,12 +1518,13 @@ function PythonExecutionGroup({ tools, onOpenLink }: { tools: ToolActivity[]; on
     previousFailures.current = summary.failed;
   }, [summary.failed]);
 
-  const status = summary.running > 0 ? "running" : summary.failed > 0 ? "failed" : summary.cancelled > 0 ? "cancelled" : "completed";
+  const status = summary.running > 0 ? "running" : summary.failed > 0 ? "failed" : summary.cancelled > 0 ? "cancelled" : summary.unresolved > 0 ? "unresolved" : "completed";
   const details = [
     summary.running ? `${summary.running} ${bi(language, "en cours", "running")}` : "",
     summary.completed ? `${summary.completed} ${bi(language, "terminée", "complete")}${summary.completed > 1 && language === "fr" ? "s" : ""}` : "",
     summary.failed ? `${summary.failed} ${summary.failed > 1 ? bi(language, "échecs", "failed") : bi(language, "échec", "failed")}` : "",
     summary.cancelled ? `${summary.cancelled} ${bi(language, "annulée", "cancelled")}${summary.cancelled > 1 && language === "fr" ? "s" : ""}` : "",
+    summary.unresolved ? `${summary.unresolved} ${bi(language, "sans résultat", "awaiting result")}` : "",
   ].filter(Boolean).join(" · ");
 
   return (
@@ -1518,9 +1574,10 @@ function summarizePythonTools(tools: ToolActivity[]) {
     if (tool.status === "running" || tool.status === "queued") summary.running += 1;
     else if (tool.status === "failed") summary.failed += 1;
     else if (tool.status === "cancelled") summary.cancelled += 1;
+    else if (tool.status === "unresolved") summary.unresolved += 1;
     else summary.completed += 1;
     return summary;
-  }, { running: 0, completed: 0, failed: 0, cancelled: 0 });
+  }, { running: 0, completed: 0, failed: 0, cancelled: 0, unresolved: 0 });
 }
 
 export function initialToolCardExpanded(tool: Pick<ToolActivity, "status">, compactByDefault = false) {
@@ -1548,14 +1605,18 @@ function ToolCard({ tool, compactByDefault = false, onOpenLink }: { tool: ToolAc
       ? <Clock3 size={15} />
       : tool.status === "failed"
         ? <X size={15} />
-        : tool.status === "cancelled" ? <CircleStop size={15} /> : <Check size={15} />;
+        : tool.status === "cancelled"
+          ? <CircleStop size={15} />
+          : tool.status === "unresolved" ? <Clock3 size={15} /> : <Check size={15} />;
   const statusText = tool.status === "running"
     ? bi(language, "En cours", "Running")
     : tool.status === "queued"
       ? bi(language, "En attente", "Queued")
       : tool.status === "failed"
         ? bi(language, "Échec", "Failed")
-        : tool.status === "cancelled" ? bi(language, "Annulé", "Cancelled") : bi(language, "Terminé", "Complete");
+        : tool.status === "cancelled"
+          ? bi(language, "Annulé", "Cancelled")
+          : tool.status === "unresolved" ? bi(language, "Résultat en attente", "Awaiting result") : bi(language, "Terminé", "Complete");
   return (
     <section className={`tool-card tool-${tool.status}`}>
       <button type="button" aria-expanded={open} onClick={() => setOpen(!open)}>
@@ -1717,7 +1778,7 @@ export function buildContextUsageSnapshot(
   };
 }
 
-function Composer({ project, conversation, models, favoriteModels, commands, stats, sessionState, resourceReloadSupported, isRunning, isCompacting, isRefining, onDraftChange, onSend, onMutateQueuedMessage, onAbort, onModel, onToggleFavoriteModel, onThinking, onRunCommand, onPlanMode, openPopover, onTogglePopover, onClosePopover }: {
+function Composer({ project, conversation, models, favoriteModels, commands, stats, sessionState, resourceReloadSupported, isRunning, isCompacting, isRefining, onDraftChange, onSend, onAbort, onModel, onToggleFavoriteModel, onThinking, onRunCommand, onPlanMode, openPopover, onTogglePopover, onClosePopover }: {
   project: Project;
   conversation: Conversation;
   models: ModelInfo[];
@@ -1731,7 +1792,6 @@ function Composer({ project, conversation, models, favoriteModels, commands, sta
   isRefining: boolean;
   onDraftChange: (draft: string) => void;
   onSend: (message: string, attachments: Attachment[], delivery?: "steer" | "follow_up") => Promise<void>;
-  onMutateQueuedMessage: (input: { messageId: string; lane: "steering" | "followUp"; index: number; expectedText: string; mutation: { type: "delete" } | { type: "replace"; text: string; lane: "steering" | "followUp" } }) => Promise<void>;
   onAbort: () => Promise<void>;
   onModel: (model: ModelInfo) => Promise<void>;
   onToggleFavoriteModel: (ref: string) => void;
@@ -1760,9 +1820,6 @@ function Composer({ project, conversation, models, favoriteModels, commands, sta
   const dropAdmissionBusyRef = useRef(false);
   const dropAdmissionGenerationRef = useRef(0);
   const [attachmentError, setAttachmentError] = useState<string>();
-  const [queueEditor, setQueueEditor] = useState<{ id: string; text: string }>();
-  const [queueBusyId, setQueueBusyId] = useState<string>();
-  const [queueError, setQueueError] = useState<string>();
   const [slashSelection, setSlashSelection] = useState(0);
   const [slashDismissed, setSlashDismissed] = useState(false);
   const [composerFocused, setComposerFocused] = useState(false);
@@ -1885,9 +1942,6 @@ function Composer({ project, conversation, models, favoriteModels, commands, sta
     setAdding(false);
     setDragging(false);
     setAttachmentError(undefined);
-    setQueueEditor(undefined);
-    setQueueBusyId(undefined);
-    setQueueError(undefined);
     return () => {
       rememberConversationAttachmentDraft(conversation.id, attachmentsRef.current);
       // Invalidate every raw attachment admission still awaiting native
@@ -2129,7 +2183,7 @@ function Composer({ project, conversation, models, favoriteModels, commands, sta
         }
       }
       event.preventDefault();
-      void submit(isBusy ? "follow_up" : undefined);
+      void submit(nativeComposerDelivery(isRunning, isCompacting, event.altKey));
     }
     if (event.key === "Escape" && isRunning) void onAbort();
   };
@@ -2301,41 +2355,7 @@ function Composer({ project, conversation, models, favoriteModels, commands, sta
   };
 
   const contextUsage = buildContextUsageSnapshot(stats, sessionState, isCompacting);
-  const queuedRows = buildQueuedRows(conversation, sessionState);
-  const applyQueuedMutation = async (
-    item: QueuedMessageRow,
-    mutation: { type: "delete" } | { type: "replace"; text: string; lane: "steering" | "followUp" },
-  ) => {
-    if (item.index === undefined || queueBusyId) return;
-    setQueueBusyId(item.id);
-    setQueueError(undefined);
-    try {
-      await onMutateQueuedMessage({
-        messageId: item.id,
-        lane: item.lane,
-        index: item.index,
-        expectedText: item.expectedText,
-        mutation,
-      });
-      setQueueEditor(undefined);
-    } catch (error) {
-      setQueueError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setQueueBusyId(undefined);
-    }
-  };
-  const saveQueuedEdit = (item: QueuedMessageRow) => {
-    const text = queueEditor?.text.trim() ?? "";
-    if (!text) {
-      setQueueError(bi(language, "Le message en attente ne peut pas être vide.", "The queued message cannot be empty."));
-      return;
-    }
-    if (text === item.expectedText) {
-      setQueueEditor(undefined);
-      return;
-    }
-    void applyQueuedMutation(item, { type: "replace", text, lane: item.lane });
-  };
+  const queuedRows = buildQueuedRows(sessionState);
   return (
     <div className={`composer-shell ${dragging ? "is-dragging" : ""}`} onDragEnter={handleDragEnter} onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={(event) => void handleDrop(event)}>
       {slashPaletteOpen ? (
@@ -2369,53 +2389,20 @@ function Composer({ project, conversation, models, favoriteModels, commands, sta
       {dragging ? <div className="drop-overlay"><Paperclip size={24} /><strong>{bi(language, "Déposez pour joindre ces fichiers", "Drop to attach these files")}</strong></div> : null}
       {queuedRows.length ? (
         <div className="queued-message-tray" aria-label={bi(language, "Instructions en attente", "Queued instructions")}>
-          {queuedRows.map((item) => {
-            const editing = queueEditor?.id === item.id;
-            const busy = queueBusyId === item.id;
-            const editBlocked = item.index === undefined;
-            return (
-              <div className={`queued-message-row ${editing ? "is-editing" : ""}`} key={item.id}>
-                <span className="queued-message-icon">{busy ? <LoaderCircle size={13} className="spin" /> : <Layers3 size={13} />}</span>
-                {editing ? (
-                  <input
-                    className="queued-message-input"
-                    value={queueEditor.text}
-                    autoFocus
-                    aria-label={bi(language, "Modifier le message en attente", "Edit queued message")}
-                    onChange={(event) => setQueueEditor({ id: item.id, text: event.target.value })}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); saveQueuedEdit(item); }
-                      if (event.key === "Escape") { event.preventDefault(); setQueueEditor(undefined); setQueueError(undefined); }
-                    }}
-                  />
-                ) : (
-                  <span className="queued-message-copy"><strong>{item.text}</strong>{item.attachments?.length ? <small>{item.attachments.length} {item.attachments.length === 1 ? bi(language, "pièce jointe", "attachment") : bi(language, "pièces jointes", "attachments")}</small> : item.index === undefined ? <small>{bi(language, "Synchronisation…", "Syncing…")}</small> : null}</span>
-                )}
-                <Badge tone={item.delivery === "steer" ? "accent" : "neutral"}>{item.delivery === "steer" ? bi(language, "Immédiat", "Steer") : bi(language, "Suivi", "Follow-up")}</Badge>
-                <span className="queued-message-actions">
-                  {editing ? (
-                    <>
-                      <IconButton label={bi(language, "Enregistrer la modification", "Save edit")} onClick={() => saveQueuedEdit(item)} disabled={busy}><Check size={13} /></IconButton>
-                      <IconButton label={bi(language, "Annuler la modification", "Cancel edit")} onClick={() => { setQueueEditor(undefined); setQueueError(undefined); }} disabled={busy}><X size={13} /></IconButton>
-                    </>
-                  ) : (
-                    <>
-                      <IconButton label={bi(language, "Modifier le message en attente", "Edit queued message")} onClick={() => { setQueueEditor({ id: item.id, text: item.expectedText }); setQueueError(undefined); }} disabled={editBlocked || busy}><Pencil size={13} /></IconButton>
-                      <IconButton label={bi(language, "Supprimer le message en attente", "Delete queued message")} onClick={() => void applyQueuedMutation(item, { type: "delete" })} disabled={item.index === undefined || busy}><Trash2 size={13} /></IconButton>
-                    </>
-                  )}
-                </span>
-              </div>
-            );
-          })}
-          {queueError ? <p className="queued-message-error" role="alert"><CircleAlert size={13} />{queueError}</p> : null}
+          {queuedRows.map((item) => (
+            <div className="queued-message-row" key={item.id}>
+              <span className="queued-message-icon"><Layers3 size={13} /></span>
+              <span className="queued-message-copy"><strong>{item.text}</strong>{item.attachments?.length ? <small>{item.attachments.length} {item.attachments.length === 1 ? bi(language, "pièce jointe", "attachment") : bi(language, "pièces jointes", "attachments")}</small> : null}</span>
+              <Badge tone={item.delivery === "steer" ? "accent" : "neutral"}>{item.delivery === "steer" ? bi(language, "Avant le prochain appel", "Before the next model call") : bi(language, "Après la fin", "After completion")}</Badge>
+            </div>
+          ))}
         </div>
       ) : null}
       {attachments.length ? <div className="composer-attachments">{attachments.map((attachment) => <div key={attachment.id}>{attachment.isImage && attachment.previewDataUrl ? <img src={attachment.previewDataUrl} alt="" /> : <AttachmentGlyph attachment={attachment} size={18} />}<span><strong>{attachment.name}</strong><small>{attachmentMetaLabel(attachment, language, locale)}</small></span><IconButton label={`${bi(language, "Retirer", "Remove")} ${attachment.name}`} onClick={() => { const removed = attachmentsRef.current.find((item) => item.id === attachment.id); const next = attachmentsRef.current.filter((item) => item.id !== attachment.id); attachmentsRef.current = next; rememberConversationAttachmentDraft(conversation.id, next); setAttachments(next); setAttachmentError(undefined); if (removed) void releaseAttachmentHandles(attachmentHandles([removed])).catch(() => undefined); }}><X size={14} /></IconButton></div>)}</div> : null}
       {attachmentError ? <p className="trust-note" role="alert"><Info size={14} />{attachmentError}</p> : null}
       {commandError ? <p className="trust-note composer-command-error" role="alert"><CircleAlert size={14} />{commandError}</p> : null}
       <div className="composer-editor">
-        <textarea ref={textarea} value={editorValue} onChange={(event) => updateEditorValue(event.target.value)} onKeyDown={handleKeyDown} onPaste={handlePaste} onFocus={() => setComposerFocused(true)} onBlur={() => { setComposerFocused(false); if (draftRef.current !== reportedDraftRef.current) reportDraftNow(draftRef.current); }} placeholder={activeSlashCommand ? activeSlashCommand.command.description : isCompacting ? bi(language, "Ajoutez un message après le compactage…", "Add a message after compaction…") : isRunning ? bi(language, "Ajoutez une instruction à la suite…", "Add a follow-up instruction…") : isPlanMode ? bi(language, "Décrivez ce que vous voulez planifier…", "Describe what you want to plan…") : `${bi(language, "Demandez quelque chose sur", "Ask something about")} ${project.name}…`} rows={1} lang={typeof navigator === "undefined" ? language : navigator.language} spellCheck data-native-spellcheck-menu="true" aria-label={bi(language, "Message à Prime Agent", "Message Prime Agent")} aria-autocomplete="list" aria-expanded={slashPaletteOpen} aria-controls={slashPaletteOpen ? "composer-slash-command-list" : undefined} aria-activedescendant={slashPaletteOpen ? `composer-slash-command-${Math.min(slashSelection, filteredSlashCommands.length - 1)}` : undefined} />
+        <textarea ref={textarea} value={editorValue} onChange={(event) => updateEditorValue(event.target.value)} onKeyDown={handleKeyDown} onPaste={handlePaste} onFocus={() => setComposerFocused(true)} onBlur={() => { setComposerFocused(false); if (draftRef.current !== reportedDraftRef.current) reportDraftNow(draftRef.current); }} placeholder={activeSlashCommand ? activeSlashCommand.command.description : isCompacting ? bi(language, "Ajoutez un message après le compactage…", "Add a message after compaction…") : isRunning ? bi(language, "Orientez le travail en cours…", "Steer the current work…") : isPlanMode ? bi(language, "Décrivez ce que vous voulez planifier…", "Describe what you want to plan…") : `${bi(language, "Demandez quelque chose sur", "Ask something about")} ${project.name}…`} rows={1} lang={typeof navigator === "undefined" ? language : navigator.language} spellCheck data-native-spellcheck-menu="true" aria-label={bi(language, "Message à Prime Agent", "Message Prime Agent")} aria-autocomplete="list" aria-expanded={slashPaletteOpen} aria-controls={slashPaletteOpen ? "composer-slash-command-list" : undefined} aria-activedescendant={slashPaletteOpen ? `composer-slash-command-${Math.min(slashSelection, filteredSlashCommands.length - 1)}` : undefined} />
       </div>
       <div className="composer-toolbar">
         <div className="composer-tools-left">
@@ -2431,7 +2418,7 @@ function Composer({ project, conversation, models, favoriteModels, commands, sta
           </div>
           <div className="composer-popover-wrap" data-dismissable-layer="composer-queue">
             <button type="button" className="composer-chip permission-chip" aria-haspopup="menu" aria-expanded={openPopover === "composer-queue"} title={bi(language, "File d’instructions réellement gérée par Prime Agent", "Instruction queue managed by Prime Agent")} onClick={() => onTogglePopover("composer-queue")}><Layers3 size={14} />{queueLabel(sessionState, language)}<ChevronDown size={13} /></button>
-            {openPopover === "composer-queue" ? <QueuePopover sessionState={sessionState} onChoose={(type, fields) => { void onRunCommand(type, fields); }} /> : null}
+            {openPopover === "composer-queue" ? <QueuePopover sessionState={sessionState} /> : null}
           </div>
         </div>
         <div className="composer-tools-right">
@@ -2445,8 +2432,8 @@ function Composer({ project, conversation, models, favoriteModels, commands, sta
             {openPopover === "composer-thinking" ? <ThinkingPopover active={conversation.thinkingLevel} onChoose={(level) => { void onThinking(level); onClosePopover(); }} /> : null}
           </div>
           {isRunning ? <IconButton label={bi(language, "Arrêter l’exécution", "Stop run")} className="composer-stop" onClick={() => void onAbort()}><CircleStop size={18} /></IconButton> : null}
-          {isRunning && !isCompacting ? <button type="button" className="queued-force-send" disabled={!hasComposerContent || adding} onClick={() => void submit("steer")} title={bi(language, "Livrer après les outils en cours, avant le prochain appel au modèle", "Deliver after current tools, before the next model call")}><Zap size={15} />{bi(language, "Orienter", "Steer")}</button> : null}
-          <button type="button" className={`send-button ${hasComposerContent ? "is-ready" : ""}`} disabled={!hasComposerContent || adding} onClick={() => void submit(isBusy ? "follow_up" : undefined)} aria-label={isBusy ? bi(language, "Ajouter à la file", "Add to queue") : bi(language, "Envoyer", "Send")} title={isBusy ? bi(language, "Attendre la fin puis démarrer un nouveau tour", "Wait for completion, then start a new turn") : bi(language, "Envoyer (Entrée)", "Send (Enter)")}>{isBusy ? <Layers3 size={18} /> : <Send size={18} />}</button>
+          {isRunning && !isCompacting ? <button type="button" className="queued-force-send" disabled={!hasComposerContent || adding} onClick={() => void submit("follow_up")} title={bi(language, "Attendre la fin du travail puis démarrer un nouveau tour (Alt+Entrée)", "Wait for current work to finish, then start a new turn (Alt+Enter)")}><Clock3 size={15} />{bi(language, "Après la fin", "After completion")}</button> : null}
+          <button type="button" className={`send-button ${hasComposerContent ? "is-ready" : ""}`} disabled={!hasComposerContent || adding} onClick={() => void submit(nativeComposerDelivery(isRunning, isCompacting, false))} aria-label={isCompacting ? bi(language, "Ajouter après le compactage", "Add after compaction") : isRunning ? bi(language, "Orienter le travail en cours", "Steer current work") : bi(language, "Envoyer", "Send")} title={isCompacting ? bi(language, "Attendre la fin du compactage puis démarrer un nouveau tour", "Wait for compaction to finish, then start a new turn") : isRunning ? bi(language, "Livrer après les outils en cours, avant le prochain appel au modèle (Entrée)", "Deliver after current tools, before the next model call (Enter)") : bi(language, "Envoyer (Entrée)", "Send (Enter)")}>{isCompacting ? <Layers3 size={18} /> : isRunning ? <Zap size={18} /> : <Send size={18} />}</button>
         </div>
       </div>
     </div>
@@ -2467,6 +2454,18 @@ function contextStatusTone(status: ContextUsageStatus): "success" | "warning" | 
   if (status === "warning") return "warning";
   if (status === "available") return "success";
   return "neutral";
+}
+
+/** Mirrors Prime Agent's native composer contract: Enter steers an active
+ * run, Alt+Enter schedules a follow-up, and compaction can only be followed by
+ * a new turn after it releases the session. */
+export function nativeComposerDelivery(
+  isRunning: boolean,
+  isCompacting: boolean,
+  followUpRequested: boolean,
+): "steer" | "follow_up" | undefined {
+  if (!isRunning && !isCompacting) return undefined;
+  return isCompacting || followUpRequested ? "follow_up" : "steer";
 }
 
 function ContextUsagePopover({ snapshot }: { snapshot: ContextUsageSnapshot }) {
@@ -2555,7 +2554,7 @@ function ActivityPanel({ activities, conversation }: { activities: ActivityItem[
   const needsAttention = conversation.status === "error" || conversation.status === "offline";
   const overviewDetail = needsAttention
     ? conversation.lastError ?? bi(language, "La session nécessite votre attention", "This session needs your attention")
-    : reversed[0]?.title ?? bi(language, "Prêt pour une nouvelle instruction", "Ready for a new instruction");
+    : reversed[0]?.title ?? activityOverviewDetail(conversation.status, language);
   return (
     <div className="inspector-section">
       <section className={`run-overview status-${conversation.status}`}>
@@ -2571,6 +2570,14 @@ function ActivityPanel({ activities, conversation }: { activities: ActivityItem[
       })}</div> : <InspectorEmpty icon={<Activity size={22} />} text={bi(language, "L’activité des outils apparaîtra ici.", "Tool activity will appear here.")} />}
     </div>
   );
+}
+
+export function activityOverviewDetail(status: Conversation["status"], language: AppLanguage) {
+  if (status === "starting") return bi(language, "Connexion à Prime Agent…", "Connecting to Prime Agent…");
+  if (status === "streaming") return bi(language, "Prime Agent traite l’instruction active", "Prime Agent is processing the active instruction");
+  if (status === "tool") return bi(language, "Un outil ou une demande interactive est en cours", "A tool or interactive request is active");
+  if (status === "queued") return bi(language, "Des instructions attendent dans la file Prime Agent", "Instructions are waiting in Prime Agent's queue");
+  return bi(language, "Prêt pour une nouvelle instruction", "Ready for a new instruction");
 }
 
 export type SessionPanelSection = "runtime" | "attachments" | "goal" | "agents" | "supervision";
@@ -3566,16 +3573,16 @@ function ThinkingPopover({ active, onChoose }: { active: ThinkingLevel; onChoose
   return <div className="popover thinking-popover"><div className="popover-label">{bi(language, "Niveau de raisonnement", "Reasoning level")}</div>{levels.map((level) => <button key={level.value} type="button" className={active === level.value ? "is-selected" : ""} onClick={() => onChoose(level.value)}><span><strong>{level.label}</strong><small>{level.detail}</small></span>{active === level.value ? <Check size={15} /> : null}</button>)}</div>;
 }
 
-function QueuePopover({ sessionState, onChoose }: { sessionState?: AgentSessionState; onChoose: (type: string, fields?: Record<string, unknown>) => void }) {
+function QueuePopover({ sessionState }: { sessionState?: AgentSessionState }) {
   const { language } = useI18n();
-  const steeringMode = sessionState?.steeringMode ?? "one-at-a-time";
-  const followUpMode = sessionState?.followUpMode ?? "one-at-a-time";
   const actions = sessionState?.sessionActions;
+  const steeringCount = actions?.steering.length ?? 0;
+  const followUpCount = actions?.followUps.length ?? 0;
   return (
     <div className="popover thinking-popover permission-popover">
       <div className="popover-label">{bi(language, "File Prime Agent", "Prime Agent queue")}</div>
-      <QueueModeRow icon={<Zap size={15} />} title={bi(language, "Orienter le travail en cours", "Steer current work")} detail={bi(language, "Après les outils du tour actuel, avant le prochain appel au modèle.", "After the current turn's tools, before the next model call.")} mode={steeringMode} language={language} onMode={(mode) => onChoose("set_steering_mode", { mode })} />
-      <QueueModeRow icon={<Clock3 size={15} />} title={bi(language, "Nouveau tour après l’exécution", "New turn after the run")} detail={bi(language, "Attend que l’agent soit libre, puis démarre un nouveau tour.", "Waits until the agent is idle, then starts a new turn.")} mode={followUpMode} language={language} onMode={(mode) => onChoose("set_follow_up_mode", { mode })} />
+      <p className="trust-note"><Zap size={14} />{bi(language, `${steeringCount} instruction(s) avant le prochain appel au modèle.`, `${steeringCount} instruction(s) before the next model call.`)}</p>
+      <p className="trust-note"><Clock3 size={14} />{bi(language, `${followUpCount} instruction(s) après la fin du travail.`, `${followUpCount} instruction(s) after completion.`)}</p>
       <div className="popover-separator" />
       <div className="popover-label">{bi(language, "État réel", "Live state")}</div>
       <p className="trust-note"><Layers3 size={14} />{actions?.queuedCount
@@ -3589,78 +3596,26 @@ interface QueuedMessageRow {
   id: string;
   text: string;
   delivery: "steer" | "follow_up";
-  lane: "steering" | "followUp";
-  index?: number;
-  expectedText: string;
   attachments?: Attachment[];
 }
 
-export function buildQueuedRows(conversation: Conversation, sessionState?: AgentSessionState): QueuedMessageRow[] {
+export function buildQueuedRows(sessionState?: AgentSessionState): QueuedMessageRow[] {
   const actions = sessionState?.sessionActions;
-  const local = conversation.messages.flatMap((message) => message.queueDelivery ? [{
-    message,
-    delivery: message.queueDelivery,
-    payload: message.queueText ?? message.content,
-    used: false,
-  }] : []);
-  const authoritative = (["steer", "follow_up"] as const).flatMap((delivery) => {
-    const lane = delivery === "steer" ? "steering" as const : "followUp" as const;
+  return (["steer", "follow_up"] as const).flatMap((delivery) => {
     const previews = delivery === "steer" ? actions?.steering ?? [] : actions?.followUps ?? [];
     const attachmentPreviews = delivery === "steer"
       ? actions?.queueAttachments?.steering ?? []
       : actions?.queueAttachments?.followUps ?? [];
     return previews.map((text, index): QueuedMessageRow => {
-      const match = local.find((item) => !item.used && item.delivery === delivery && item.payload === text);
-      if (match) match.used = true;
-      const attachments = match?.message.attachments?.length
-        ? match.message.attachments
-        : attachmentPreviews[index]?.length
-          ? attachmentPreviews[index]
-          : undefined;
+      const attachments = attachmentPreviews[index]?.length ? attachmentPreviews[index] : undefined;
       return {
-        id: match?.message.id ?? `remote-queue:${delivery}:${index}:${text.slice(0, 32)}`,
-        text: match?.message.content ?? (
-          text
-          || attachments?.map((attachment) => attachment.name).join(", ")
-          || "Fichier joint"
-        ),
+        id: `prime-agent-queue:${delivery}:${index}`,
+        text: text || attachments?.map((attachment) => attachment.name).join(", ") || "Fichier joint",
         delivery,
-        lane,
-        index,
-        expectedText: text,
         attachments,
       };
     });
   });
-  const syncing = local.filter((item) => !item.used).map(({ message, delivery, payload }): QueuedMessageRow => ({
-    id: message.id,
-    text: message.content,
-    delivery,
-    lane: delivery === "steer" ? "steering" : "followUp",
-    expectedText: payload,
-    attachments: message.attachments,
-  }));
-  return [...authoritative, ...syncing];
-}
-
-function QueueModeRow({ icon, title, detail, mode, language, onMode }: {
-  icon: React.ReactNode;
-  title: string;
-  detail: string;
-  mode: "all" | "one-at-a-time";
-  language: "fr" | "en";
-  onMode: (mode: "all" | "one-at-a-time") => void;
-}) {
-  return (
-    <div className="queue-mode-row">
-      <span className="queue-mode-icon">{icon}</span>
-      <span className="queue-mode-copy"><strong>{title}</strong><small>{detail}</small></span>
-      <span className="queue-mode-toggle" role="group" aria-label={`${title} · ${bi(language, "mode de distribution", "delivery mode")}`}>
-        <button type="button" title={bi(language, "Livrer ensemble toutes les instructions en attente", "Deliver every queued instruction together")} className={mode === "all" ? "is-selected" : ""} aria-pressed={mode === "all"} onClick={() => onMode("all")}>{bi(language, "Tout", "All")}</button>
-        <button type="button" title={bi(language, "Livrer une instruction, attendre la réponse, puis livrer la suivante", "Deliver one instruction, wait for its response, then deliver the next")} className={mode === "one-at-a-time" ? "is-selected" : ""} aria-pressed={mode === "one-at-a-time"} onClick={() => onMode("one-at-a-time")}>{bi(language, "Un à la fois", "One at a time")}</button>
-      </span>
-    </div>
-  );
 }
 
 function AutoCompactionModeRow({ enabled, disabled, language, onEnabled }: {

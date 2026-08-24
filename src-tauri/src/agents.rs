@@ -12,6 +12,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
@@ -42,12 +43,16 @@ const RELOAD_UNKNOWN_GRACE: Duration = Duration::from_secs(30);
 const QUEUE_BRIDGE_SCRIPT: &str = include_str!("../assets/prime-agent-queue-bridge.cjs");
 const SESSION_CONTROL_BRIDGE_SCRIPT: &str =
     include_str!("../assets/prime-agent-session-control-bridge.cjs");
+const RPC_REATTACH_BRIDGE_SCRIPT: &str =
+    include_str!("../assets/prime-agent-rpc-reattach-bridge.cjs");
 const MAX_QUEUED_MESSAGE_TEXT: usize = 128 * 1024;
 const PLAN_RUNTIME_TOOLS: &str =
     "prime_orbit_plan_inspect,prime_orbit_plan_question,prime_orbit_plan_submit";
 const PLAN_UI_TITLE_PREFIX: &str = "prime-orbit-plan-ui:v1:";
 const MAX_PENDING_EXTENSION_UI_REQUESTS: usize = 32;
 const MAX_PENDING_EXTENSION_UI_REQUEST_BYTES: usize = 512 * 1024;
+const MAX_PENDING_EXTENSION_UI_STORE_BYTES: u64 = 16 * 1024 * 1024;
+const PENDING_EXTENSION_UI_STORE_VERSION: u8 = 1;
 const MAX_PUBLIC_AGENT_MESSAGE_ID_SUFFIX_CHARS: usize = 200;
 const MAX_PUBLIC_AGENT_MESSAGE_TEXT_CHARS: usize = 16_000;
 const MAX_PUBLIC_AGENT_NAME_CHARS: usize = 160;
@@ -122,10 +127,20 @@ pub enum AgentRuntimeMode {
     Plan,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct PendingExtensionUiRecord {
     id: String,
     line: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingExtensionUiStore {
+    version: u8,
+    conversation_id: String,
+    session_path: String,
+    session_id: Option<String>,
+    requests: Vec<PendingExtensionUiRecord>,
 }
 
 #[derive(Clone)]
@@ -325,6 +340,15 @@ pub struct ReloadAgentResourcesResult {
     reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeAgentQueueResult {
+    status: String,
+    supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionControlBridgeRequest {
@@ -332,6 +356,15 @@ struct SessionControlBridgeRequest {
     session_file: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OwnedSessionInspectionResult {
+    status: String,
+    supported: bool,
+    #[serde(default)]
+    active_session_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -583,12 +616,188 @@ fn cache_pending_extension_ui_request(
     true
 }
 
+fn pending_extension_ui_store_directory(app_data_dir: &Path) -> Result<PathBuf, String> {
+    let directory = app_data_dir.join("pending-extension-ui");
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(format!(
+                "Le cache UI Prime Agent {} n’est pas un dossier physique.",
+                directory.display()
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&directory).map_err(|error| {
+                format!(
+                    "Impossible de créer le cache UI Prime Agent {}: {error}",
+                    directory.display()
+                )
+            })?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "Impossible de vérifier le cache UI Prime Agent {}: {error}",
+                directory.display()
+            ))
+        }
+    }
+    let canonical = canonicalize(&directory).map_err(|error| {
+        format!(
+            "Impossible de résoudre le cache UI Prime Agent {}: {error}",
+            directory.display()
+        )
+    })?;
+    if !canonical.starts_with(app_data_dir) {
+        return Err("Le cache UI Prime Agent sort du stockage autorisé.".to_string());
+    }
+    Ok(canonical)
+}
+
+fn pending_extension_ui_store_path(
+    app_data_dir: &Path,
+    conversation_id: &str,
+) -> Result<PathBuf, String> {
+    let directory = pending_extension_ui_store_directory(app_data_dir)?;
+    let digest = Sha256::digest(conversation_id.as_bytes());
+    Ok(directory.join(format!("{digest:x}.json")))
+}
+
+fn remove_pending_extension_ui_store(app_data_dir: &Path, conversation_id: &str) {
+    let Ok(path) = pending_extension_ui_store_path(app_data_dir, conversation_id) else {
+        return;
+    };
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            let _ = fs::remove_file(path);
+        }
+        _ => {}
+    }
+}
+
+fn persist_pending_extension_ui_store(
+    app_data_dir: &Path,
+    conversation_id: &str,
+    session_path: Option<&str>,
+    session_id: Option<&str>,
+    requests: &[PendingExtensionUiRecord],
+) -> Result<(), String> {
+    if requests.is_empty() {
+        remove_pending_extension_ui_store(app_data_dir, conversation_id);
+        return Ok(());
+    }
+    let session_path = session_path
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "Prime Agent n’a pas encore publié le chemin de la session UI.".to_string()
+        })?;
+    if requests.len() > MAX_PENDING_EXTENSION_UI_REQUESTS
+        || requests.iter().any(|request| {
+            request.id.is_empty()
+                || request.id.len() > 256
+                || request.line.len() > MAX_PENDING_EXTENSION_UI_REQUEST_BYTES
+                || parsed_extension_ui_request(request.line.as_bytes())
+                    .is_none_or(|(id, awaits_response, _)| id != request.id || !awaits_response)
+        })
+    {
+        return Err("Le cache UI Prime Agent contient une demande invalide.".to_string());
+    }
+    let store = PendingExtensionUiStore {
+        version: PENDING_EXTENSION_UI_STORE_VERSION,
+        conversation_id: conversation_id.to_string(),
+        session_path: session_path.to_string(),
+        session_id: session_id.map(str::to_string),
+        requests: requests.to_vec(),
+    };
+    let bytes = serde_json::to_vec(&store)
+        .map_err(|error| format!("Impossible de sérialiser le cache UI Prime Agent: {error}"))?;
+    if bytes.len() as u64 > MAX_PENDING_EXTENSION_UI_STORE_BYTES {
+        return Err("Le cache UI Prime Agent dépasse sa taille maximale.".to_string());
+    }
+    let path = pending_extension_ui_store_path(app_data_dir, conversation_id)?;
+    crate::storage::write_atomic(&path, &bytes)
+}
+
+fn load_pending_extension_ui_store(
+    app_data_dir: &Path,
+    conversation_id: &str,
+    session_path: &Path,
+    session_id: Option<&str>,
+) -> Vec<PendingExtensionUiRecord> {
+    let Ok(path) = pending_extension_ui_store_path(app_data_dir, conversation_id) else {
+        return Vec::new();
+    };
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return Vec::new();
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_PENDING_EXTENSION_UI_STORE_BYTES
+    {
+        remove_pending_extension_ui_store(app_data_dir, conversation_id);
+        return Vec::new();
+    }
+    let store = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PendingExtensionUiStore>(&bytes).ok());
+    let Some(store) = store else {
+        remove_pending_extension_ui_store(app_data_dir, conversation_id);
+        return Vec::new();
+    };
+    let identity_matches = store.version == PENDING_EXTENSION_UI_STORE_VERSION
+        && store.conversation_id == conversation_id
+        && same_session_path(&store.session_path, session_path)
+        && match (store.session_id.as_deref(), session_id) {
+            (Some(stored), Some(expected)) => stored == expected,
+            _ => true,
+        };
+    if !identity_matches
+        || store.requests.len() > MAX_PENDING_EXTENSION_UI_REQUESTS
+        || store.requests.iter().any(|request| {
+            request.id.is_empty()
+                || request.id.len() > 256
+                || request.line.len() > MAX_PENDING_EXTENSION_UI_REQUEST_BYTES
+                || parsed_extension_ui_request(request.line.as_bytes())
+                    .is_none_or(|(id, awaits_response, _)| id != request.id || !awaits_response)
+        })
+    {
+        remove_pending_extension_ui_store(app_data_dir, conversation_id);
+        return Vec::new();
+    }
+    store.requests
+}
+
+fn sync_pending_extension_ui_store(
+    app: &AppHandle,
+    conversation_id: &str,
+    session_path: Option<&str>,
+    session_id: Option<&str>,
+    requests: &[PendingExtensionUiRecord],
+) {
+    let Ok(app_data_dir) = crate::storage::app_data_dir(app) else {
+        return;
+    };
+    if persist_pending_extension_ui_store(
+        &app_data_dir,
+        conversation_id,
+        session_path,
+        session_id,
+        requests,
+    )
+    .is_err()
+    {
+        // A stale partial cache is worse than losing this optional recovery
+        // copy: Prime Agent remains authoritative and will reject an old id.
+        remove_pending_extension_ui_store(&app_data_dir, conversation_id);
+    }
+}
+
 struct ExtensionRequestRoute {
     owner: Option<String>,
     plan_attention_request_id: Option<String>,
 }
 
 fn extension_request_target(
+    app: &AppHandle,
     agents: &AgentsState,
     conversation_id: &str,
     pid: u32,
@@ -596,25 +805,45 @@ fn extension_request_target(
     public_line: &str,
 ) -> Option<ExtensionRequestRoute> {
     let (id, awaits_response, claimed_plan_request) = parsed_extension_ui_request(record)?;
-    let mut map = agents.0.lock();
-    let agent = map
-        .get_mut(conversation_id)
-        .filter(|agent| agent.info.pid == pid && !agent.restarting)?;
-    if awaits_response {
-        cache_pending_extension_ui_request(
-            &mut agent.pending_extension_ui_requests,
-            id.clone(),
-            public_line.to_string(),
+    let (route, persisted) = {
+        let mut map = agents.0.lock();
+        let agent = map
+            .get_mut(conversation_id)
+            .filter(|agent| agent.info.pid == pid && !agent.restarting)?;
+        let cached = awaits_response
+            && cache_pending_extension_ui_request(
+                &mut agent.pending_extension_ui_requests,
+                id.clone(),
+                public_line.to_string(),
+            );
+        let plan_attention_request_id = (awaits_response
+            && claimed_plan_request
+            && agent.info.runtime_mode == AgentRuntimeMode::Plan)
+            .then_some(id);
+        (
+            ExtensionRequestRoute {
+                owner: agent.interactive_owner.clone(),
+                plan_attention_request_id,
+            },
+            cached.then(|| {
+                (
+                    agent.info.session_path.clone(),
+                    agent.info.session_id.clone(),
+                    agent.pending_extension_ui_requests.clone(),
+                )
+            }),
+        )
+    };
+    if let Some((session_path, session_id, requests)) = persisted {
+        sync_pending_extension_ui_store(
+            app,
+            conversation_id,
+            session_path.as_deref(),
+            session_id.as_deref(),
+            &requests,
         );
     }
-    let plan_attention_request_id = (awaits_response
-        && claimed_plan_request
-        && agent.info.runtime_mode == AgentRuntimeMode::Plan)
-        .then_some(id);
-    Some(ExtensionRequestRoute {
-        owner: agent.interactive_owner.clone(),
-        plan_attention_request_id,
-    })
+    Some(route)
 }
 
 fn emit_runtime_line(
@@ -1198,7 +1427,7 @@ fn stream_records<R: Read>(
                         continue;
                     }
                     if apply_runtime_state {
-                        apply_runtime_record(agents, &conversation_id, *pid, &record);
+                        apply_runtime_record(&app, agents, &conversation_id, *pid, &record);
                     }
                 }
                 let line = public_runtime_line(&record);
@@ -1206,7 +1435,7 @@ fn stream_records<R: Read>(
                     append_diagnostic_tail(diagnostic_tail, &line);
                 }
                 let target = runtime_identity.as_ref().and_then(|(agents, pid)| {
-                    extension_request_target(agents, &conversation_id, *pid, &record, &line)
+                    extension_request_target(&app, agents, &conversation_id, *pid, &record, &line)
                 });
                 emit_runtime_line(&app, event_name, &conversation_id, line, target);
             }
@@ -1453,7 +1682,13 @@ fn is_current_agent_process(agents: &AgentsState, conversation_id: &str, pid: u3
         .is_some_and(|agent| waiter_may_remove_slot(agent.info.pid, agent.restarting, pid))
 }
 
-fn apply_runtime_record(agents: &AgentsState, conversation_id: &str, pid: u32, record: &[u8]) {
+fn apply_runtime_record(
+    app: &AppHandle,
+    agents: &AgentsState,
+    conversation_id: &str,
+    pid: u32,
+    record: &[u8],
+) {
     let busy = runtime_busy_state(record);
     let clear_pending_extension_ui = terminal_clears_pending_extension_ui(record);
     let direct_session_operation_event = direct_session_operation_runtime_event(record);
@@ -1475,7 +1710,7 @@ fn apply_runtime_record(agents: &AgentsState, conversation_id: &str, pid: u32, r
     {
         return;
     }
-    let release_candidate = {
+    let (release_candidate, cleared_pending_identity) = {
         let mut map = agents.0.lock();
         let Some(agent) = map.get_mut(conversation_id) else {
             return;
@@ -1486,9 +1721,15 @@ fn apply_runtime_record(agents: &AgentsState, conversation_id: &str, pid: u32, r
         if let Some(busy) = busy {
             agent.busy = busy;
         }
-        if clear_pending_extension_ui {
+        let cleared_pending_identity = if clear_pending_extension_ui {
             agent.pending_extension_ui_requests.clear();
-        }
+            Some((
+                agent.info.session_path.clone(),
+                agent.info.session_id.clone(),
+            ))
+        } else {
+            None
+        };
         if let Some(event) = direct_session_operation_event {
             apply_direct_session_operation_runtime_event(&mut agent.operations, event);
         }
@@ -1509,8 +1750,17 @@ fn apply_runtime_record(agents: &AgentsState, conversation_id: &str, pid: u32, r
                 agent.info.thinking = Some(thinking);
             }
         }
-        idle_release_candidate(agent)
+        (idle_release_candidate(agent), cleared_pending_identity)
     };
+    if let Some((session_path, session_id)) = cleared_pending_identity {
+        sync_pending_extension_ui_store(
+            app,
+            conversation_id,
+            session_path.as_deref(),
+            session_id.as_deref(),
+            &[],
+        );
+    }
     if let Some(pid) = release_candidate {
         schedule_idle_release(agents.clone(), conversation_id.to_string(), pid);
     }
@@ -2349,14 +2599,16 @@ fn spawn_rpc_agent(
     runtime_mode: AgentRuntimeMode,
     daemon_socket: Option<&Path>,
     launch_spec: &LaunchSpec,
+    reattach_owned_session: bool,
 ) -> Result<SpawnedRpcAgent, String> {
-    let (plan_extension, plan_extension_guard) = if runtime_mode == AgentRuntimeMode::Plan {
-        let path = crate::plan_mode::ensure_plan_extension(app)?;
-        let guard = crate::plan_mode::lock_plan_extension_for_launch(&path)?;
-        (Some(path), Some(guard))
-    } else {
-        (None, None)
-    };
+    let (plan_extension, plan_extension_guard) =
+        if runtime_mode == AgentRuntimeMode::Plan && !reattach_owned_session {
+            let path = crate::plan_mode::ensure_plan_extension(app)?;
+            let guard = crate::plan_mode::lock_plan_extension_for_launch(&path)?;
+            (Some(path), Some(guard))
+        } else {
+            (None, None)
+        };
     let arguments = rpc_launch_arguments(
         session_path,
         provider.as_deref(),
@@ -2368,11 +2620,39 @@ fn spawn_rpc_agent(
         daemon_socket,
     );
 
-    let mut command = launch_spec.command(&arguments);
-    #[cfg(windows)]
-    if let LaunchSpec::Source { source_dir, .. } = launch_spec {
-        crate::node_compat::configure_source_rpc(app, &mut command, Some(source_dir))?;
-    }
+    let mut command = if reattach_owned_session {
+        let LaunchSpec::Source { node, cli, .. } = launch_spec else {
+            return Err(
+                "Ce runtime Prime Agent ne permet pas de réattacher une session RPC existante."
+                    .to_string(),
+            );
+        };
+        let session_path = session_path.ok_or_else(|| {
+            "Le réattachement Prime Agent exige un fichier de session attesté.".to_string()
+        })?;
+        let bridge_arguments = [
+            OsString::from("-e"),
+            OsString::from(RPC_REATTACH_BRIDGE_SCRIPT),
+        ];
+        let mut command = external_command(node, &bridge_arguments);
+        configure_bridge_daemon_socket(&mut command, daemon_socket);
+        command
+            .env("PRIME_ORBIT_CLI_PATH", cli)
+            .env("PRIME_ORBIT_SESSION_FILE", session_path);
+        if let Some(session_id) = session_id.as_deref() {
+            command.env("PRIME_ORBIT_SESSION_ID", session_id);
+        } else {
+            command.env_remove("PRIME_ORBIT_SESSION_ID");
+        }
+        command
+    } else {
+        let mut command = launch_spec.command(&arguments);
+        #[cfg(windows)]
+        if let LaunchSpec::Source { source_dir, .. } = launch_spec {
+            crate::node_compat::configure_source_rpc(app, &mut command, Some(source_dir))?;
+        }
+        command
+    };
     command
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -2416,6 +2696,68 @@ fn spawn_rpc_agent(
         exit_emitted: Arc::new(AtomicBool::new(false)),
         _plan_extension_guard: plan_extension_guard,
     })
+}
+
+fn inspect_owned_session_for_reattach(
+    launch_spec: &LaunchSpec,
+    daemon_socket: Option<&Path>,
+    session_file: &Path,
+    session_id: Option<&str>,
+) -> bool {
+    let LaunchSpec::Source { node, cli, .. } = launch_spec else {
+        return false;
+    };
+    let request = SessionControlBridgeRequest {
+        action: "inspect_owned_session",
+        session_file: session_file.to_string_lossy().into_owned(),
+        session_id: session_id.map(str::to_string),
+    };
+    let Ok(request_json) = serde_json::to_vec(&request) else {
+        return false;
+    };
+    let arguments = [
+        OsString::from("-e"),
+        OsString::from(SESSION_CONTROL_BRIDGE_SCRIPT),
+    ];
+    let mut command = external_command(node, &arguments);
+    configure_bridge_daemon_socket(&mut command, daemon_socket);
+    command
+        .env("PRIME_ORBIT_CLI_PATH", cli)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let wrote_request = child
+        .stdin
+        .take()
+        .and_then(|mut stdin| stdin.write_all(&request_json).ok())
+        .is_some();
+    if !wrote_request {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    }
+    let Ok(output) = child.wait_with_output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    serde_json::from_slice::<OwnedSessionInspectionResult>(&output.stdout)
+        .ok()
+        .is_some_and(|result| {
+            result.supported
+                && result.status == "active"
+                && result.active_session_id.as_deref().is_some_and(|id| {
+                    !id.is_empty()
+                        && id.len() <= 256
+                        && id.chars().all(|character| {
+                            character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                        })
+                })
+        })
 }
 
 fn spawn_agent_io_threads(
@@ -2559,6 +2901,29 @@ fn start_agent_blocking(
         )
     })?;
     let daemon_socket = managed_generation_daemon_socket(&launch_spec)?;
+    let reattach_owned_session = session_path.as_deref().is_some_and(|session_file| {
+        inspect_owned_session_for_reattach(
+            &launch_spec,
+            daemon_socket.as_deref(),
+            session_file,
+            None,
+        )
+    });
+    let app_data_dir = crate::storage::app_data_dir(&app).ok();
+    let restored_pending_extension_ui_requests = match (
+        reattach_owned_session,
+        app_data_dir.as_deref(),
+        session_path.as_deref(),
+    ) {
+        (true, Some(app_data_dir), Some(session_path)) => {
+            load_pending_extension_ui_store(app_data_dir, &conversation_id, session_path, None)
+        }
+        (false, Some(app_data_dir), _) => {
+            remove_pending_extension_ui_store(app_data_dir, &conversation_id);
+            Vec::new()
+        }
+        _ => Vec::new(),
+    };
 
     let mut map = agents.0.lock();
     ensure_update_installation_is_idle(&agents)?;
@@ -2589,6 +2954,7 @@ fn start_agent_blocking(
         runtime_mode,
         daemon_socket.as_deref(),
         &launch_spec,
+        reattach_owned_session,
     )?;
     if let Some(target) = managed_daemon_shutdown_target(&launch_spec, daemon_socket.as_deref()) {
         agents.2.lock().insert(target.socket.clone(), target);
@@ -2599,7 +2965,7 @@ fn start_agent_blocking(
         RunningAgent {
             info: info.clone(),
             append_system_prompt,
-            pending_extension_ui_requests: Vec::new(),
+            pending_extension_ui_requests: restored_pending_extension_ui_requests,
             _plan_extension_guard: spawned._plan_extension_guard.clone(),
             daemon_socket,
             launch_spec,
@@ -2885,6 +3251,33 @@ fn send_rpc_blocking(
                 }
             }
         }
+        if extension_ui_response_id.is_some() {
+            let pending_snapshot = {
+                let map = agents.0.lock();
+                map.get(&conversation_id)
+                    .filter(|agent| agent.info.pid == pid && !agent.restarting)
+                    .map(|agent| {
+                        (
+                            agent.info.session_path.clone(),
+                            agent.info.session_id.clone(),
+                            agent.pending_extension_ui_requests.clone(),
+                        )
+                    })
+            };
+            if let Some((session_path, session_id, requests)) = pending_snapshot {
+                if persist_pending_extension_ui_store(
+                    &app_data_dir,
+                    &conversation_id,
+                    session_path.as_deref(),
+                    session_id.as_deref(),
+                    &requests,
+                )
+                .is_err()
+                {
+                    remove_pending_extension_ui_store(&app_data_dir, &conversation_id);
+                }
+            }
+        }
     }
     write_result
 }
@@ -3129,6 +3522,136 @@ fn validate_reload_result(
     valid
         .then_some(result)
         .ok_or_else(|| "Réponse de rechargement Prime Agent invalide.".to_string())
+}
+
+fn unsupported_queue_resume(reason: &str) -> ResumeAgentQueueResult {
+    ResumeAgentQueueResult {
+        status: "unsupported".to_string(),
+        supported: false,
+        reason: Some(reason.to_string()),
+    }
+}
+
+fn validate_queue_resume_result(
+    result: ResumeAgentQueueResult,
+) -> Result<ResumeAgentQueueResult, String> {
+    let valid = matches!(
+        (
+            result.status.as_str(),
+            result.supported,
+            result.reason.as_deref(),
+        ),
+        ("resumed", true, None)
+            | ("unavailable", true, Some("inactive_session"))
+            | (
+                "unsupported",
+                false,
+                Some("runtime_kind" | "daemon_protocol" | "daemon_command")
+            )
+    );
+    valid
+        .then_some(result)
+        .ok_or_else(|| "Réponse de reprise de file Prime Agent invalide.".to_string())
+}
+
+fn resume_agent_queue_blocking(
+    agents: AgentsState,
+    owner: String,
+    conversation_id: String,
+) -> Result<ResumeAgentQueueResult, String> {
+    let conversation_id = validated_identifier(conversation_id)?;
+    let (node, cli, daemon_socket, session_file, session_id, pid, started_at) = {
+        let mut map = agents.0.lock();
+        let agent = map
+            .get_mut(&conversation_id)
+            .ok_or_else(|| format!("Aucun Prime Agent actif pour {conversation_id}"))?;
+        if agent.restarting {
+            return Err(
+                "Prime Agent redémarre pour cette conversation. Réessayez dans un instant."
+                    .to_string(),
+            );
+        }
+        if !agent.owners.contains(&owner) {
+            return Err(
+                "Cette fenêtre ne possède pas la conversation Prime Agent demandée.".to_string(),
+            );
+        }
+        let Some(session_file) = agent.info.session_path.clone() else {
+            return Ok(ResumeAgentQueueResult {
+                status: "unavailable".to_string(),
+                supported: true,
+                reason: Some("inactive_session".to_string()),
+            });
+        };
+        let LaunchSpec::Source { node, cli, .. } = agent.launch_spec.clone() else {
+            return Ok(unsupported_queue_resume("runtime_kind"));
+        };
+        begin_runtime_write(&mut agent.operations).map_err(|_| {
+            "Les ressources Prime Agent sont en cours de rechargement. La file d’attente ne peut pas être reprise pendant cette opération."
+                .to_string()
+        })?;
+        (
+            node,
+            cli,
+            agent.daemon_socket.clone(),
+            session_file,
+            agent.info.session_id.clone(),
+            agent.info.pid,
+            agent.info.started_at,
+        )
+    };
+    let _runtime_write =
+        RuntimeWriteGuard::new(agents, conversation_id, pid, started_at, None, None, None);
+    let request = SessionControlBridgeRequest {
+        action: "resume_queue",
+        session_file,
+        session_id,
+    };
+    let request_json = serde_json::to_vec(&request).map_err(|error| {
+        format!("Impossible de préparer la reprise de file Prime Agent: {error}")
+    })?;
+    let arguments = [
+        OsString::from("-e"),
+        OsString::from(SESSION_CONTROL_BRIDGE_SCRIPT),
+    ];
+    let mut command = external_command(&node, &arguments);
+    configure_bridge_daemon_socket(&mut command, daemon_socket.as_deref());
+    command
+        .env("PRIME_ORBIT_CLI_PATH", cli)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Impossible de lancer la reprise de file Prime Agent: {error}"))?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Impossible d’ouvrir l’entrée de reprise de file Prime Agent.".to_string())
+        .and_then(|mut stdin| {
+            stdin.write_all(&request_json).map_err(|error| {
+                format!("Impossible d’envoyer la reprise de file à Prime Agent: {error}")
+            })
+        });
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let output = child.wait_with_output().map_err(|error| {
+        format!("Impossible d’attendre la reprise de file Prime Agent: {error}")
+    })?;
+    if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if details.is_empty() {
+            "Prime Agent n’a pas pu reprendre la file d’entrée de cette session.".to_string()
+        } else {
+            details
+        });
+    }
+    let result: ResumeAgentQueueResult = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Réponse de reprise de file Prime Agent invalide: {error}"))?;
+    validate_queue_resume_result(result)
 }
 
 fn reload_agent_resources_blocking(
@@ -3447,6 +3970,7 @@ fn restart_agent_blocking(
             snapshot.runtime_mode,
             snapshot.daemon_socket.as_deref(),
             &snapshot.launch_spec,
+            false,
         ) {
             Ok(spawned) => spawned,
             Err(error) => {
@@ -3610,6 +4134,7 @@ fn stop_agent_blocking(
     };
 
     let status = stop_rpc_client(&snapshot.child, &snapshot.stdin)?;
+    sync_pending_extension_ui_store(&app, &conversation_id, None, None, &[]);
 
     {
         let mut map = agents.0.lock();
@@ -3843,6 +4368,19 @@ pub async fn reload_agent_resources(
     .await
 }
 
+/// Re-arms Prime Agent's native queued-input scheduler after an explicit abort.
+/// The daemon remains the sole owner of queue ordering and delivery.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn resume_agent_queue(
+    window: tauri::WebviewWindow,
+    agents: tauri::State<'_, AgentsState>,
+    conversation_id: String,
+) -> Result<ResumeAgentQueueResult, String> {
+    let agents = agents.inner().clone();
+    let owner = window.label().to_string();
+    crate::run_blocking(move || resume_agent_queue_blocking(agents, owner, conversation_id)).await
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub async fn stop_agent(
     app: AppHandle,
@@ -3945,6 +4483,7 @@ pub fn shutdown_all_agents(app: &AppHandle, agents: &AgentsState) {
     let running: Vec<_> = agents.0.lock().drain().collect();
     for (conversation_id, agent) in running {
         let status = stop_rpc_client(&agent.child, &agent.stdin);
+        sync_pending_extension_ui_store(app, &conversation_id, None, None, &[]);
         emit_exit_once(app, &conversation_id, &agent.exit_emitted, status, None);
     }
 
@@ -4073,20 +4612,23 @@ mod tests {
         close_rpc_stdin, conflicting_session_conversation, direct_session_operation_runtime_event,
         ensure_update_installation_is_idle, finish_resource_reload, finish_runtime_write,
         is_extension_ui_request, is_plan_review_request, is_reload_acknowledgement_timeout,
-        lease_absence_attests_release, managed_daemon_shutdown_target,
-        managed_generation_daemon_socket, mark_resource_reload_unknown, owner_may_send,
-        parsed_extension_ui_request, public_runtime_line, release_owner_lease_state,
+        lease_absence_attests_release, load_pending_extension_ui_store,
+        managed_daemon_shutdown_target, managed_generation_daemon_socket,
+        mark_resource_reload_unknown, owner_may_send, parsed_extension_ui_request,
+        persist_pending_extension_ui_store, public_runtime_line, release_owner_lease_state,
         requested_launch_option_update, restart_slot_matches, rpc_launch_arguments,
         rpc_starts_busy_operation, runtime_busy_state, runtime_launch_options,
         runtime_mode_matches_expected, runtime_session_id, runtime_session_path,
         should_emit_resources_reloaded, terminal_clears_pending_extension_ui, terminate_rpc_client,
-        validate_queue_lane, validate_queue_mutation, validate_reload_result, wait_for_child_until,
-        waiter_may_remove_slot, AgentOperations, AgentResourcesReloadedEvent, AgentRuntimeMode,
-        AgentsState, DirectSessionOperationKind, DirectSessionOperationRuntimeEvent,
-        LaunchOptionUpdate, LaunchSpec, QueuedMessageMutation, ReloadAgentResourcesResult,
-        ResourceReloadClaimError, ResourceReloadPhase, RestartAgentResult, RpcAdmissionError,
-        RunningAgentInfo, INVALID_AGENT_MESSAGE_PLACEHOLDER, MAX_EXIT_DIAGNOSTIC_BYTES,
-        MAX_PENDING_EXTENSION_UI_REQUESTS, MAX_PENDING_EXTENSION_UI_REQUEST_BYTES,
+        validate_queue_lane, validate_queue_mutation, validate_queue_resume_result,
+        validate_reload_result, wait_for_child_until, waiter_may_remove_slot, AgentOperations,
+        AgentResourcesReloadedEvent, AgentRuntimeMode, AgentsState, DirectSessionOperationKind,
+        DirectSessionOperationRuntimeEvent, LaunchOptionUpdate, LaunchSpec,
+        PendingExtensionUiRecord, QueuedMessageMutation, ReloadAgentResourcesResult,
+        ResourceReloadClaimError, ResourceReloadPhase, RestartAgentResult, ResumeAgentQueueResult,
+        RpcAdmissionError, RunningAgentInfo, INVALID_AGENT_MESSAGE_PLACEHOLDER,
+        MAX_EXIT_DIAGNOSTIC_BYTES, MAX_PENDING_EXTENSION_UI_REQUESTS,
+        MAX_PENDING_EXTENSION_UI_REQUEST_BYTES,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use parking_lot::Mutex;
@@ -4249,6 +4791,44 @@ mod tests {
         assert!(!terminal_clears_pending_extension_ui(
             br#"{"type":"message_end"}"#
         ));
+    }
+
+    #[test]
+    fn pending_extension_dialogs_survive_only_an_exact_session_reattach() {
+        let temporary = tempfile::tempdir().unwrap();
+        let app_data_dir = dunce::canonicalize(temporary.path()).unwrap();
+        let session_path = temporary.path().join("session.jsonl");
+        let line = r#"{"type":"extension_ui_request","activeSessionId":"active-1","id":"request-1","method":"select","title":"Question","options":["A","B"]}"#;
+        let requests = vec![PendingExtensionUiRecord {
+            id: "request-1".to_string(),
+            line: line.to_string(),
+        }];
+
+        persist_pending_extension_ui_store(
+            &app_data_dir,
+            "conversation-1",
+            Some(session_path.to_string_lossy().as_ref()),
+            Some("session-1"),
+            &requests,
+        )
+        .unwrap();
+        assert_eq!(
+            load_pending_extension_ui_store(
+                &app_data_dir,
+                "conversation-1",
+                &session_path,
+                Some("session-1"),
+            ),
+            requests
+        );
+
+        assert!(load_pending_extension_ui_store(
+            &app_data_dir,
+            "conversation-1",
+            &session_path,
+            Some("another-session"),
+        )
+        .is_empty());
     }
 
     #[test]
@@ -5084,6 +5664,34 @@ mod tests {
             status: "busy".to_string(),
             supported: true,
             reason: Some("unknown".to_string()),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn validates_the_native_queue_resume_capability_contract() {
+        assert!(validate_queue_resume_result(ResumeAgentQueueResult {
+            status: "resumed".to_string(),
+            supported: true,
+            reason: None,
+        })
+        .is_ok());
+        assert!(validate_queue_resume_result(ResumeAgentQueueResult {
+            status: "unavailable".to_string(),
+            supported: true,
+            reason: Some("inactive_session".to_string()),
+        })
+        .is_ok());
+        assert!(validate_queue_resume_result(ResumeAgentQueueResult {
+            status: "unsupported".to_string(),
+            supported: false,
+            reason: Some("daemon_command".to_string()),
+        })
+        .is_ok());
+        assert!(validate_queue_resume_result(ResumeAgentQueueResult {
+            status: "resumed".to_string(),
+            supported: false,
+            reason: Some("daemon_command".to_string()),
         })
         .is_err());
     }

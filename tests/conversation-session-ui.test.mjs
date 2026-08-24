@@ -23,6 +23,7 @@ const {
   buildToolSequenceSegments,
   buildContextUsageSnapshot,
   buildSessionPanelSummary,
+  activityOverviewDetail,
   clampRefinementContextMenuPosition,
   continueComposerMarkdownList,
   agentMessageRelationshipLabel,
@@ -32,6 +33,7 @@ const {
   harnessConfirmationPhrase,
   isConversationMaintenanceBlocked,
   isConversationTurnActive,
+  unresolvedPlanQuestionCount,
   planModeTransitionError,
   isGoalPanelBusy,
   isRefineControlBusy,
@@ -39,6 +41,12 @@ const {
   refinementReaderAdjacentIndex,
   refinementReaderCopyText,
 } = compiledModule.exports;
+
+test("describes authoritative active states even when the activity timeline is empty", () => {
+  assert.equal(activityOverviewDetail("streaming", "en"), "Prime Agent is processing the active instruction");
+  assert.equal(activityOverviewDetail("tool", "en"), "A tool or interactive request is active");
+  assert.equal(activityOverviewDetail("idle", "en"), "Ready for a new instruction");
+});
 
 test("clamps memory and refinement menus inside the visible desktop viewport", () => {
   assert.deepEqual(clampRefinementContextMenuPosition(980, 740, 240, 160, 1024, 768), { x: 776, y: 600 });
@@ -110,6 +118,20 @@ test("maintenance stays unavailable while connecting or while a real turn is act
   assert.equal(isConversationMaintenanceBlocked("tool"), true);
   assert.equal(isConversationMaintenanceBlocked("queued"), true);
   assert.equal(isConversationMaintenanceBlocked("idle"), false);
+});
+
+test("detects only unresolved Prime Orbit Plan questions for dialog recovery", () => {
+  assert.equal(unresolvedPlanQuestionCount({
+    messages: [{
+      tools: [
+        { name: "prime_orbit_plan_question", status: "unresolved" },
+        { name: "prime_orbit_plan_question", status: "cancelled" },
+        { name: "prime_orbit_plan_inspect", status: "unresolved" },
+      ],
+    }, {
+      tools: [{ name: "prime_orbit_plan_question", status: "unresolved" }],
+    }],
+  }), 2);
 });
 
 test("localizes the native Plan busy rejection with the application language", () => {

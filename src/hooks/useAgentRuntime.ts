@@ -12,15 +12,14 @@ import {
   listRunningAgents,
   notifyPlanAttention,
   loadSessionHistory,
-  mutateAgentQueue,
   reloadAgentResources,
+  resumeAgentQueue,
   restartAgent,
   sendRpc,
   startAgent,
   writePlanDocument,
   stopAgent,
   type AgentRuntimeMode,
-  type QueueMutation,
   type StartAgentOptions,
 } from "../lib/bridge";
 import {
@@ -79,7 +78,6 @@ import type {
   SessionHarnessEntry,
   SessionRefinementRecord,
   SessionStats,
-  SessionActionSnapshot,
   SlashCommand,
   ThinkingLevel,
   ToolActivity,
@@ -255,16 +253,21 @@ export function shouldEnterLocalHistoryLoading(
     && !rpcHistoryLoaded;
 }
 
-/** The composer can render while a new RPC process is connecting. `starting`
- * alone is not an active agent turn, so UI-supplied follow-up/steer delivery
- * must be ignored until a real lifecycle or local operation proves work is in
- * progress. The prompt then waits for bootstrap and starts normally. */
-export function normalizeConnectingPromptDelivery(
+/** Mirrors Prime Agent's native admission rule. An idle prompt starts a turn;
+ * input submitted during active work steers unless the caller explicitly asks
+ * for a follow-up. Compaction only accepts work for the later idle boundary. */
+export function resolveNativePromptDelivery(
   status: Conversation["status"],
   requestedDelivery: "steer" | "follow_up" | undefined,
   hasTrackedWork: boolean,
+  isCompacting = false,
 ): "steer" | "follow_up" | undefined {
-  return status === "starting" && !hasTrackedWork ? undefined : requestedDelivery;
+  if (status === "starting" && !hasTrackedWork) return undefined;
+  if (isCompacting) return "follow_up";
+  if (requestedDelivery) return requestedDelivery;
+  return hasTrackedWork || status === "streaming" || status === "tool" || status === "queued"
+    ? "steer"
+    : undefined;
 }
 
 /** A successful get_state snapshot is the recovery boundary when renderer
@@ -275,22 +278,16 @@ export function isAuthoritativeIdleSessionSnapshot(
   const actions = sessionState.sessionActions;
   return !sessionState.isCompacting
     && !sessionState.isStreaming
-    && !actions.active
-    && actions.queuedCount <= 0
-    && actions.steering.length === 0
-    && actions.followUps.length === 0;
+    && !actions.active;
 }
 
-/** Prime Agent may be blocked in an extension UI tool while `isStreaming` is
- * already false. The durable session-action lane remains authoritative until
- * that tool and its enclosing turn have actually completed. */
+/** Only Prime Agent's active action means that work is executing. Its native
+ * queues deliberately survive Ctrl+C/Stop and must not make an idle session
+ * look busy or force the next normal prompt into the steering lane. */
 export function sessionActionsHaveWork(
   actions: AgentSessionState["sessionActions"] | undefined,
 ): boolean {
-  return Boolean(actions?.active)
-    || (actions?.queuedCount ?? 0) > 0
-    || (actions?.steering.length ?? 0) > 0
-    || (actions?.followUps.length ?? 0) > 0;
+  return Boolean(actions?.active);
 }
 
 export function activeStatusForSessionActions(
@@ -299,7 +296,7 @@ export function activeStatusForSessionActions(
   if (actions?.active) {
     return actions.active.kind === "session_command" ? "tool" : "streaming";
   }
-  return sessionActionsHaveWork(actions) ? "queued" : undefined;
+  return undefined;
 }
 
 export function conversationStatusForSessionSnapshot(
@@ -356,7 +353,7 @@ export function shouldScheduleTerminalStateReconciliation(event: { type: string;
 }
 
 /** Finalize renderer-only tool/activity state after get_state proves that the
- * daemon has no live turn or queued work. */
+ * daemon has no active turn. A preserved native queue remains visible. */
 export function finalizeAuthoritativeIdleSnapshot(
   conversation: Conversation,
   eventTime = now(),
@@ -518,241 +515,27 @@ export function promptAttachmentPayload(attachments: Attachment[]) {
   };
 }
 
-export interface PromptTransaction {
-  conversationId: string;
-  messageId: string;
-  previous: Pick<Conversation, "draft" | "hasContent" | "status" | "title" | "updatedAt">;
-  optimisticStatus: Conversation["status"];
-  optimisticTitle: string;
-  optimisticUpdatedAt: string;
-  previousMessageCount: number;
-  previousActivityCount: number;
+/** Removes queue rows written by older Orbit builds. They are renderer-owned
+ * artifacts, not Prime Agent transcript entries, and must never participate in
+ * queue reconciliation after the native queue becomes authoritative. */
+function isLegacyOrbitQueueRow(message: ChatMessage): boolean {
+  return Boolean(
+    message.role === "user"
+    && (message.status === "pending" || message.queueDelivery || message.queueHistoryPending)
+  );
 }
 
-export function beginPromptTransaction(
-  conversation: Conversation,
-  input: { message: string; attachments: Attachment[]; messageId: string; createdAt: string; queuedPayload?: string; forceQueued?: boolean; queuedDelivery?: "steer" | "follow_up" },
-): { conversation: Conversation; transaction: PromptTransaction } {
-  const isFirst = conversation.messages.every((item) => item.role !== "user");
-  const title = isFirst && conversation.title === "Nouvelle conversation"
-    ? makeTitle(input.message.trim() || input.attachments[0]?.name || "Nouvelle conversation")
-    : conversation.title;
-  const queued = input.forceQueued === true
-    || conversation.status === "streaming"
-    || conversation.status === "tool"
-    || conversation.status === "queued";
-  const status = queued
-    ? "queued"
-    : "streaming";
-  const localMessage: ChatMessage = {
-    id: input.messageId,
-    role: "user",
-    content: input.message.trim() || "Analyse les pièces jointes.",
-    createdAt: input.createdAt,
-    status: "pending",
-    attachments: input.attachments.map(durableAttachmentMetadata),
-    ...(queued ? {
-      queueDelivery: input.queuedDelivery ?? "follow_up",
-      queueObserved: false,
-      queueText: input.queuedPayload ?? input.message.trim(),
-    } : {}),
-  };
-  return {
-    conversation: {
-      ...conversation,
-      title,
-      hasContent: true,
-      status,
-      messages: [...conversation.messages, localMessage],
-      updatedAt: input.createdAt,
-    },
-    transaction: {
-      conversationId: conversation.id,
-      messageId: input.messageId,
-      previous: {
-        draft: conversation.draft,
-        hasContent: conversation.hasContent,
-        status: conversation.status,
-        title: conversation.title,
-        updatedAt: conversation.updatedAt,
-      },
-      optimisticStatus: status,
-      optimisticTitle: title,
-      optimisticUpdatedAt: input.createdAt,
-      previousMessageCount: conversation.messages.length,
-      previousActivityCount: conversation.activities.length,
-    },
-  };
+function stripLegacyOrbitQueueMessages(messages: ChatMessage[]): ChatMessage[] {
+  return messages.some(isLegacyOrbitQueueRow)
+    ? messages.filter((message) => !isLegacyOrbitQueueRow(message))
+    : messages;
 }
 
-/** Reconciles optimistic queue rows with Prime Agent's authoritative lanes.
- * A row stays out of the transcript while queued, then becomes a normal user
- * turn only on Prime Agent's user message_start. Queue snapshots describe
- * state, not transcript position: both an active and an empty snapshot may
- * arrive after the assistant reply and would otherwise invert the turn. */
-export function reconcileQueuedMessages(
-  conversation: Conversation,
-  actions: AgentSessionState["sessionActions"] | undefined,
-): Conversation {
-  if (!actions || !conversation.messages.some((message) => message.queueDelivery)) return conversation;
-  const visibleActions = normalizePrimeOrbitSessionActions(actions);
-  const available = {
-    steer: [...visibleActions.steering],
-    follow_up: [...visibleActions.followUps],
-  };
-  let changed = false;
-  const messages: ChatMessage[] = [];
-  for (const message of conversation.messages) {
-    const lane = message.queueDelivery;
-    if (!lane) {
-      messages.push(message);
-      continue;
-    }
-    const payload = message.queueText ?? message.content;
-    const index = available[lane].findIndex((text) => text === payload);
-    if (index >= 0) {
-      available[lane].splice(index, 1);
-      if (message.queueObserved) messages.push(message);
-      else {
-        changed = true;
-        messages.push({ ...message, queueObserved: true });
-      }
-      continue;
-    }
-    // A terminal/late snapshot can omit a row after its turn has already been
-    // persisted. Keep it hidden at its original anchor until message_start or
-    // the persisted history establishes the authoritative turn boundary.
-    messages.push(message);
-  }
-  const deliveredIndex = deliveredQueueCandidateIndex(conversation, visibleActions);
-  if (deliveredIndex >= 0) {
-    const delivered = messages[deliveredIndex];
-    if (delivered) {
-      changed = true;
-      messages[deliveredIndex] = {
-        ...withoutQueueMetadata(delivered),
-        queueHistoryPending: true,
-      };
-    }
-  }
-  return changed ? { ...conversation, hasContent: true, messages } : conversation;
-}
-
-/** Prime Agent's `running` action phase is emitted only after the queued user
- * message has reached message_end and is durable. Resolve one FIFO action that
- * is no longer represented by its authoritative lane. Steering wins across
- * lanes, matching Prime Agent's own delivery priority. */
-/** Prime Agent compacts `active.label` through compactRlmText: whitespace is
- * collapsed and prompts longer than 160 characters end with a literal "...".
- * Local rows hold the full text, so equality alone would miss every long
- * delivered prompt and leave its row stuck in the queue tray. */
-function matchesActiveLabel(localText: string, normalizedLabel: string): boolean {
-  const normalized = normalizeQueuedText(localText);
-  if (normalized === normalizedLabel) return true;
-  if (!normalizedLabel.endsWith("...")) return false;
-  const prefix = normalizedLabel.slice(0, -3);
-  return prefix.length > 0 && normalized.startsWith(prefix);
-}
-
-function deliveredQueueCandidateIndex(
-  conversation: Conversation,
-  actions: AgentSessionState["sessionActions"],
-): number {
-  const active = actions.active;
-  if (active?.kind !== "turn" || active.phase !== "running" || typeof active.label !== "string") return -1;
-  const normalizedLabel = normalizeQueuedText(active.label);
-  const activeAttachments = sanitizeAuthoritativeAttachments(actions.queueAttachments?.active ?? []);
-  if (!normalizedLabel && activeAttachments.length === 0) return -1;
-
-  for (const delivery of ["steer", "follow_up"] as const) {
-    const localCandidates = conversation.messages.flatMap((message, index) => (
-      message.queueDelivery === delivery
-      && matchesActiveLabel(message.queueText ?? message.content, normalizedLabel)
-      && sameAttachmentSet(message.attachments, activeAttachments)
-        ? [index]
-        : []
-    ));
-    if (localCandidates.length === 0) continue;
-    const laneTexts = delivery === "steer" ? actions.steering : actions.followUps;
-    const laneAttachments = delivery === "steer"
-      ? actions.queueAttachments?.steering ?? []
-      : actions.queueAttachments?.followUps ?? [];
-    const stillQueued = laneTexts.reduce((count, text, index) => (
-      normalizeQueuedText(text) === normalizedLabel
-      && sameAttachmentSet(laneAttachments[index], activeAttachments)
-        ? count + 1
-        : count
-    ), 0);
-    if (localCandidates.length > stillQueued) return localCandidates[0]!;
-  }
-  return -1;
-}
-
-function sameAttachmentSet(left: Attachment[] | undefined, right: Attachment[] | undefined) {
-  const leftAttachments = left ?? [];
-  const rightAttachments = right ?? [];
-  if (leftAttachments.length !== rightAttachments.length) return false;
-  return leftAttachments.every((attachment, index) => {
-    const candidate = rightAttachments[index];
-    if (!candidate) return false;
-    return attachment.name === candidate.name
-      && attachment.mimeType === candidate.mimeType
-      && attachment.size === candidate.size
-      && attachment.isImage === candidate.isImage;
-  });
-}
-
-function queuedDeliveryCandidateIndex(
-  conversation: Conversation,
-  normalizedText: string,
-  authoritativeAttachments: Attachment[],
-): number {
-  let candidates = conversation.messages.flatMap((message, index) => (
-    message.queueDelivery
-      && normalizeQueuedText(message.queueText ?? message.content) === normalizedText
-      && (normalizedText.length > 0 || (message.attachments?.length ?? 0) > 0 || authoritativeAttachments.length > 0)
-      ? [index]
-      : []
-  ));
-  if (candidates.length === 0) return -1;
-
-  // Native message metadata is the strongest identity available for duplicate
-  // prompts and cross-window collisions. Absence is meaningful too: a
-  // text-only event must never consume a same-text row that owns attachments.
-  candidates = candidates.filter((index) => (
-    sameAttachmentSet(conversation.messages[index]?.attachments, authoritativeAttachments)
-  ));
-  if (candidates.length === 0) return -1;
-  if (candidates.length === 1) return candidates[0]!;
-
-  // Prime Agent gives steering actions priority over follow-ups. Resolve a
-  // cross-lane duplicate only when that priority leaves one unique candidate;
-  // duplicate rows within the same lane remain history-owned.
-  const steering = candidates.filter((index) => conversation.messages[index]?.queueDelivery === "steer");
-  if (steering.length === 1) return steering[0]!;
-  return -1;
-}
-
-/** An accepted queue row can disappear without a message_start when it is
- * consumed before Orbit observes its lane (or while another conversation is
- * selected). In the terminal idle/empty state, reload the persisted session
- * instead of guessing where the user turn belongs. Prime Agent's JSONL
- * history is the ordering authority. */
-export function shouldReloadQueuedTranscript(
-  conversation: Conversation | undefined,
-  actions: AgentSessionState["sessionActions"] | undefined,
-  isCompacting = false,
-): boolean {
-  if (!conversation || !actions || actions.active || isCompacting) return false;
-  if (
-    (actions.queuedCount ?? 0) > 0
-    || (actions.steering?.length ?? 0) > 0
-    || (actions.followUps?.length ?? 0) > 0
-  ) return false;
-  return conversation.messages.some((message) => (
-    message.queueHistoryPending
-    || (message.queueDelivery && (message.queueAccepted || message.queueObserved))
-  ));
+export function stripLegacyOrbitQueueRows(conversation: Conversation): Conversation {
+  const messages = stripLegacyOrbitQueueMessages(conversation.messages);
+  return messages === conversation.messages
+    ? conversation
+    : { ...conversation, messages };
 }
 
 /** Normal bootstrap histories remain applicable without an epoch. A targeted
@@ -770,21 +553,8 @@ function normalizeQueuedText(value: string) {
   return value.replace(/\s+/g, " ").trim();
 }
 
-function withoutQueueMetadata(message: ChatMessage): ChatMessage {
-  const {
-    queueDelivery: _delivery,
-    queueObserved: _observed,
-    queueAccepted: _accepted,
-    queueText: _queueText,
-    queueHistoryPending: _historyPending,
-    ...delivered
-  } = message;
-  return { ...delivered, status: "complete" };
-}
-
-/** Places a queued user turn at its authoritative delivery position.
- * Prime Agent emits a user message_start immediately before the assistant turn;
- * using that event avoids exposing accepted prompts before they are consumed. */
+/** Appends only Prime Agent's authoritative user event. Orbit never promotes a
+ * local draft or queue row by comparing text, position, or attachments. */
 export function applyAuthoritativeUserMessageStart(
   conversation: Conversation,
   text: string,
@@ -798,99 +568,17 @@ export function applyAuthoritativeUserMessageStart(
   const authoritativeAttachments = eventAttachments.length
     ? eventAttachments
     : parsedContext.attachments;
-  if (authoritativeMessageId && conversation.messages.some((message) => (
+  const cleaned = stripLegacyOrbitQueueRows(conversation);
+  if (authoritativeMessageId && cleaned.messages.some((message) => (
     message.role === "user"
     && (message.id === authoritativeMessageId || message.entryId === authoritativeMessageId)
-  ))) return conversation;
-  const normalized = normalizeQueuedText(visibleText);
-  const queuedIndex = queuedDeliveryCandidateIndex(conversation, normalized, authoritativeAttachments);
-  if (queuedIndex >= 0) {
-    const messages = [...conversation.messages];
-    const [queued] = messages.splice(queuedIndex, 1);
-    if (!queued) return conversation;
-    messages.push(withoutQueueMetadata({
-      ...queued,
-      ...(authoritativeMessageId ? { entryId: authoritativeMessageId } : {}),
-      ...(!queued.attachments?.length && authoritativeAttachments.length
-        ? { attachments: authoritativeAttachments }
-        : {}),
-    }));
-    return { ...conversation, hasContent: true, messages };
-  }
-
-  const historyPendingCandidates = conversation.messages.flatMap((message, index) => (
-    message.role === "user"
-      && message.queueHistoryPending
-      && normalizeQueuedText(message.content) === normalized
-      && sameAttachmentSet(message.attachments, authoritativeAttachments)
-      ? [index]
-      : []
-  ));
-  if (historyPendingCandidates.length === 1) {
-    const index = historyPendingCandidates[0]!;
-    const current = conversation.messages[index]!;
-    const messages = [...conversation.messages];
-    messages[index] = withoutQueueMetadata({
-      ...current,
-      ...(authoritativeMessageId ? { entryId: authoritativeMessageId } : {}),
-      createdAt,
-      ...(!current.attachments?.length && authoritativeAttachments.length
-        ? { attachments: authoritativeAttachments }
-        : {}),
-    });
-    return { ...conversation, hasContent: true, messages };
-  }
-
-  const pendingCandidates = conversation.messages.flatMap((message, index) => (
-    message.role === "user"
-      && message.status === "pending"
-      && (
-        normalizeQueuedText(message.content) === normalized
-        || (!normalized && authoritativeAttachments.length > 0 && (message.attachments?.length ?? 0) > 0)
-      )
-      && (normalized.length > 0 || (message.attachments?.length ?? 0) > 0 || authoritativeAttachments.length > 0)
-      && sameAttachmentSet(message.attachments, authoritativeAttachments)
-      ? [index]
-      : []
-  ));
-  // Two windows can optimistically submit the same prompt before either sees
-  // the shared lifecycle. Without a native origin id, choosing one candidate
-  // would silently steal the other window's turn. Keep both local rows intact
-  // and append the authoritative event; persisted history will own the order.
-  if (pendingCandidates.length === 1) {
-    const pendingIndex = pendingCandidates[0]!;
-    const messages = [...conversation.messages];
-    const [pending] = messages.splice(pendingIndex, 1);
-    if (!pending) return conversation;
-    messages.push({
-      ...pending,
-      ...(authoritativeMessageId ? { entryId: authoritativeMessageId } : {}),
-      status: "complete",
-    });
-    return { ...conversation, hasContent: true, messages };
-  }
-
-  const lastVisible = [...conversation.messages].reverse().find((message) => !message.queueDelivery);
-  const conflictingEntryIdentity = Boolean(
-    authoritativeMessageId
-      && lastVisible?.entryId
-      && lastVisible.entryId !== authoritativeMessageId,
-  );
-  if (pendingCandidates.length === 0
-    && lastVisible?.role === "user"
-    && normalizeQueuedText(lastVisible.content) === normalized
-    && sameAttachmentSet(lastVisible.attachments, authoritativeAttachments)
-    && !conflictingEntryIdentity
-    && (normalized.length > 0 || (lastVisible.attachments?.length ?? 0) > 0 || authoritativeAttachments.length > 0)) {
-    return conversation;
-  }
-
-  if (!normalized && !authoritativeAttachments.length) return conversation;
+  ))) return cleaned;
+  if (!visibleText.trim() && !authoritativeAttachments.length) return cleaned;
 
   return {
-    ...conversation,
+    ...cleaned,
     hasContent: true,
-    messages: [...conversation.messages, {
+    messages: [...cleaned.messages, {
       id: authoritativeMessageId || uid("user"),
       ...(authoritativeMessageId ? { entryId: authoritativeMessageId } : {}),
       role: "user",
@@ -899,118 +587,6 @@ export function applyAuthoritativeUserMessageStart(
       status: "complete",
       attachments: authoritativeAttachments.length ? authoritativeAttachments : undefined,
     }],
-  };
-}
-
-export function commitPromptTransaction(conversation: Conversation, transaction: PromptTransaction): Conversation {
-  if (conversation.id !== transaction.conversationId) return conversation;
-  let changed = false;
-  const messages = conversation.messages.map((message) => {
-    if (message.id !== transaction.messageId || message.status !== "pending") return message;
-    changed = true;
-    return {
-      ...message,
-      status: "complete" as const,
-      ...(message.queueDelivery ? { queueAccepted: true } : {}),
-    };
-  });
-  return changed ? { ...conversation, messages } : conversation;
-}
-
-export function applyQueueMutationSnapshot(
-  actions: SessionActionSnapshot,
-  lane: "steering" | "followUp",
-  index: number,
-  expectedText: string,
-  mutation: QueueMutation,
-): SessionActionSnapshot {
-  const steering = [...(actions.steering ?? [])];
-  const followUps = [...(actions.followUps ?? [])];
-  const steeringAttachments = steering.map((_, attachmentIndex) => (
-    sanitizePrimeOrbitDocumentAttachments(actions.queueAttachments?.steering?.[attachmentIndex] ?? [])
-  ));
-  const followUpAttachments = followUps.map((_, attachmentIndex) => (
-    sanitizePrimeOrbitDocumentAttachments(actions.queueAttachments?.followUps?.[attachmentIndex] ?? [])
-  ));
-  const source = lane === "steering" ? steering : followUps;
-  const sourceAttachments = lane === "steering" ? steeringAttachments : followUpAttachments;
-  const actualIndex = source[index] === expectedText ? index : source.indexOf(expectedText);
-  if (actualIndex < 0) return actions;
-
-  if (mutation.type === "delete") {
-    source.splice(actualIndex, 1);
-    sourceAttachments.splice(actualIndex, 1);
-  } else if (mutation.type === "move") {
-    const destination = actualIndex + mutation.direction;
-    if (destination < 0 || destination >= source.length) return actions;
-    [source[actualIndex], source[destination]] = [source[destination]!, source[actualIndex]!];
-    [sourceAttachments[actualIndex], sourceAttachments[destination]] = [
-      sourceAttachments[destination]!,
-      sourceAttachments[actualIndex]!,
-    ];
-  } else {
-    const destination = mutation.lane === "steering" ? steering : followUps;
-    const destinationAttachments = mutation.lane === "steering" ? steeringAttachments : followUpAttachments;
-    if (destination === source) {
-      source.splice(actualIndex, 1, mutation.text);
-    } else {
-      source.splice(actualIndex, 1);
-      const [movedAttachments] = sourceAttachments.splice(actualIndex, 1);
-      destination.push(mutation.text);
-      destinationAttachments.push(movedAttachments ?? []);
-    }
-  }
-  return {
-    ...actions,
-    steering,
-    followUps,
-    queueAttachments: {
-      steering: steeringAttachments,
-      followUps: followUpAttachments,
-      ...(actions.queueAttachments?.active?.length
-        ? { active: sanitizePrimeOrbitDocumentAttachments(actions.queueAttachments.active) }
-        : {}),
-    },
-    queuedCount: steering.length + followUps.length,
-  };
-}
-
-/** A deleted queue row may have been the only reason activePromptRuns was set
- * while Compact owned the session. Clear that optimistic run marker only when
- * both the local transcript and Prime Agent's authoritative lanes are empty,
- * and never while an actual agent_start/agent_end lifecycle is active. */
-export function shouldClearPromptRunAfterQueueDeletion(
-  mutation: QueueMutation,
-  messages: ChatMessage[],
-  actions: SessionActionSnapshot | undefined,
-  hasActiveAgentLifecycle: boolean,
-): boolean {
-  if (mutation.type !== "delete" || hasActiveAgentLifecycle) return false;
-  if (messages.some((message) => Boolean(message.queueDelivery))) return false;
-  if (!actions) return true;
-  return (actions.steering?.length ?? 0) === 0
-    && (actions.followUps?.length ?? 0) === 0
-    && (actions.queuedCount ?? 0) === 0;
-}
-
-export function rollbackPromptTransaction(conversation: Conversation, transaction: PromptTransaction): Conversation {
-  if (conversation.id !== transaction.conversationId) return conversation;
-  const messages = conversation.messages.filter((message) => message.id !== transaction.messageId);
-  if (messages.length === conversation.messages.length) return conversation;
-  const hasConcurrentContent = messages.length !== transaction.previousMessageCount
-    || conversation.activities.length !== transaction.previousActivityCount;
-  return {
-    ...conversation,
-    messages,
-    status: conversation.status === transaction.optimisticStatus ? transaction.previous.status : conversation.status,
-    title: conversation.title === transaction.optimisticTitle ? transaction.previous.title : conversation.title,
-    hasContent: !hasConcurrentContent && conversation.hasContent === true
-      ? transaction.previous.hasContent
-      : conversation.hasContent,
-    draft: conversation.draft === "" ? transaction.previous.draft : conversation.draft,
-    updatedAt: conversation.updatedAt === transaction.optimisticUpdatedAt
-      ? transaction.previous.updatedAt
-      : conversation.updatedAt,
   };
 }
 
@@ -1789,26 +1365,6 @@ export function useAgentRuntime(options: {
     void loadConversationHistory(conversationId, token.generation, epoch).catch(() => undefined);
   }, [isCurrentSelection, loadConversationHistory, sendSelectionRequest]);
 
-  const reloadDeliveredQueueTranscript = useCallback((
-    conversationId: string,
-    actions: AgentSessionState["sessionActions"] | undefined,
-  ) => {
-    const token = activeSelection.current;
-    if (
-      token.conversationId !== conversationId
-      || !isCurrentSelection(conversationId, token.generation)
-      || activePromptRuns.current.has(conversationId)
-      || !shouldReloadQueuedTranscript(
-        getConversationRef.current(conversationId),
-        actions,
-        compactingConversations.current.has(conversationId),
-      )
-    ) return;
-    const epoch = transcriptEpoch.current.get(conversationId) ?? 0;
-    historyLoaded.current.delete(conversationId);
-    void loadConversationHistory(conversationId, token.generation, epoch).catch(() => undefined);
-  }, [isCurrentSelection, loadConversationHistory]);
-
   /** Apply a complete state snapshot without coupling it to the current
    * selection. Goal mutations and their final reconciliation belong to the
    * originating conversation and must survive navigation. */
@@ -1845,10 +1401,11 @@ export function useAgentRuntime(options: {
       // get_state is the daemon's authoritative answer after a renderer
       // listener gap. Purging both refs is essential: conversation.status alone
       // is not used to close the rapid-submit race, and a stale prompt marker
-      // would force the next genuinely idle prompt into follow_up.
+      // would make the next genuinely idle prompt look like active work.
       activeAgentLifecycles.current.delete(conversationId);
       activePromptRuns.current.delete(conversationId);
       cancelTerminalStateReconciliation(conversationId);
+      historyLoaded.current.delete(conversationId);
     }
     if (sessionState.isCompacting) compactingConversations.current.add(conversationId);
     else compactingConversations.current.delete(conversationId);
@@ -1861,15 +1418,8 @@ export function useAgentRuntime(options: {
         state: sessionState,
       },
     }));
-    // An authoritative snapshot is also a healing opportunity: when delivered
-    // queue rows are still waiting for their persisted turn, refresh the
-    // transcript now instead of waiting for the user to press refresh.
-    window.setTimeout(() => {
-      if (!isCurrentSelection(conversationId, activeSelection.current.generation)) return;
-      reloadDeliveredQueueTranscript(conversationId, sessionState.sessionActions);
-    }, 0);
     updateConversation(conversationId, (conversation) => {
-      const reconciled = reconcileQueuedMessages({
+      const authoritative = stripLegacyOrbitQueueRows({
         ...conversation,
         title: !conversation.sessionNameSyncPending && sessionState.sessionName?.trim()
           ? sessionState.sessionName.trim()
@@ -1886,10 +1436,10 @@ export function useAgentRuntime(options: {
           localOperationBlocksIdleRecovery,
         ),
         lastError: undefined,
-      }, sessionState.sessionActions);
+      });
       return shouldRecoverIdle
-        ? finalizeAuthoritativeIdleSnapshot(reconciled)
-        : reconciled;
+        ? finalizeAuthoritativeIdleSnapshot(authoritative)
+        : authoritative;
     });
     if (shouldRecoverIdle && !historyLoaded.current.has(conversationId)) {
       // A large get_messages response can race ahead of this recovery snapshot
@@ -1907,10 +1457,7 @@ export function useAgentRuntime(options: {
         void loadConversationHistory(conversationId, token.generation, epoch).catch(() => undefined);
       }, 0);
     }
-    if (!sessionState.isStreaming) {
-      window.setTimeout(() => reloadDeliveredQueueTranscript(conversationId, sessionState.sessionActions), 0);
-    }
-  }, [cancelTerminalStateReconciliation, isCurrentSelection, loadConversationHistory, reloadDeliveredQueueTranscript, updateConversation]);
+  }, [cancelTerminalStateReconciliation, isCurrentSelection, loadConversationHistory, updateConversation]);
 
   const handleResponse = useCallback(
     (conversationId: string, message: RpcEnvelope) => {
@@ -2608,14 +2155,17 @@ export function useAgentRuntime(options: {
         setRuntimeCompacting(conversationId, false, true);
         const presentation = compactionEndPresentation(event);
         const diagnostic = cleanDiagnostic(event.errorMessage);
+        const activeWorkRemains = sessionActionsHaveWork(
+          sessionActionsByConversation.current.get(conversationId),
+        );
         updateConversation(conversationId, (conversation) => ({
           ...conversation,
           status: presentation.failed
             ? "error"
             : event.willRetry === true
               ? "streaming"
-              : conversation.messages.some((message) => Boolean(message.queueDelivery))
-                ? "queued"
+              : activeWorkRemains
+                ? "streaming"
                 : activePromptRuns.current.has(conversationId)
                   ? "streaming"
                   : "idle",
@@ -2705,13 +2255,6 @@ export function useAgentRuntime(options: {
         } else if (pendingPlan) {
           void finalizePendingPlan(conversationId);
         }
-        window.setTimeout(() => {
-          const actions = sessionActionsByConversation.current.get(conversationId);
-          // agent_end is a stronger boundary than a possibly stale `active`
-          // field. Keep real remaining lanes, but ignore that stale marker when
-          // deciding whether the persisted transcript must resolve the turn.
-          reloadDeliveredQueueTranscript(conversationId, actions ? { ...actions, active: undefined } : actions);
-        }, 0);
         window.setTimeout(() => {
           const token = activeSelection.current;
           if (token.conversationId !== conversationId) return;
@@ -2809,11 +2352,10 @@ export function useAgentRuntime(options: {
           };
         });
         updateConversation(conversationId, (conversation) => {
-          const reconciled = reconcileQueuedMessages(conversation, actions);
+          const authoritative = stripLegacyOrbitQueueRows(conversation);
           const status = activeStatusForSessionActions(actions);
-          return status ? { ...reconciled, status } : reconciled;
+          return status ? { ...authoritative, status } : authoritative;
         });
-        window.setTimeout(() => reloadDeliveredQueueTranscript(conversationId, actions), 0);
         addActivity(conversationId, {
           id: "session-actions",
           type: eventType,
@@ -3015,7 +2557,7 @@ export function useAgentRuntime(options: {
         addActivity(conversationId, { type: eventType, title: humanizeEvent(eventType), status: "info", raw: event });
       }
     },
-    [addActivity, cancelTerminalStateReconciliation, finalizePendingPlan, flushWorkspaceState, handleResponse, invalidateCompactionHistory, isCurrentSelection, recentCompactionEnd, refreshAfterCompaction, refreshLocalRefinements, reloadDeliveredQueueTranscript, removeActivity, scheduleTerminalStateReconciliation, sendSelectionRequest, setGoalMutationState, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation],
+    [addActivity, cancelTerminalStateReconciliation, finalizePendingPlan, flushWorkspaceState, handleResponse, invalidateCompactionHistory, isCurrentSelection, recentCompactionEnd, refreshAfterCompaction, refreshLocalRefinements, removeActivity, scheduleTerminalStateReconciliation, sendSelectionRequest, setGoalMutationState, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation],
   );
 
   const consumeAgentEventLine = useCallback(({ conversationId, line }: { conversationId: string; line: string }) => {
@@ -3131,6 +2673,23 @@ export function useAgentRuntime(options: {
         getConversation(conversation.id) ?? conversation,
         expectedRuntimeModeTransitions.current.get(conversation.id),
       );
+      const modelRef = conversation.model ?? project.defaultModel;
+      const slash = modelRef?.indexOf("/") ?? -1;
+      const startOptions: StartAgentOptions = {
+        conversationId: conversation.id,
+        cwd: project.path,
+        sessionPath: conversation.sessionPath,
+        provider: slash > 0 ? modelRef?.slice(0, slash) : undefined,
+        model: slash > 0 ? modelRef?.slice(slash + 1) : modelRef,
+        thinking: conversation.thinkingLevel,
+        appendSystemPrompt: desiredRuntimeMode === "plan"
+          ? undefined
+          : buildRlmDelegationPrompt({
+              preferredModel: conversation.rlmPreferredModel,
+              thinkingLevel: conversation.rlmThinkingLevel,
+            }),
+        runtimeMode: desiredRuntimeMode,
+      };
       if (started.current.has(conversation.id)) {
         // The renderer can outlive a crashed/removed native client. Never trust
         // its local marker without checking the authoritative Rust registry.
@@ -3141,7 +2700,17 @@ export function useAgentRuntime(options: {
           started.current.delete(conversation.id);
           runtimeModes.current.delete(conversation.id);
         } else if (running.runtimeMode === desiredRuntimeMode) {
-          runtimeModes.current.set(conversation.id, running.runtimeMode);
+          // start_agent is idempotent for an existing runtime and is also its
+          // ownership handshake. Reclaim the interactive lease so unanswered
+          // native dialogs can be presented by this selected window.
+          const reacquired = await startAgent(startOptions);
+          if (!reacquired || reacquired.runtimeMode !== desiredRuntimeMode) {
+            throw new Error(planRuntimeText(
+              "Prime Orbit n’a pas pu reprendre les demandes interactives de cette conversation.",
+              "Prime Orbit could not reclaim this conversation's interactive requests.",
+            ));
+          }
+          runtimeModes.current.set(conversation.id, reacquired.runtimeMode);
           processExitErrors.current.delete(conversation.id);
           lastStderr.current.delete(conversation.id);
           return;
@@ -3161,23 +2730,6 @@ export function useAgentRuntime(options: {
       const existing = startInFlight.current.get(conversation.id);
       if (existing) return existing;
 
-      const modelRef = conversation.model ?? project.defaultModel;
-      const slash = modelRef?.indexOf("/") ?? -1;
-      const startOptions: StartAgentOptions = {
-        conversationId: conversation.id,
-        cwd: project.path,
-        sessionPath: conversation.sessionPath,
-        provider: slash > 0 ? modelRef?.slice(0, slash) : undefined,
-        model: slash > 0 ? modelRef?.slice(slash + 1) : modelRef,
-        thinking: conversation.thinkingLevel,
-        appendSystemPrompt: desiredRuntimeMode === "plan"
-          ? undefined
-          : buildRlmDelegationPrompt({
-              preferredModel: conversation.rlmPreferredModel,
-              thinkingLevel: conversation.rlmThinkingLevel,
-            }),
-        runtimeMode: desiredRuntimeMode,
-      };
       // A retry starts a new process attempt. Discard the previous terminal
       // diagnostic only here (not in ensureStarted, which can join an existing
       // attempt) so concurrent callers cannot erase a fresh exit error.
@@ -3201,11 +2753,6 @@ export function useAgentRuntime(options: {
           if (earlyExit) throw new Error(earlyExit);
           intentionallyStopped.current.delete(conversation.id);
           started.current.add(conversation.id);
-          // The native process retains unanswered dialogs across a renderer
-          // reload. Replay them only after this window has reacquired the
-          // interactive-owner lease; enqueueExtensionRequest is idempotent.
-          const pending = await listPendingExtensionUiRequests(conversation.id).catch(() => []);
-          pending.forEach(consumeAgentEventLine);
         })
         .finally(() => {
           if (startInFlight.current.get(conversation.id) === start) {
@@ -3215,7 +2762,7 @@ export function useAgentRuntime(options: {
       startInFlight.current.set(conversation.id, start);
       return start;
     },
-    [consumeAgentEventLine, detection?.error, detection?.installed, ensureRuntime, getConversation],
+    [detection?.error, detection?.installed, ensureRuntime, getConversation],
   );
 
   const waitForConversationActivation = useCallback(async (conversationId: string) => {
@@ -3327,6 +2874,19 @@ export function useAgentRuntime(options: {
               ), "AbortError");
             }
 
+            // The native process owns unanswered extension dialogs. Rebuild
+            // their React presentation on every selection bootstrap, including
+            // when the process already existed and only its interactive-owner
+            // lease had to be reclaimed.
+            const pendingUiRequests = await listPendingExtensionUiRequests(conversation.id);
+            if (!isCurrentSelection(conversation.id, token.generation)) {
+              throw new DOMException(planRuntimeText(
+                "Le chargement a été remplacé par une autre conversation.",
+                "The conversation load was replaced by another conversation.",
+              ), "AbortError");
+            }
+            pendingUiRequests.forEach(consumeAgentEventLine);
+
             // State and history are the only critical-path requests. Await the
             // state acknowledgement: merely writing get_state to a client that
             // exits one tick later is not a successful recovery.
@@ -3437,7 +2997,7 @@ export function useAgentRuntime(options: {
       });
       return trackedBootstrap;
     },
-    [addActivity, ensureProcessStarted, ensureRuntime, isCurrentSelection, loadConversationHistory, sendSelectionRequest, updateConversation, waitForConversationActivation],
+    [addActivity, consumeAgentEventLine, ensureProcessStarted, ensureRuntime, isCurrentSelection, loadConversationHistory, sendSelectionRequest, updateConversation, waitForConversationActivation],
   );
 
   const resynchronizeConversationForPrompt = useCallback(async (conversationId: string) => {
@@ -3631,13 +3191,7 @@ export function useAgentRuntime(options: {
       }));
     }
     void loadLocalConversationHistory(selectedConversation, selectedProject, token.generation).catch(() => undefined);
-    // Selecting a conversation is the last reliable moment to reconcile queue
-    // rows whose delivery completed while another conversation was focused.
-    window.setTimeout(() => {
-      const actions = sessionActionsByConversation.current.get(selectedConversation.id);
-      reloadDeliveredQueueTranscript(selectedConversation.id, actions);
-    }, 0);
-  }, [active, loadLocalConversationHistory, reloadDeliveredQueueTranscript, selectedConversation?.id, selectedConversation?.sessionId, selectedConversation?.sessionPath, selectedProject?.id, selectedProject?.path, updateConversation]);
+  }, [active, loadLocalConversationHistory, selectedConversation?.id, selectedConversation?.sessionId, selectedConversation?.sessionPath, selectedProject?.id, selectedProject?.path, updateConversation]);
 
   useEffect(() => {
     if (!active || !selectedConversation || !selectedProject || !detection) return;
@@ -3696,16 +3250,15 @@ export function useAgentRuntime(options: {
         || pendingCompactions.current.has(conversationId)
         || compactingConversations.current.has(conversationId)
         || sessionActionsHaveWork(sessionActions);
-      const effectiveDelivery = normalizeConnectingPromptDelivery(
+      const compactionOwnsSession = pendingCompactions.current.has(conversationId)
+        || compactingConversations.current.has(conversationId);
+      const effectiveDelivery = resolveNativePromptDelivery(
         beforeStart.status,
         requestedDelivery,
         hasTrackedWork,
+        compactionOwnsSession,
       );
-      const forceQueued = effectiveDelivery !== undefined
-        || hasTrackedWork
-        || beforeStart.status === "streaming"
-        || beforeStart.status === "tool"
-        || beforeStart.status === "queued";
+      const forceQueued = effectiveDelivery !== undefined;
       cancelTerminalStateReconciliation(conversationId);
       // Invalidate any get_state request issued before this local admission.
       // Otherwise an idle bootstrap response could arrive in the narrow gap
@@ -3731,43 +3284,24 @@ export function useAgentRuntime(options: {
         pendingPromptAdmissions.current.delete(conversationId);
       }
       const content = trimmed;
-      const preparation: { value?: ReturnType<typeof beginPromptTransaction> } = {};
-      const messageId = uid("user");
-      const createdAt = now();
-      // useWorkspace evaluates this functional updater against its synchronous
-      // authoritative ref. Building the transaction inside it prevents a
-      // render-stale snapshot from restoring an old draft or dropping a
-      // concurrent runtime event.
-      updateConversation(conversationId, (current) => {
-        const prepared = beginPromptTransaction(current, {
-          message: trimmed,
-          attachments,
-          messageId,
-          createdAt,
-          queuedPayload: content,
-          forceQueued,
-          queuedDelivery: effectiveDelivery,
-        });
-        preparation.value = prepared;
-        return prepared.conversation;
-      });
-      const prepared = preparation.value;
-      if (!prepared) {
-        throw new Error("La conversation n’est plus disponible.");
-      }
       if (!isNative()) {
-        updateConversation(conversationId, (conversation) => commitPromptTransaction(conversation, prepared.transaction));
+        updateConversation(conversationId, (conversation) => ({
+          ...applyAuthoritativeUserMessageStart(
+            conversation,
+            content,
+            now(),
+            attachments.map(durableAttachmentMetadata),
+          ),
+          status: "streaming",
+        }));
         window.setTimeout(() => {
           activePromptRuns.current.delete(conversationId);
           updateConversation(conversationId, (conversation) => {
-            const delivered = forceQueued
-              ? applyAuthoritativeUserMessageStart(conversation, content, now())
-              : conversation;
             return {
-              ...delivered,
+              ...conversation,
               status: "idle",
               messages: [
-                ...delivered.messages,
+                ...conversation.messages,
                 {
                   id: uid("assistant"),
                   role: "assistant",
@@ -3795,7 +3329,6 @@ export function useAgentRuntime(options: {
             ? { streamingBehavior: effectiveDelivery === "steer" ? "steer" : "followUp" }
             : {}),
         }, { expectedRuntimeMode });
-        updateConversation(conversationId, (conversation) => commitPromptTransaction(conversation, prepared.transaction));
         if (forceQueued) {
           const token = activeSelection.current;
           window.setTimeout(() => {
@@ -3804,156 +3337,15 @@ export function useAgentRuntime(options: {
           }, 50);
         }
       } catch (error) {
-        // The RPC was rejected before reaching Prime Agent's stdin: roll the
-        // optimistic message back and stop tracking a run that never started.
-        // Keeping the marker would force every later prompt into queued
-        // delivery until an agent_end that can never arrive.
+        // The RPC was rejected before reaching Prime Agent's stdin. No local
+        // transcript or queue row exists to roll back: Prime Agent remains the
+        // only source of visible messages and queued actions.
         activePromptRuns.current.delete(conversationId);
-        updateConversation(conversationId, (conversation) => rollbackPromptTransaction(conversation, prepared.transaction));
         throw error;
       }
     },
     [cancelTerminalStateReconciliation, ensureStarted, isCurrentSelection, resynchronizeConversationForPrompt, selectedConversation, selectedProject, sendSelectionRequest, updateConversation],
   );
-
-  const mutateQueuedMessage = useCallback(async (input: {
-    messageId: string;
-    lane: "steering" | "followUp";
-    index: number;
-    expectedText: string;
-    mutation: QueueMutation;
-  }) => {
-    if (!selectedConversation || !selectedProject) return;
-    const conversationId = selectedConversation.id;
-    await ensureStarted(selectedConversation, selectedProject);
-    const token = activeSelection.current;
-    const refresh = () => {
-      if (!isCurrentSelection(conversationId, token.generation)) return;
-      void sendSelectionRequest(conversationId, token.generation, "get_state").catch(() => undefined);
-    };
-    const initialActions = sessionActionsByConversation.current.get(conversationId)
-      ?? runtimes[conversationId]?.state?.sessionActions;
-    const expectedLane = [
-      ...(input.lane === "steering" ? initialActions?.steering ?? [] : initialActions?.followUps ?? []),
-    ];
-    const hadLocalRow = Boolean(
-      getConversationRef.current(conversationId)?.messages.some((message) => (
-        message.id === input.messageId && message.queueDelivery
-      )),
-    );
-    const reconcileMutationRace = async () => {
-      if (!isCurrentSelection(conversationId, token.generation)) return false;
-      try {
-        await sendSelectionRequest(conversationId, token.generation, "get_state");
-      } catch {
-        return false;
-      }
-      const actions = sessionActionsByConversation.current.get(conversationId);
-      if (!actions) return false;
-      let localRowWasDelivered = false;
-      updateConversation(conversationId, (conversation) => {
-        const reconciled = reconcileQueuedMessages(conversation, actions);
-        localRowWasDelivered = hadLocalRow && !reconciled.messages.some((message) => (
-          message.id === input.messageId && message.queueDelivery
-        ));
-        return reconciled;
-      });
-      window.setTimeout(() => reloadDeliveredQueueTranscript(conversationId, actions), 0);
-      if (localRowWasDelivered) return true;
-      const currentLane = input.lane === "steering" ? actions.steering : actions.followUps;
-      return !hadLocalRow
-        && (currentLane.length < expectedLane.length || currentLane[input.index] !== input.expectedText);
-    };
-
-    if (expectedLane[input.index] !== input.expectedText) {
-      const delivered = await reconcileMutationRace();
-      if (input.mutation.type === "delete" && delivered) return;
-      throw new Error("La file a changé entre-temps. Elle vient d’être resynchronisée.");
-    }
-
-    let status;
-    try {
-      status = await mutateAgentQueue({ conversationId, ...input, expectedLane });
-    } catch (error) {
-      const delivered = await reconcileMutationRace();
-      if (input.mutation.type === "delete" && delivered) return;
-      if (delivered) {
-        throw new Error("Cette instruction a déjà été livrée à Prime Agent et ne peut plus être modifiée.");
-      }
-      throw error;
-    }
-    const staleInactiveDelete = status === "inactive" && input.mutation.type === "delete";
-    if (status !== "applied" && !staleInactiveDelete) {
-      const delivered = await reconcileMutationRace();
-      if (input.mutation.type === "delete" && delivered) return;
-      if (delivered) {
-        throw new Error("Cette instruction a déjà été livrée à Prime Agent et ne peut plus être modifiée.");
-      }
-      if (status === "inactive") {
-        throw new Error("Cette instruction n’est plus modifiable car la session Prime Agent a déjà quitté la file active.");
-      }
-      if (status === "unsupported") {
-        throw new Error("Ce runtime Prime Agent ne permet pas encore de modifier sa file d’attente.");
-      }
-      throw new Error(status === "rejected"
-        ? "La file a changé entre-temps. Elle vient d’être resynchronisée."
-        : "Prime Agent a refusé cette modification de la file.");
-    }
-
-    const previousActions = runtimes[conversationId]?.state?.sessionActions;
-    const nextActions = previousActions
-      ? applyQueueMutationSnapshot(previousActions, input.lane, input.index, input.expectedText, input.mutation)
-      : undefined;
-    setRuntimes((current) => {
-      const runtime = current[conversationId];
-      if (!runtime?.state) return current;
-      const sessionActions = applyQueueMutationSnapshot(
-        runtime.state.sessionActions,
-        input.lane,
-        input.index,
-        input.expectedText,
-        input.mutation,
-      );
-      if (sessionActions === runtime.state.sessionActions) return current;
-      return {
-        ...current,
-        [conversationId]: {
-          ...runtime,
-          state: { ...runtime.state, sessionActions },
-        },
-      };
-    });
-    let conversationAfterMutation: Conversation | undefined;
-    updateConversation(conversationId, (conversation) => {
-      let messages = conversation.messages;
-      if (input.mutation.type === "delete") {
-        messages = messages.filter((message) => message.id !== input.messageId);
-      } else if (input.mutation.type === "replace") {
-        const replacement = input.mutation;
-        messages = messages.map((message) => message.id === input.messageId ? {
-          ...message,
-          content: replacement.text,
-          queueText: replacement.text,
-          queueDelivery: replacement.lane === "steering" ? "steer" as const : "follow_up" as const,
-          queueAccepted: true,
-          queueObserved: true,
-        } : message);
-      }
-      const updated = messages === conversation.messages ? conversation : { ...conversation, messages };
-      const reconciled = nextActions ? reconcileQueuedMessages(updated, nextActions) : updated;
-      conversationAfterMutation = reconciled;
-      return reconciled;
-    });
-    if (conversationAfterMutation && shouldClearPromptRunAfterQueueDeletion(
-      input.mutation,
-      conversationAfterMutation.messages,
-      nextActions,
-      activeAgentLifecycles.current.has(conversationId),
-    )) {
-      activePromptRuns.current.delete(conversationId);
-    }
-    window.setTimeout(refresh, 50);
-  }, [ensureStarted, isCurrentSelection, reloadDeliveredQueueTranscript, runtimes, selectedConversation, selectedProject, sendSelectionRequest, updateConversation]);
 
   const retryMessage = useCallback(async (assistantMessageId: string) => {
     if (!selectedConversation) return;
@@ -3974,20 +3366,124 @@ export function useAgentRuntime(options: {
 
   const abort = useCallback(async () => {
     if (!selectedConversation) return;
+    const conversationId = selectedConversation.id;
+    let confirmedIdle = false;
     try {
-      await sendRpc(selectedConversation.id, { id: uid("abort"), type: "abort" });
+      await sendRpc(conversationId, { id: uid("abort"), type: "abort" });
+      const token = activeSelection.current;
+      if (isCurrentSelection(conversationId, token.generation)) {
+        for (let attempt = 0; attempt < 6; attempt += 1) {
+          let response: RpcEnvelope | void;
+          try {
+            response = await sendSelectionRequest(conversationId, token.generation, "get_state", true);
+          } catch {
+            break;
+          }
+          const state = asRecord(response?.data) as unknown as AgentSessionState | undefined;
+          if (response?.success !== false && state && isAuthoritativeIdleSessionSnapshot(state)) {
+            confirmedIdle = true;
+            break;
+          }
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 75));
+        }
+      }
     } finally {
-      activeAgentLifecycles.current.delete(selectedConversation.id);
-      activePromptRuns.current.delete(selectedConversation.id);
-      directRefinementActivities.current.delete(selectedConversation.id);
-      uncertainRefinementConversations.current.delete(selectedConversation.id);
-      setRuntimeRefining(selectedConversation.id, false);
-      updateConversation(selectedConversation.id, (conversation) => ({
-        ...finalizeConversationTools(conversation, "cancelled", now()),
-        status: "idle",
-      }));
+      if (confirmedIdle) {
+        activeAgentLifecycles.current.delete(conversationId);
+        activePromptRuns.current.delete(conversationId);
+        directRefinementActivities.current.delete(conversationId);
+        uncertainRefinementConversations.current.delete(conversationId);
+        setRuntimeRefining(conversationId, false);
+        updateConversation(conversationId, (conversation) => ({
+          ...finalizeConversationTools(conversation, "cancelled", now()),
+          status: "idle",
+        }));
+      }
     }
-  }, [selectedConversation, setRuntimeRefining, updateConversation]);
+  }, [isCurrentSelection, selectedConversation, sendSelectionRequest, setRuntimeRefining, updateConversation]);
+
+  const recoverPlanQuestions = useCallback(async () => {
+    if (!selectedConversation) return;
+    const conversationId = selectedConversation.id;
+    const token = activeSelection.current;
+    const queuedBeforeAbort = sessionActionsByConversation.current.get(conversationId)?.queuedCount ?? 0;
+    await sendRpc(conversationId, { id: uid("recover-plan-abort"), type: "abort" }, {
+      expectedRuntimeMode: "plan",
+    });
+    const resumeResult = await resumeAgentQueue(conversationId);
+    if (resumeResult.status === "unavailable") {
+      throw new Error(planRuntimeText(
+        "La session Prime Agent n’est plus active dans le daemon.",
+        "The Prime Agent session is no longer active in the daemon.",
+      ));
+    }
+    if (resumeResult.status === "unsupported") {
+      throw new Error(planRuntimeText(
+        "Cette version de Prime Agent ne permet pas de reprendre sa file après un arrêt.",
+        "This Prime Agent version cannot resume its queue after an abort.",
+      ));
+    }
+
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      if (!isCurrentSelection(conversationId, token.generation)) {
+        throw new DOMException(planRuntimeText(
+          "La récupération a été remplacée par une autre conversation.",
+          "Recovery was replaced by another conversation.",
+        ), "AbortError");
+      }
+      const response = await sendSelectionRequest(conversationId, token.generation, "get_state", true);
+      if (response?.success === false) {
+        throw new Error(response.error ?? planRuntimeText(
+          "Prime Agent n’a pas pu confirmer l’état de la session.",
+          "Prime Agent could not confirm the session state.",
+        ));
+      }
+      const state = asRecord(response?.data) as unknown as AgentSessionState | undefined;
+      if (state) {
+        const queuedNow = state.sessionActions?.queuedCount ?? 0;
+        if (state.isStreaming && queuedBeforeAbort > 0 && queuedNow < queuedBeforeAbort) {
+          // Prime Agent consumed the instruction that was already queued. Its
+          // next extension_ui_request will rebuild the real form normally.
+          return;
+        }
+        if (!state.isStreaming && queuedNow === 0) {
+          activeAgentLifecycles.current.delete(conversationId);
+          activePromptRuns.current.delete(conversationId);
+          directRefinementActivities.current.delete(conversationId);
+          uncertainRefinementConversations.current.delete(conversationId);
+          setRuntimeRefining(conversationId, false);
+          updateConversation(conversationId, (conversation) => ({
+            ...finalizeConversationTools(conversation, "cancelled", now()),
+            status: "starting",
+            lastError: undefined,
+          }));
+          stateEpoch.current.set(conversationId, (stateEpoch.current.get(conversationId) ?? 0) + 1);
+          transcriptEpoch.current.set(conversationId, (transcriptEpoch.current.get(conversationId) ?? 0) + 1);
+          activePromptRuns.current.add(conversationId);
+          try {
+            await sendRpc(conversationId, {
+              id: uid("recover-plan-prompt"),
+              type: "prompt",
+              message:
+                "[Prime Orbit recovery] The previous Plan dialogs were lost during a client reconnection. "
+                + "Ask every still unresolved planning question again with prime_orbit_plan_question, one at a time. "
+                + "Do not reuse the cancelled tool calls.",
+            }, { expectedRuntimeMode: "plan" });
+          } catch (error) {
+            activePromptRuns.current.delete(conversationId);
+            updateConversation(conversationId, { status: "idle" });
+            throw error;
+          }
+          return;
+        }
+      }
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 100));
+    }
+    throw new Error(planRuntimeText(
+      "Prime Agent n’a pas libéré les anciennes questions dans le délai prévu.",
+      "Prime Agent did not release the previous questions in time.",
+    ));
+  }, [isCurrentSelection, selectedConversation, sendSelectionRequest, setRuntimeRefining, updateConversation]);
 
   const closeRuntime = useCallback(async () => {
     if (!selectedConversation) return;
@@ -4800,10 +4296,50 @@ export function useAgentRuntime(options: {
       && isTrustedPlanUiRequest(request, runtimeModes.current.get(request.conversationId))
   ));
   useEffect(() => {
+    if (
+      !isNative()
+      || !eventsReady
+      || !selectedConversation
+      || !selectedProject
+      || planExtensionRequest
+      || !["starting", "streaming", "tool", "queued"].includes(selectedConversation.status)
+    ) {
+      return;
+    }
+    const conversationId = selectedConversation.id;
+    const generation = activeSelection.current.generation;
+    // A renderer refresh can lose React's transient dialog queue while the
+    // native RPC client still owns the unanswered requests. Re-read that
+    // authoritative queue whenever active Plan work has no visible dialog.
+    void ensureStarted(selectedConversation, selectedProject)
+      .then(() => listPendingExtensionUiRequests(conversationId))
+      .then((requests) => {
+        if (!isCurrentSelection(conversationId, generation)) return;
+        requests.forEach(consumeAgentEventLine);
+      })
+      .catch(() => undefined);
+  }, [consumeAgentEventLine, ensureStarted, eventsReady, isCurrentSelection, planExtensionRequest?.requestKey, selectedConversation?.id, selectedConversation?.status, selectedProject?.id]);
+  useEffect(() => {
     if (!planExtensionRequest || !selectedConversation) return;
+    // Answering a Plan question updates the persisted state before the native
+    // response write resolves. Do not reopen that same request during this
+    // short await; once it is acknowledged and removed, the next cached
+    // question becomes the active request naturally.
+    if (extensionResponsesInFlight.current.has(planExtensionRequest.requestKey)) return;
     const decoded = decodePlanUiRequestTitle(planExtensionRequest.title);
-    if (decoded?.payload.kind !== "review") return;
     const currentState = conversationPlanState(selectedConversation);
+    if (!decoded) return;
+    if (decoded.payload.kind !== "review") {
+      if (currentState.phase === "question" && currentState.question?.requestId === planExtensionRequest.id) return;
+      const opened = openPlanQuestion(currentState, { request: planExtensionRequest });
+      if (opened.status !== "accepted" || !opened.changed) return;
+      updateConversation(selectedConversation.id, {
+        status: "tool",
+        planMode: opened.state,
+        planArtifactId: selectedConversation.planArtifactId ?? crypto.randomUUID(),
+      });
+      return;
+    }
     if (currentState.document) return;
     const document = planDocumentForReview(
       selectedConversation,
@@ -4853,8 +4389,8 @@ export function useAgentRuntime(options: {
     ensureStarted,
     setConversationRuntimeMode,
     retryPlanFinalization: finalizePendingPlan,
+    recoverPlanQuestions,
     sendPrompt,
-    mutateQueuedMessage,
     retryMessage,
     abort,
     closeRuntime,
@@ -5030,7 +4566,9 @@ interface ReconciledToolEvent {
 }
 
 const isPendingTool = (tool: ToolActivity) => tool.status === "queued" || tool.status === "running";
-const isTerminalTool = (tool: ToolActivity) => !isPendingTool(tool);
+const isTerminalTool = (tool: ToolActivity) => tool.status === "completed"
+  || tool.status === "failed"
+  || tool.status === "cancelled";
 const normalizedToolName = (value: unknown) => textValue(value)?.toLocaleLowerCase();
 
 function comparableToolInput(value: unknown): string {
@@ -5610,12 +5148,12 @@ export function mapAgentMessages(messages: unknown[]): ChatMessage[] {
           id,
           name,
           title: humanizeToolName(name),
-          // A saved assistant toolCall without its matching toolResult has no
-          // proof of success; represent it as terminal but cancelled.
-          status: "cancelled",
+          // A saved toolCall without its matching toolResult proves neither
+          // cancellation nor completion. Live lifecycle events may still be
+          // pending (notably extension UI questions), so keep it neutral.
+          status: "unresolved",
           input: historicalToolInput(name, block.arguments),
           startedAt: createdAt,
-          endedAt: createdAt,
         }];
       });
       const content = extractMessageText(message);
@@ -5849,9 +5387,10 @@ export function reconcileRpcTranscript(
   current: ChatMessage[],
   rpc: ChatMessage[],
 ): ChatMessage[] {
-  return rpc.length === 0 && current.length > 0
-    ? current
-    : mergeHistoricalAttachmentPreviews(rpc, current);
+  const durableCurrent = stripLegacyOrbitQueueMessages(current);
+  return rpc.length === 0 && durableCurrent.length > 0
+    ? durableCurrent
+    : mergeHistoricalAttachmentPreviews(rpc, durableCurrent);
 }
 
 /** If an empty RPC response won the initial race, let the validated session
@@ -5860,9 +5399,11 @@ export function reconcileLocalTranscriptAfterRpc(
   current: ChatMessage[],
   local: ChatMessage[],
 ): ChatMessage[] {
-  return current.length === 0
-    ? local
-    : mergeHistoricalAttachmentPreviews(current, local);
+  const durableCurrent = stripLegacyOrbitQueueMessages(current);
+  const durableLocal = stripLegacyOrbitQueueMessages(local);
+  return durableCurrent.length === 0
+    ? durableLocal
+    : mergeHistoricalAttachmentPreviews(durableCurrent, durableLocal);
 }
 
 function historyTimestamp(value: unknown): string {
@@ -6126,9 +5667,4 @@ function summarizeGoal(value: unknown) {
   if (!value || typeof value !== "object") return undefined;
   const goal = value as Record<string, unknown>;
   return [goal.objective, goal.status].filter(Boolean).join(" · ").slice(0, 220);
-}
-
-function makeTitle(input: string) {
-  const words = input.replace(/\s+/g, " ").trim().split(" ").slice(0, 7).join(" ");
-  return words.length > 52 ? `${words.slice(0, 49)}…` : words || "Nouvelle conversation";
 }

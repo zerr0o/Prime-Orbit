@@ -5,7 +5,7 @@ export type SettingsSectionId = "general" | "appearance" | "agent" | "models" | 
 export type ThemeMode = "dark" | "light" | "system";
 export type PermissionPreset = "guarded" | "standard" | "autonomous";
 export type ConversationStatus = "idle" | "starting" | "streaming" | "tool" | "queued" | "error" | "offline";
-export type ToolStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type ToolStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "unresolved";
 
 export interface Project {
   id: string;

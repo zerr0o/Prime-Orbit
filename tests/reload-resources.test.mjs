@@ -11,7 +11,9 @@ const {
   busyReason,
   createOwnedRequestIdSeed,
   daemonDescriptorKey,
+  inspectOwnedSession,
   reloadAgentResources,
+  resumeQueuedWork,
   resolveDaemonSocketPath,
   selectSession,
   selectOwnedClientDescriptor,
@@ -83,6 +85,11 @@ test("selects only the ready client-owned worker for the exact daemon and sessio
     ownerClientId,
     "the exact session file remains authoritative after a runtime session id replacement",
   );
+  assert.equal(
+    selectOwnedClientDescriptor([{ ...ownedDescriptor, version: 2 }], request, generationSocket)?.ownerClientId,
+    ownerClientId,
+    "Prime Agent v0.8 worker descriptors remain eligible for exact owner reattachment",
+  );
   assert.throws(
     () => selectOwnedClientDescriptor([ownedDescriptor, { ...ownedDescriptor, pid: 4243 }], request, generationSocket),
     /Plusieurs sessions Prime Agent propriétaires/u,
@@ -142,9 +149,33 @@ test("accepts only the bounded native reload action", () => {
   assert.equal(validRequest(request), true);
   assert.equal(validRequest({ action: "shutdown" }), true);
   assert.equal(validRequest({ action: "shutdown", sessionFile: request.sessionFile }), false);
+  assert.equal(validRequest({ ...request, action: "inspect_owned_session" }), true);
   assert.equal(validRequest({ ...request, action: "prompt" }), false);
   assert.equal(validRequest({ ...request, sessionFile: "" }), false);
   assert.equal(validRequest({ ...request, sessionId: "x".repeat(513) }), false);
+});
+
+test("detects an exact active owned session without mutating it", async () => {
+  const commands = [];
+  const client = {
+    async request(command) {
+      commands.push(command);
+      return {
+        success: true,
+        data: { sessions: [{ ...request, activeSessionId: "owned-active" }] },
+      };
+    },
+  };
+
+  assert.deepEqual(
+    await inspectOwnedSession(client, { ...request, action: "inspect_owned_session" }, hello, ownedDescriptor),
+    { status: "active", supported: true, activeSessionId: "owned-active" },
+  );
+  assert.deepEqual(commands, [{ type: "list", all: true, includeClientOwned: true }]);
+  assert.deepEqual(
+    await inspectOwnedSession(client, { ...request, action: "inspect_owned_session" }, hello, undefined),
+    { status: "inactive", supported: true },
+  );
 });
 
 test("stops the exact managed daemon and waits until its socket disappears", async () => {
@@ -243,6 +274,46 @@ test("reloads the exact active session without submitting a prompt", async () =>
   assert.deepEqual(commands[2], { type: "reload", activeSessionId: "daemon-session" });
   assert.equal(calls[2].timeoutMs, RELOAD_REQUEST_TIMEOUT_MS);
   assert.equal(commands.some(({ type }) => type === "prompt"), false);
+});
+
+test("resumes the exact native queue without admitting another session action", async () => {
+  const calls = [];
+  const client = {
+    async request(command, timeoutMs) {
+      calls.push({ command, timeoutMs });
+      if (command.type === "list") {
+        return { success: true, data: { sessions: [{ ...request, activeSessionId: "daemon-session" }] } };
+      }
+      if (command.type === "resume_queue") return { success: true };
+      throw new Error(`unexpected command ${command.type}`);
+    },
+  };
+
+  assert.deepEqual(
+    await resumeQueuedWork(client, { ...request, action: "resume_queue" }, hello),
+    { status: "resumed", supported: true },
+  );
+  assert.deepEqual(calls.map(({ command }) => command), [
+    { type: "list", all: true, includeClientOwned: true },
+    { type: "resume_queue", activeSessionId: "daemon-session" },
+  ]);
+  assert.equal(calls[1].timeoutMs, 5_000);
+});
+
+test("treats an empty native queue as resumed because suspension is still cleared", async () => {
+  const client = {
+    async request(command) {
+      if (command.type === "list") {
+        return { success: true, data: { sessions: [{ ...request, activeSessionId: "daemon-session" }] } };
+      }
+      return { success: false, error: "No queued work to resume" };
+    },
+  };
+
+  assert.deepEqual(
+    await resumeQueuedWork(client, { ...request, action: "resume_queue" }, hello),
+    { status: "resumed", supported: true },
+  );
 });
 
 test("keeps a slow reload request pending until the daemon actually answers", async () => {

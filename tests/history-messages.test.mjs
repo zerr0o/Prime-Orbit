@@ -189,7 +189,7 @@ test("strips hydrated queue and active payloads before renderer state or matchin
   assert.doesNotMatch(JSON.stringify(actions), /secret queue|C:\\\\Users/u);
 });
 
-test("rehydrates historical tool calls by id with terminal states and bounded payloads", () => {
+test("rehydrates historical tool calls by id with terminal or unresolved states and bounded payloads", () => {
   const oversized = "x".repeat(20_000);
   const assistantTimestamp = 1_720_000_000_000;
   const successTimestamp = assistantTimestamp + 2_000;
@@ -262,8 +262,8 @@ test("rehydrates historical tool calls by id with terminal states and bounded pa
 
   const unmatched = mapped[2].tools[0];
   assert.equal(unmatched.id, "call-without-result");
-  assert.equal(unmatched.status, "cancelled");
-  assert.equal(unmatched.endedAt, new Date(orphanTimestamp).toISOString());
+  assert.equal(unmatched.status, "unresolved");
+  assert.equal(unmatched.endedAt, undefined);
 });
 
 test("hides Prime Agent's internal IPython restore envelope without hiding real conversation text", () => {

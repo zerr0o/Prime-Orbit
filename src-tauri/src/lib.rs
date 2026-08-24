@@ -114,6 +114,7 @@ pub fn run() {
             agents::send_rpc,
             agents::mutate_agent_queue,
             agents::reload_agent_resources,
+            agents::resume_agent_queue,
             agents::stop_agent,
             agents::restart_agent,
             agents::list_running_agents,

@@ -28,6 +28,7 @@ const {
   isSupportedDroppedImage,
   mergeAttachmentSelection,
   moveSlashCommandSelection,
+  nativeComposerDelivery,
   parseActiveComposerSlashCommand,
   releaseConversationAttachmentDrafts,
   resolveComposerActionSubmission,
@@ -142,14 +143,9 @@ test("keeps unsent handle-backed attachments scoped to their conversation and re
   await releaseConversationAttachmentDrafts("conversation-b");
 });
 
-test("renders queued rows in Prime Agent order with exact mutable indexes", () => {
+test("renders only Prime Agent's authoritative queue in native lane order", () => {
   const queuedDocument = { id: "queued-doc", name: "queued.pdf", mimeType: "application/pdf", size: 2048, isImage: false };
   const rows = buildQueuedRows({
-    messages: [
-      { id: "local-first", content: "First", queueDelivery: "follow_up", queueText: "First" },
-      { id: "local-second", content: "Second", queueDelivery: "follow_up", queueText: "Second" },
-    ],
-  }, {
     sessionActions: {
       queuedCount: 3,
       steering: ["External steer"],
@@ -161,12 +157,19 @@ test("renders queued rows in Prime Agent order with exact mutable indexes", () =
     },
   });
 
-  assert.deepEqual(rows.map((row) => [row.id, row.lane, row.index, row.expectedText]), [
-    ["remote-queue:steer:0:External steer", "steering", 0, "External steer"],
-    ["local-second", "followUp", 0, "Second"],
-    ["local-first", "followUp", 1, "First"],
+  assert.deepEqual(rows.map((row) => [row.id, row.delivery, row.text]), [
+    ["prime-agent-queue:steer:0", "steer", "External steer"],
+    ["prime-agent-queue:follow_up:0", "follow_up", "Second"],
+    ["prime-agent-queue:follow_up:1", "follow_up", "First"],
   ]);
   assert.deepEqual(rows[0].attachments, [queuedDocument]);
+});
+
+test("matches Prime Agent's native Enter and Alt+Enter delivery behavior", () => {
+  assert.equal(nativeComposerDelivery(false, false, false), undefined);
+  assert.equal(nativeComposerDelivery(true, false, false), "steer");
+  assert.equal(nativeComposerDelivery(true, false, true), "follow_up");
+  assert.equal(nativeComposerDelivery(false, true, false), "follow_up");
 });
 
 test("slash palette combines wired Orbit commands with authoritative Prime Agent commands", () => {
