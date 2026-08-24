@@ -4,6 +4,27 @@ All notable changes to Prime Orbit are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.26] - 2026-08-24
+
+### Native Plan mode
+
+- Added a conversation-scoped **Normal / Plan** selector and `/plan` command. Plan mode launches Prime Agent in an isolated process with only three embedded read-only tools, no discovered extensions, skills, prompt templates, shell, MCP, Python, or delegation tools, plus a deny-by-default tool-call gate.
+- Added blocking Plan questions through Prime Agent's public extension UI protocol, including structured choices, free-text answers, explicit cancellation, revision feedback, bilingual states, and Windows attention notifications only when no Orbit WebView is focused.
+- Rendered the submitted Markdown plan in the conversation and saved accepted plans atomically under `.prime/plans/` with bounded inputs, project/runtime attestation, link and reparse-point checks, collision-safe no-replace publication, and stable ownership markers.
+- Added **Apply**, **Keep**, and **Revise** actions. Apply restarts the same session in the Normal runtime and immediately admits the approved document as the implementation source of truth; Keep exits without implementation; Revise returns bounded feedback without saving the rejected candidate.
+
+### Recovery and ownership
+
+- Persisted a staged Plan handoff before consuming the native review response, then reconciled reloads against cached extension UI requests and a stable canonical transcript marker so Apply cannot be silently lost or blindly sent twice.
+- Restricted extension UI responses and mode-changing restarts to the current native interactive owner, claimed each pending response atomically, and broadcast resolution so stale windows dismiss their copy.
+- Preserved full bounded Plan tool inputs through history reloads, including documents above the generic 16,000-character diagnostic limit, and replayed missing reviews after canonical history hydration.
+- Added a native no-owner notification fallback with generic privacy-safe copy, verified multi-WebView focus suppression, process-wide deduplication, and the explicit Windows default notification sound.
+
+### Validation
+
+- Added 27 Plan state/protocol regressions, targeted runtime handoff coverage, native ownership/storage/notification tests, and a 47-check Prime Agent extension harness.
+- Revalidated 229 frontend tests, 195 native tests, TypeScript, the production Vite build, strict Clippy, Rust 1.88 compatibility, and the embedded extension's strict Prime Agent v0.8.0 type contract.
+
 ## [0.1.25] - 2026-08-24
 
 ### External links
