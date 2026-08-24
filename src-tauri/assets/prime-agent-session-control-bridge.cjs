@@ -154,18 +154,20 @@ function resolveDaemonSocketPath(explicitSocketPath, defaultDaemonSocketPath, pl
   return explicitSocketPath;
 }
 
+function validSessionTarget(request) {
+  return typeof request.sessionFile === "string"
+    && request.sessionFile.length > 0
+    && request.sessionFile.length <= 32_768
+    && (request.sessionId === undefined
+      || (typeof request.sessionId === "string" && request.sessionId.length > 0 && request.sessionId.length <= 512));
+}
+
 function validRequest(request) {
   return request
     && typeof request === "object"
     && !Array.isArray(request)
-    && (request.action === "shutdown"
-      ? Object.keys(request).length === 1
-      : request.action === "reload"
-        && typeof request.sessionFile === "string"
-        && request.sessionFile.length > 0
-        && request.sessionFile.length <= 32_768
-        && (request.sessionId === undefined
-          || (typeof request.sessionId === "string" && request.sessionId.length > 0 && request.sessionId.length <= 512)));
+    && ((request.action === "shutdown" && Object.keys(request).length === 1)
+      || ((request.action === "reload" || request.action === "resume_queue") && validSessionTarget(request)));
 }
 
 function selectSession(sessions, request) {
@@ -245,6 +247,49 @@ async function reloadAgentResources(client, request, hello) {
   }
 
   return { status: "reloaded", supported: true };
+}
+
+/** Re-arm queued-input admission after an abort-driven suspension (manual
+ * compactions suspend the pump through requestAbort and never resume it). A
+ * falsy daemon reply only means nothing selectable was waiting; admission was
+ * still resumed as a side effect, so both outcomes unblock new sends. */
+async function resumeQueuedWork(client, request, hello) {
+  if (!validRequest(request)) throw new Error("Requête de reprise Prime Agent invalide.");
+  if (!Number.isInteger(hello?.protocol?.version) || hello.protocol.version < SUPPORTED_PROTOCOL_VERSION) {
+    return unsupported("daemon_protocol");
+  }
+
+  const list = await client.request({ type: "list", all: true, includeClientOwned: true }, 5_000);
+  if (!list.success) throw new Error(list.error || "Prime Agent a refusé de lister les sessions.");
+  const sessions = Array.isArray(list.data?.sessions) ? list.data.sessions : [];
+  const session = selectSession(sessions, request);
+  if (!session?.activeSessionId) {
+    return { status: "unavailable", supported: true, reason: "inactive_session" };
+  }
+
+  let response;
+  try {
+    response = await client.request({
+      type: "resume_queue",
+      activeSessionId: session.activeSessionId,
+    }, 5_000);
+  } catch (error) {
+    if (error?.name === "DaemonCapabilityUnavailableError") {
+      return unsupported("daemon_command");
+    }
+    throw error;
+  }
+  if (!response.success) {
+    const detail = typeof response.error === "string" ? response.error.toLowerCase() : "";
+    if (detail.includes("no queued work")) {
+      return { status: "resumed", supported: true };
+    }
+    if (detail.includes("unknown command") || detail.includes("unsupported")) {
+      return unsupported("daemon_command");
+    }
+    throw new Error(response.error || "Prime Agent a refusé de reprendre la file d’entrée.");
+  }
+  return { status: "resumed", supported: true };
 }
 
 function delay(milliseconds) {
@@ -327,7 +372,9 @@ async function main() {
   try {
     await client.connect(3_000);
     const hello = await client.waitForHello(3_000);
-    const result = await reloadAgentResources(client, request, hello);
+    const result = request.action === "resume_queue"
+      ? await resumeQueuedWork(client, request, hello)
+      : await reloadAgentResources(client, request, hello);
     process.stdout.write(JSON.stringify(result));
   } finally {
     client.close();
@@ -337,6 +384,7 @@ async function main() {
 module.exports = {
   DAEMON_SHUTDOWN_TIMEOUT_MS,
   RELOAD_REQUEST_TIMEOUT_MS,
+  resumeQueuedWork,
   SUPPORTED_PROTOCOL_VERSION,
   bindOwnedClientIdentity,
   busyReason,

@@ -86,6 +86,21 @@ test("requires opaque native handles for every file and localizes expired-handle
   assert.match(attachmentSubmitError(new Error("handle expiré"), "fr"), /plus disponible/i);
 });
 
+test("localizes conversation activation failures without mixing languages", () => {
+  assert.equal(
+    attachmentSubmitError(new DOMException("La conversation n’est plus active.", "AbortError"), "en"),
+    "Could not send: the conversation is no longer active.",
+  );
+  assert.equal(
+    attachmentSubmitError(new DOMException("The conversation is no longer active.", "AbortError"), "fr"),
+    "Envoi impossible : la conversation n’est plus active.",
+  );
+  assert.equal(
+    attachmentSubmitError(new DOMException("Le chargement a été remplacé par une autre conversation.", "AbortError"), "en"),
+    "Send cancelled: another conversation was opened.",
+  );
+});
+
 test("accepts supported dropped images without requiring an exposed path", () => {
   assert.equal(isSupportedDroppedImage({ name: "capture.png", type: "image/png" }), true);
   assert.equal(isSupportedDroppedImage({ name: "capture.webp", type: "" }), true);

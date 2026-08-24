@@ -1533,7 +1533,7 @@ fn schedule_idle_release(agents: AgentsState, conversation_id: String, pid: u32)
                 .flatten()
         };
         if let Some(agent) = agent {
-            let _ = terminate_child(&mut agent.child.lock());
+            let _ = stop_rpc_client(&agent.child, &agent.stdin);
         }
     });
 }
@@ -1970,7 +1970,13 @@ fn emit_exit_once(
     let _ = app.emit("prime-agent://exit", event);
 }
 
-fn terminate_child(child: &mut Child) -> Result<ExitStatus, String> {
+/// Terminates only Orbit's RPC client process.
+///
+/// Prime Agent's supervisor is shared by every RPC client in a managed
+/// generation and may be a descendant of whichever client connected first.
+/// Killing the Windows process tree here would therefore terminate unrelated
+/// conversations as well as the shared supervisor.
+fn terminate_rpc_client(child: &mut Child) -> Result<ExitStatus, String> {
     if let Some(status) = child
         .try_wait()
         .map_err(|error| format!("Impossible d’inspecter Prime Agent: {error}"))?
@@ -1978,53 +1984,26 @@ fn terminate_child(child: &mut Child) -> Result<ExitStatus, String> {
         return Ok(status);
     }
 
-    #[cfg(windows)]
-    {
-        use crate::runtime::{capture_command_output, external_command, find_program};
-        use std::ffi::OsString;
-
-        if let Some(taskkill) = find_program("taskkill") {
-            let arguments = [
-                OsString::from("/PID"),
-                OsString::from(child.id().to_string()),
-                OsString::from("/T"),
-                OsString::from("/F"),
-            ];
-            let mut command = external_command(&taskkill, &arguments);
-            if let Ok(output) = capture_command_output(&mut command) {
-                if output.status.success() {
-                    return child.wait().map_err(|error| {
-                        format!("Impossible de finaliser l’arrêt de Prime Agent: {error}")
-                    });
-                }
-            }
-        }
-    }
-
-    child
-        .kill()
-        .map_err(|error| format!("Impossible d’arrêter Prime Agent: {error}"))?;
-    child
-        .wait()
-        .map_err(|error| format!("Impossible de finaliser l’arrêt: {error}"))
-}
-
-/// Emergency restart first kills only Orbit's RPC client. Prime Agent's
-/// daemon can be shared by other conversations, so a process-tree kill is a
-/// last resort rather than the default. `terminate_child` supplies that
-/// Windows `/T /F` fallback when the direct termination cannot be performed.
-fn terminate_rpc_client_for_restart(child: &mut Child) -> Result<ExitStatus, String> {
-    if let Some(status) = child
-        .try_wait()
-        .map_err(|error| format!("Impossible d’inspecter Prime Agent: {error}"))?
-    {
-        return Ok(status);
-    }
     match child.kill() {
         Ok(()) => child.wait().map_err(|error| {
             format!("Impossible de finaliser l’arrêt du client Prime Agent: {error}")
         }),
-        Err(_) => terminate_child(child),
+        Err(error) => {
+            // The process may have exited between try_wait() and kill(). Treat
+            // that race as success, but never broaden the target to a process
+            // tree when the exact client cannot be terminated.
+            if let Some(status) = child.try_wait().map_err(|inspect_error| {
+                format!(
+                    "Impossible d’arrêter le client Prime Agent ({error}) ni de confirmer sa fin: {inspect_error}"
+                )
+            })? {
+                Ok(status)
+            } else {
+                Err(format!(
+                    "Impossible d’arrêter le client Prime Agent sans interrompre les autres sessions: {error}"
+                ))
+            }
+        }
     }
 }
 
@@ -2048,7 +2027,7 @@ fn wait_for_child_until(
     }
 }
 
-fn close_rpc_stdin_for_restart(stdin: &Arc<Mutex<Option<ChildStdin>>>) -> Result<(), String> {
+fn close_rpc_stdin(stdin: &Arc<Mutex<Option<ChildStdin>>>) -> Result<(), String> {
     let Some(mut stdin) = stdin.lock().take() else {
         return Ok(());
     };
@@ -2069,6 +2048,24 @@ fn close_rpc_stdin_for_restart(stdin: &Arc<Mutex<Option<ChildStdin>>>) -> Result
     // Dropping the only retained ChildStdin is the protocol's graceful EOF.
     drop(stdin);
     write_result
+}
+
+fn stop_rpc_client(
+    child: &Arc<Mutex<Child>>,
+    stdin: &Arc<Mutex<Option<ChildStdin>>>,
+) -> Result<ExitStatus, String> {
+    let graceful_request_error = close_rpc_stdin(stdin).err();
+    if let Some(status) = wait_for_child_until(child, RESTART_GRACEFUL_EXIT_TIMEOUT)? {
+        // A write can race a process that already completed its own shutdown.
+        // The observed process exit is authoritative in that case.
+        return Ok(status);
+    }
+
+    terminate_rpc_client(&mut child.lock()).map_err(|error| {
+        graceful_request_error
+            .map(|graceful| format!("{graceful}\n\n{error}"))
+            .unwrap_or(error)
+    })
 }
 
 fn wait_for_forced_session_release(
@@ -2138,21 +2135,12 @@ fn stop_rpc_client_for_restart(
         "Prime Agent n’a pas encore publié son fichier de session. Le client reste actif car sa libération ne pourrait pas être attestée; resynchronisez son état puis réessayez."
             .to_string()
     })?;
-    let graceful_request_error = close_rpc_stdin_for_restart(stdin).err();
-    if wait_for_child_until(child, RESTART_GRACEFUL_EXIT_TIMEOUT)?.is_some() {
-        // RPC shutdown intentionally catches a failed
-        // `complete_owned_session` request before exiting. Even exit code 0
-        // is therefore not sufficient proof by itself: the exact lease must
-        // be gone (or safely reclaimable from a dead owner) before resume.
-    } else {
-        terminate_rpc_client_for_restart(&mut child.lock())?;
-    }
-
-    wait_for_forced_session_release(app, session_path, cwd).map_err(|error| {
-        graceful_request_error
-            .map(|graceful| format!("{graceful}\n\n{error}"))
-            .unwrap_or(error)
-    })
+    stop_rpc_client(child, stdin)?;
+    // RPC shutdown intentionally catches a failed `complete_owned_session`
+    // request before exiting. Even exit code 0 is therefore not sufficient
+    // proof by itself: the exact lease must be gone (or safely reclaimable
+    // from a dead owner) before resume.
+    wait_for_forced_session_release(app, session_path, cwd)
 }
 
 fn request_runtime_state_after_restart(
@@ -3578,6 +3566,7 @@ fn restart_agent_blocking(
 
 struct StopAgentSnapshot {
     child: Arc<Mutex<Child>>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     exit_emitted: Arc<AtomicBool>,
     pid: u32,
     restarting: bool,
@@ -3613,13 +3602,14 @@ fn stop_agent_blocking(
         }
         StopAgentSnapshot {
             child: Arc::clone(&agent.child),
+            stdin: Arc::clone(&agent.stdin),
             exit_emitted: Arc::clone(&agent.exit_emitted),
             pid: agent.info.pid,
             restarting: agent.restarting,
         }
     };
 
-    let status = terminate_child(&mut snapshot.child.lock())?;
+    let status = stop_rpc_client(&snapshot.child, &snapshot.stdin)?;
 
     {
         let mut map = agents.0.lock();
@@ -3954,8 +3944,17 @@ pub fn running_agent_count(agents: &AgentsState) -> usize {
 pub fn shutdown_all_agents(app: &AppHandle, agents: &AgentsState) {
     let running: Vec<_> = agents.0.lock().drain().collect();
     for (conversation_id, agent) in running {
-        let status = terminate_child(&mut agent.child.lock());
+        let status = stop_rpc_client(&agent.child, &agent.stdin);
         emit_exit_once(app, &conversation_id, &agent.exit_emitted, status, None);
+    }
+
+    // RPC clients do not own the managed supervisor process. Shut down each
+    // exact private daemon only after all clients have released their sessions.
+    let targets: Vec<_> = agents.2.lock().values().cloned().collect();
+    for target in targets {
+        if shutdown_managed_daemon_for_update(&target).is_ok() {
+            agents.2.lock().remove(&target.socket);
+        }
     }
 }
 
@@ -4025,10 +4024,7 @@ pub fn shutdown_all_agents_for_update(app: &AppHandle, agents: &AgentsState) -> 
     let mut failed = Vec::new();
 
     for (conversation_id, agent) in running {
-        let status = {
-            let mut child = agent.child.lock();
-            terminate_child(&mut child)
-        };
+        let status = stop_rpc_client(&agent.child, &agent.stdin);
         match status {
             Ok(status) => {
                 emit_exit_once(app, &conversation_id, &agent.exit_emitted, Ok(status), None)
@@ -4074,16 +4070,16 @@ mod tests {
         acquire_owner_lease, append_diagnostic_tail, apply_direct_session_operation_runtime_event,
         apply_launch_option_update, begin_owned_resource_reload, begin_rpc_admission,
         begin_runtime_write, begin_update_installation, cache_pending_extension_ui_request,
-        close_rpc_stdin_for_restart, conflicting_session_conversation,
-        direct_session_operation_runtime_event, ensure_update_installation_is_idle,
-        finish_resource_reload, finish_runtime_write, is_extension_ui_request,
-        is_plan_review_request, is_reload_acknowledgement_timeout, lease_absence_attests_release,
-        managed_daemon_shutdown_target, managed_generation_daemon_socket,
-        mark_resource_reload_unknown, owner_may_send, parsed_extension_ui_request,
-        public_runtime_line, release_owner_lease_state, requested_launch_option_update,
-        restart_slot_matches, rpc_launch_arguments, rpc_starts_busy_operation, runtime_busy_state,
-        runtime_launch_options, runtime_mode_matches_expected, runtime_session_id,
-        runtime_session_path, should_emit_resources_reloaded, terminal_clears_pending_extension_ui,
+        close_rpc_stdin, conflicting_session_conversation, direct_session_operation_runtime_event,
+        ensure_update_installation_is_idle, finish_resource_reload, finish_runtime_write,
+        is_extension_ui_request, is_plan_review_request, is_reload_acknowledgement_timeout,
+        lease_absence_attests_release, managed_daemon_shutdown_target,
+        managed_generation_daemon_socket, mark_resource_reload_unknown, owner_may_send,
+        parsed_extension_ui_request, public_runtime_line, release_owner_lease_state,
+        requested_launch_option_update, restart_slot_matches, rpc_launch_arguments,
+        rpc_starts_busy_operation, runtime_busy_state, runtime_launch_options,
+        runtime_mode_matches_expected, runtime_session_id, runtime_session_path,
+        should_emit_resources_reloaded, terminal_clears_pending_extension_ui, terminate_rpc_client,
         validate_queue_lane, validate_queue_mutation, validate_reload_result, wait_for_child_until,
         waiter_may_remove_slot, AgentOperations, AgentResourcesReloadedEvent, AgentRuntimeMode,
         AgentsState, DirectSessionOperationKind, DirectSessionOperationRuntimeEvent,
@@ -4097,8 +4093,9 @@ mod tests {
     use serde_json::{json, Value};
     use std::{
         collections::HashSet,
+        io::{BufRead, BufReader},
         path::{Path, PathBuf},
-        process::Stdio,
+        process::{Command, Stdio},
         sync::{Arc, Barrier},
         thread,
         time::Duration,
@@ -5462,11 +5459,77 @@ mod tests {
         let stdin = Arc::new(Mutex::new(child.stdin.take()));
         let child = Arc::new(Mutex::new(child));
 
-        close_rpc_stdin_for_restart(&stdin).expect("close retained RPC stdin");
+        close_rpc_stdin(&stdin).expect("close retained RPC stdin");
         assert!(stdin.lock().is_none(), "the retained pipe must be consumed");
         let status = wait_for_child_until(&child, Duration::from_secs(5))
             .expect("wait for EOF fixture")
             .expect("EOF fixture should exit promptly");
         assert!(status.success(), "EOF fixture exited with {status}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn terminating_one_rpc_client_preserves_its_shared_descendant() {
+        struct ExactProcessCleanup(u32);
+        impl Drop for ExactProcessCleanup {
+            fn drop(&mut self) {
+                let _ = Command::new("powershell.exe")
+                    .args([
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        &format!(
+                            "Stop-Process -Id {} -Force -ErrorAction SilentlyContinue",
+                            self.0
+                        ),
+                    ])
+                    .status();
+            }
+        }
+
+        let mut command = Command::new("powershell.exe");
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$shared = Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60' -PassThru; [Console]::Out.WriteLine($shared.Id); [Console]::Out.Flush(); Wait-Process -Id $shared.Id",
+        ]);
+        crate::runtime::hide_secondary_console(&mut command);
+        let mut rpc_client = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn RPC-client topology fixture");
+        let stdout = rpc_client.stdout.take().expect("topology fixture stdout");
+        let mut line = String::new();
+        BufReader::new(stdout)
+            .read_line(&mut line)
+            .expect("read shared descendant pid");
+        let descendant_pid = line.trim().parse::<u32>().expect("numeric descendant pid");
+        let _cleanup = ExactProcessCleanup(descendant_pid);
+
+        terminate_rpc_client(&mut rpc_client).expect("terminate only the RPC client");
+        thread::sleep(Duration::from_millis(150));
+        let descendant_is_alive = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "if (Get-Process -Id {} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}",
+                    descendant_pid
+                ),
+            ])
+            .status()
+            .expect("inspect shared descendant")
+            .success();
+        assert!(
+            descendant_is_alive,
+            "stopping one RPC client must not kill the shared supervisor descendant"
+        );
     }
 }

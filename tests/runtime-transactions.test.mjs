@@ -19,6 +19,7 @@ new Function("module", "exports", "require", buildResult.outputFiles[0].text)(
   require,
 );
 const {
+  activeStatusForSessionActions,
   applyAuthoritativeUserMessageStart,
   applyQueueMutationSnapshot,
   applyRuntimeCompactingState,
@@ -26,12 +27,15 @@ const {
   compactResponseDisposition,
   compactionEndPresentation,
   commitPlanRuntimeModeTransition,
+  canResumePendingPlanFinalization,
+  conversationStatusForSessionSnapshot,
   commitPromptTransaction,
   conversationHasPlanHandoff,
   conversationPlanState,
   planDocumentForReview,
   runtimeModeForConversationPlan,
   runtimeModeForPlan,
+  sessionActionsHaveWork,
   desiredRuntimeModeForConversation,
   durableAttachmentMetadata,
   enqueueExtensionRequest,
@@ -42,11 +46,16 @@ const {
   isAuthoritativeIdleSessionSnapshot,
   isTransientHistoryReadFailure,
   isTransientHistoryResponseFailure,
+  isOptionalSelectionResponseFailure,
+  isRecoverableConversationActivationError,
+  isRecoverableRuntimeBootstrapError,
   mapAgentMessages,
   mergeHistoricalAttachmentPreviews,
   normalizeConnectingPromptDelivery,
   promptAttachmentPayload,
+  reconcileLocalTranscriptAfterRpc,
   reconcileQueuedMessages,
+  reconcileRpcTranscript,
   recordedPlanResponseValue,
   rollbackPromptTransaction,
   selectForkEntryId,
@@ -213,6 +222,77 @@ test("a transient get_messages timeout never masquerades as a runtime failure", 
   }), false);
 });
 
+test("optional bootstrap probes never masquerade as a conversation failure", () => {
+  for (const command of [
+    "get_available_models",
+    "get_commands",
+    "get_session_stats",
+    "list_schedules",
+    "get_heartbeat",
+    "list_heartbeats",
+  ]) {
+    assert.equal(isOptionalSelectionResponseFailure({
+      command,
+      success: false,
+      error: `Cannot send daemon command "${command}" because the Prime Agent daemon is not connected.`,
+    }), true, command);
+  }
+  assert.equal(isOptionalSelectionResponseFailure({
+    command: "list_heartbeats",
+    success: false,
+    error: "Unknown command: list_heartbeats",
+  }), true);
+  assert.equal(isOptionalSelectionResponseFailure({
+    command: "list_heartbeats",
+    success: false,
+    error: "Session permission denied",
+  }), false, "unexpected passive-read failures remain visible");
+  assert.equal(isOptionalSelectionResponseFailure({
+    command: "get_state",
+    success: false,
+    error: 'Cannot send daemon command "get_state" because the Prime Agent daemon is not connected.',
+  }), false);
+  assert.equal(isOptionalSelectionResponseFailure({ command: "prompt", success: false }), false);
+  assert.equal(isOptionalSelectionResponseFailure({ command: "manage_heartbeat", success: false }), false);
+  assert.equal(isOptionalSelectionResponseFailure({ command: "list_heartbeats", success: true }), false);
+});
+
+test("only transient selection races qualify for automatic prompt recovery", () => {
+  assert.equal(isRecoverableConversationActivationError(
+    new DOMException("La conversation n’est plus active.", "AbortError"),
+  ), true);
+  assert.equal(isRecoverableConversationActivationError(
+    new DOMException("The conversation load was replaced by another conversation.", "AbortError"),
+  ), true);
+  assert.equal(isRecoverableConversationActivationError(
+    new Error("La conversation n’est plus active."),
+  ), false, "an unrelated error with the same text is not retried");
+  assert.equal(isRecoverableConversationActivationError(
+    new DOMException("La fenêtre se ferme.", "AbortError"),
+  ), false);
+});
+
+test("only lost native clients and daemon lease races qualify for runtime bootstrap recovery", () => {
+  assert.equal(isRecoverableRuntimeBootstrapError(
+    new Error("Aucun Prime Agent actif pour conversation-123"),
+  ), true);
+  assert.equal(isRecoverableRuntimeBootstrapError(
+    new Error("SessionAlreadyActiveError: Session is already active in 17e1c622ab16"),
+  ), true);
+  assert.equal(isRecoverableRuntimeBootstrapError(
+    new Error("Session is registered to a failed worker that could not be safely reclaimed"),
+  ), true);
+  assert.equal(isRecoverableRuntimeBootstrapError(
+    new Error('Cannot send daemon command "get_state" because the Prime Agent daemon is not connected.'),
+  ), true);
+  assert.equal(isRecoverableRuntimeBootstrapError(
+    new Error('Cannot send daemon command "prompt" because the Prime Agent daemon is not connected.'),
+  ), false, "a prompt transport failure must never be replayed automatically");
+  assert.equal(isRecoverableRuntimeBootstrapError(
+    new Error("Cannot find package 'zeromq'"),
+  ), false, "installation failures remain actionable instead of looping");
+});
+
 test("an empty RPC history cannot be relatched into local-history loading", () => {
   const hydratedEmptyConversation = conversation({
     status: "idle",
@@ -276,6 +356,32 @@ test("uses only a quiescent daemon state snapshot as an idle recovery boundary",
       active: { kind: "turn", phase: "running" },
     },
   })), false);
+});
+
+test("an active daemon session action remains visible and forces queued prompt delivery", () => {
+  const activePlanTool = idleSessionSnapshot({
+    sessionActions: {
+      queuedCount: 0,
+      steering: [],
+      followUps: [],
+      active: { kind: "turn", phase: "running", label: "prime_orbit_plan_submit" },
+    },
+  });
+  assert.equal(sessionActionsHaveWork(activePlanTool.sessionActions), true);
+  assert.equal(activeStatusForSessionActions(activePlanTool.sessionActions), "streaming");
+  assert.equal(conversationStatusForSessionSnapshot(activePlanTool, "idle", false), "streaming");
+  assert.equal(canResumePendingPlanFinalization(activePlanTool, false), false);
+  assert.equal(canResumePendingPlanFinalization(idleSessionSnapshot(), true), false);
+  assert.equal(canResumePendingPlanFinalization(idleSessionSnapshot(), false), true);
+  assert.equal(conversationStatusForSessionSnapshot(idleSessionSnapshot({
+    sessionActions: {
+      queuedCount: 0,
+      steering: [],
+      followUps: [],
+      active: { kind: "session_command", phase: "committing" },
+    },
+  }), "idle", false), "tool");
+  assert.equal(activeStatusForSessionActions(idleSessionSnapshot().sessionActions), undefined);
 });
 
 test("rejects an idle snapshot requested before a newer prompt or lifecycle epoch", () => {
@@ -561,6 +667,27 @@ test("merges a locally generated historical thumbnail after RPC history wins the
   assert.equal(merged.attachments[1].name, "notes.txt");
   assert.equal("path" in merged.attachments[1], false);
   assert.equal("attachmentHandle" in merged.attachments[1], false);
+});
+
+test("an empty RPC transcript never erases a validated persisted conversation", () => {
+  const localMessage = {
+    id: "persisted-user",
+    role: "user",
+    content: "Existing session content",
+    createdAt: "2026-08-24T18:30:27.390Z",
+    status: "complete",
+  };
+  const current = [localMessage];
+  assert.equal(
+    reconcileRpcTranscript(current, []),
+    current,
+    "an empty daemon response preserves the already rendered transcript by identity",
+  );
+  assert.deepEqual(
+    reconcileLocalTranscriptAfterRpc([], current),
+    current,
+    "local history fills the transcript when an empty RPC response won the race",
+  );
 });
 
 test("never resurrects attachments onto a different or attachment-free historical turn", () => {

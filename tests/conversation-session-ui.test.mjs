@@ -32,6 +32,7 @@ const {
   harnessConfirmationPhrase,
   isConversationMaintenanceBlocked,
   isConversationTurnActive,
+  planModeTransitionError,
   isGoalPanelBusy,
   isRefineControlBusy,
   normalizeLegacyActivity,
@@ -109,6 +110,18 @@ test("maintenance stays unavailable while connecting or while a real turn is act
   assert.equal(isConversationMaintenanceBlocked("tool"), true);
   assert.equal(isConversationMaintenanceBlocked("queued"), true);
   assert.equal(isConversationMaintenanceBlocked("idle"), false);
+});
+
+test("localizes the native Plan busy rejection with the application language", () => {
+  const nativeError = new Error("Le mode de cette conversation ne peut changer que lorsque Prime Agent est au repos.");
+  assert.equal(
+    planModeTransitionError(nativeError, "en"),
+    "The conversation mode can only be changed while Prime Agent is idle.",
+  );
+  assert.equal(
+    planModeTransitionError(nativeError, "fr"),
+    "Le mode de cette conversation ne peut changer que lorsque Prime Agent est au repos.",
+  );
 });
 
 test("legacy child activities preserve a parent-managed closure as neutral", () => {

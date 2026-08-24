@@ -1903,7 +1903,7 @@ function Composer({ project, conversation, models, favoriteModels, commands, sta
       await onPlanMode(mode);
       return true;
     } catch (error) {
-      setCommandError(error instanceof Error ? error.message : String(error));
+      setCommandError(planModeTransitionError(error, language));
       return false;
     } finally {
       setPlanModeBusy(false);
@@ -3761,7 +3761,36 @@ export function attachmentSubmitError(error: unknown, language: AppLanguage) {
       "The attachment is no longer available. Select it again.",
     );
   }
+  if (/^(La conversation n’est plus active\.|The conversation is no longer active\.)$/.test(detail)) {
+    return bi(
+      language,
+      "Envoi impossible : la conversation n’est plus active.",
+      "Could not send: the conversation is no longer active.",
+    );
+  }
+  if (/^(Le chargement a été remplacé par une autre conversation\.|The conversation load was replaced by another conversation\.)$/.test(detail)) {
+    return bi(
+      language,
+      "Envoi annulé : une autre conversation a été ouverte.",
+      "Send cancelled: another conversation was opened.",
+    );
+  }
   return `${bi(language, "Envoi impossible.", "Could not send.")} ${detail}`.trim();
+}
+
+export function planModeTransitionError(error: unknown, language: AppLanguage) {
+  const detail = error instanceof Error ? error.message : String(error);
+  if (
+    detail.includes("Le mode de cette conversation ne peut changer que lorsque Prime Agent est au repos.")
+    || detail.includes("The conversation mode can only be changed while Prime Agent is idle.")
+  ) {
+    return bi(
+      language,
+      "Le mode de cette conversation ne peut changer que lorsque Prime Agent est au repos.",
+      "The conversation mode can only be changed while Prime Agent is idle.",
+    );
+  }
+  return detail;
 }
 
 function statusLabel(status: Conversation["status"], language: AppLanguage) {
