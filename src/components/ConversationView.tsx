@@ -80,6 +80,12 @@ import {
   SESSION_MEMORY_CAPABILITIES,
   subagentStatusPresentation,
 } from "../lib/session-inspector";
+import {
+  EMPTY_PLAN_MODE,
+  decodePlanUiRequestTitle,
+  normalizePlanDocument,
+  resolvePlanState,
+} from "../lib/plan-mode";
 import { useDismissableLayer } from "../hooks/useDismissableLayer";
 import { useI18n, type AppLanguage } from "../i18n";
 import type {
@@ -95,6 +101,7 @@ import type {
   GitChange,
   GitFileDiff,
   ModelInfo,
+  PendingExtensionUiRequest,
   Project,
   SessionHarnessEntry,
   SessionRefinementKind,
@@ -138,6 +145,10 @@ interface ConversationViewProps {
   inspectorOpen: boolean;
   changes: GitChange[];
   resourceReloadSupported: boolean;
+  planRequest?: PendingExtensionUiRequest;
+  onPlanMode: (mode: "normal" | "plan") => Promise<void>;
+  onRetryPlanFinalization: (conversationId: string) => Promise<void>;
+  onAnswerPlanRequest: (request: PendingExtensionUiRequest, response: Record<string, unknown>) => Promise<void>;
   onToggleInspector: () => void;
   onDraftChange: (draft: string) => void;
   onSend: (message: string, attachments: Attachment[], delivery?: "steer" | "follow_up") => Promise<void>;
@@ -184,6 +195,13 @@ export function buildComposerSlashCommands(
   resourceReloadSupported = true,
 ): ComposerSlashCommand[] {
   const entries: ComposerSlashCommand[] = [
+    {
+      name: "plan",
+      label: bi(language, "Mode Plan", "Plan mode"),
+      description: bi(language, "Planifier en lecture seule dans cette conversation", "Plan read-only in this conversation"),
+      source: "orbit",
+      behavior: "prompt",
+    },
     {
       name: "goal",
       label: bi(language, "Objectif", "Goal"),
@@ -350,11 +368,14 @@ export function continueComposerMarkdownList(
 }
 
 export function ConversationView(props: ConversationViewProps) {
-  const { project, conversation, models, favoriteModels, commands, stats, sessionState, goalMutation, isCompacting: runtimeCompacting = false, isRefining = false, refinements, harnessEntries, schedules = [], heartbeat, heartbeats = [], subagents = [], observedSubagent, inspectorOpen, changes, resourceReloadSupported, onToggleInspector, onDraftChange, onSend, onMutateQueuedMessage, onRetryMessage, onAbort, onModel, onToggleFavoriteModel, onThinking, onRunCommand, onObserveSubagent, onForkMessage, onCloneSession, onNewWindow, onOpenTerminal } = props;
+  const { project, conversation, models, favoriteModels, commands, stats, sessionState, goalMutation, isCompacting: runtimeCompacting = false, isRefining = false, refinements, harnessEntries, schedules = [], heartbeat, heartbeats = [], subagents = [], observedSubagent, inspectorOpen, changes, resourceReloadSupported, planRequest, onPlanMode, onRetryPlanFinalization, onAnswerPlanRequest, onToggleInspector, onDraftChange, onSend, onMutateQueuedMessage, onRetryMessage, onAbort, onModel, onToggleFavoriteModel, onThinking, onRunCommand, onObserveSubagent, onForkMessage, onCloneSession, onNewWindow, onOpenTerminal } = props;
   const { language } = useI18n();
   const isCompacting = runtimeCompacting || Boolean(sessionState?.isCompacting);
   const isRunning = !isCompacting && isConversationTurnActive(conversation.status);
   const showActiveRun = !isCompacting && (conversation.status === "starting" || isRunning);
+  const conversationPlan = resolvePlanState(conversation.planMode) ?? EMPTY_PLAN_MODE;
+  const planFinalizing = conversationPlan.phase === "idle"
+    && (conversationPlan.outcome === "applied" || conversationPlan.outcome === "kept");
   const [inspectorTab, setInspectorTab] = useState<"activity" | "session" | "changes" | "details">("changes");
   const [openPopover, setOpenPopover] = useState<ConversationPopover>(null);
   const [restartDialogOpen, setRestartDialogOpen] = useState(false);
@@ -424,6 +445,21 @@ export function ConversationView(props: ConversationViewProps) {
         {showActiveRun ? <ActiveRunBar conversation={conversation} onAbort={onAbort} onActivity={() => { setInspectorTab("activity"); if (!inspectorOpen) onToggleInspector(); }} /> : null}
         {isCompacting ? <CompactionStatusBar /> : null}
         {isRefining ? <RefinementStatusBar /> : null}
+        {planRequest ? (
+          <PlanInteractionCard
+            key={planRequest.requestKey}
+            request={planRequest}
+            conversation={conversation}
+            project={project}
+            onAnswer={onAnswerPlanRequest}
+          />
+        ) : planFinalizing ? (
+          <div className={`plan-finalizing ${conversation.status === "error" ? "is-error" : ""}`} role={conversation.status === "error" ? "alert" : "status"}>
+            {conversation.status === "error" ? <CircleAlert size={16} /> : <LoaderCircle size={16} className="spin" />}
+            <span><strong>{conversation.status === "error" ? bi(language, "Le passage au runtime Normal a échoué", "Switching to the Normal runtime failed") : conversationPlan.outcome === "applied" ? bi(language, "Passage à l’implémentation…", "Switching to implementation…") : bi(language, "Enregistrement du plan…", "Saving the plan…")}</strong><small>{conversation.status === "error" ? conversation.lastError : bi(language, "Prime Orbit relance cette conversation avec le runtime Normal.", "Prime Orbit is restarting this conversation with the Normal runtime.")}</small></span>
+            {conversation.status === "error" ? <Button variant="secondary" onClick={() => void onRetryPlanFinalization(conversation.id)}><RefreshCw size={14} />{bi(language, "Réessayer", "Retry")}</Button> : null}
+          </div>
+        ) : (
         <Composer
           key={conversation.id}
           project={project}
@@ -445,10 +481,12 @@ export function ConversationView(props: ConversationViewProps) {
           onToggleFavoriteModel={onToggleFavoriteModel}
           onThinking={onThinking}
           onRunCommand={onRunCommand}
+          onPlanMode={onPlanMode}
           openPopover={openPopover}
           onTogglePopover={togglePopover}
           onClosePopover={closePopover}
         />
+        )}
       </div>
       {inspectorOpen ? (
         <RunInspector
@@ -837,6 +875,176 @@ const ConversationMarkdown = memo(function ConversationMarkdown({ content, onOpe
   }}>{content}</ReactMarkdown>;
 });
 
+function PlanInteractionCard({
+  request,
+  conversation,
+  project,
+  onAnswer,
+}: {
+  request: PendingExtensionUiRequest;
+  conversation: Conversation;
+  project: Project;
+  onAnswer: (request: PendingExtensionUiRequest, response: Record<string, unknown>) => Promise<void>;
+}) {
+  const { language } = useI18n();
+  const cardRef = useRef<HTMLElement>(null);
+  const decoded = decodePlanUiRequestTitle(request.title);
+  const planState = resolvePlanState(conversation.planMode) ?? EMPTY_PLAN_MODE;
+  const [selected, setSelected] = useState<string>();
+  const [customAnswer, setCustomAnswer] = useState(request.prefill ?? "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+
+  useEffect(() => {
+    setSelected(undefined);
+    setCustomAnswer(request.prefill ?? "");
+    setBusy(false);
+    setError(undefined);
+  }, [request.id, request.prefill]);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      const card = cardRef.current;
+      if (!card) return;
+      card.scrollIntoView({ block: "nearest" });
+      const primaryTarget = card.querySelector<HTMLElement>("textarea, button[aria-pressed]");
+      (primaryTarget ?? card).focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [request.id, request.title]);
+
+  const openPlanLink = async (href: string) => {
+    const target = classifyConversationLink(href);
+    if (target.kind === "external") {
+      try {
+        await openUrl(target.url);
+      } catch {
+        if (/^https?:/iu.test(target.url)) window.open(target.url, "_blank", "noopener,noreferrer");
+      }
+    } else if (target.kind === "file") {
+      await openConversationPath(project.path, target.path);
+    } else if (target.kind === "anchor") {
+      document.getElementById(target.id)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  };
+
+  if (!decoded) {
+    return (
+      <section ref={cardRef} className="plan-interaction is-error" role="alert" tabIndex={-1}>
+        <CircleAlert size={18} />
+        <div><strong>{bi(language, "Dialogue Plan illisible", "Unreadable Plan dialog")}</strong><p>{bi(language, "Prime Orbit a bloqué une requête interne invalide.", "Prime Orbit blocked an invalid internal request.")}</p></div>
+      </section>
+    );
+  }
+
+  const answer = async (response: Record<string, unknown>) => {
+    if (busy) return;
+    setBusy(true);
+    setError(undefined);
+    try {
+      await onAnswer(request, response);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      setBusy(false);
+    }
+  };
+
+  if (decoded.payload.kind === "review") {
+    const document = planState.document;
+    const choices = request.options ?? [];
+    const decide = (index: number) => {
+      const value = choices[index];
+      if (value) void answer({ value });
+    };
+    return (
+      <section ref={cardRef} className="plan-interaction plan-review" role="region" aria-label={decoded.payload.title} aria-busy={busy} tabIndex={-1}>
+        <header className="plan-interaction-header">
+          <span className="plan-interaction-icon" aria-hidden="true"><FileText size={18} /></span>
+          <div><strong>{decoded.payload.title}</strong><p>{bi(language, "Le plan est prêt. Vérifiez-le avant de choisir la suite.", "The plan is ready. Review it before choosing what happens next.")}</p></div>
+          <Badge tone="accent">{bi(language, "Plan", "Plan")}</Badge>
+        </header>
+        {document ? (
+          <div className="assistant-message-body plan-document-preview">
+            <ConversationMarkdown content={document.markdown} onOpenLink={openPlanLink} />
+          </div>
+        ) : (
+          <p className="plan-interaction-error" role="alert"><CircleAlert size={14} />{bi(language, "Le document est en cours de synchronisation. Réessayez dans un instant.", "The document is still syncing. Try again in a moment.")}</p>
+        )}
+        <footer className="plan-review-actions">
+          <div className="plan-review-copy">
+            <ShieldCheck size={15} />
+            <span>{bi(language, "Conserver ou Appliquer enregistre atomiquement dans .prime/plans. Aucun code n’a encore été modifié.", "Keep or Apply saves atomically to .prime/plans. No code has been changed yet.")}</span>
+          </div>
+          <div>
+            <Button variant="ghost" disabled={busy || !document || !choices[2]} onClick={() => decide(2)}>{bi(language, "Réviser", "Revise")}</Button>
+            <Button variant="secondary" disabled={busy || !document || !choices[1]} onClick={() => decide(1)}>{bi(language, "Conserver", "Keep")}</Button>
+            <Button variant="primary" loading={busy} disabled={!document || !choices[0]} onClick={() => decide(0)}><Play size={14} />{bi(language, "Appliquer le plan", "Apply plan")}</Button>
+          </div>
+        </footer>
+        {error ? <p className="plan-interaction-error" role="alert"><CircleAlert size={14} />{error}</p> : null}
+      </section>
+    );
+  }
+
+  if (decoded.payload.kind === "custom") {
+    const canSubmit = customAnswer.trim().length > 0;
+    return (
+      <section ref={cardRef} className="plan-interaction plan-question" role="region" aria-label={decoded.payload.prompt} aria-live="polite" aria-busy={busy} tabIndex={-1}>
+        <header className="plan-interaction-header">
+          <span className="plan-interaction-icon" aria-hidden="true"><ListTree size={18} /></span>
+          <div><strong>{decoded.payload.prompt}</strong><p>{bi(language, "Précisez votre réponse pour que l’agent puisse continuer le plan.", "Add your own answer so the agent can continue the plan.")}</p></div>
+          <Badge tone="warning">{bi(language, "Réponse attendue", "Answer needed")}</Badge>
+        </header>
+        <label className="plan-custom-answer">
+          <span>{bi(language, "Votre réponse", "Your answer")}</span>
+          <textarea autoFocus value={customAnswer} maxLength={4_096} rows={3} onChange={(event) => setCustomAnswer(event.target.value)} placeholder={bi(language, "Écrivez une réponse précise…", "Write a precise answer…")} />
+        </label>
+        <footer className="plan-question-footer">
+          <small>{bi(language, "Prime Agent reste en attente tant que vous ne répondez pas.", "Prime Agent waits until you answer.")}</small>
+          <div>
+            <Button variant="ghost" disabled={busy} onClick={() => void answer({ cancelled: true })}>{bi(language, "Annuler", "Cancel")}</Button>
+            <Button variant="primary" loading={busy} disabled={!canSubmit} onClick={() => void answer({ value: customAnswer.trim() })}>{bi(language, "Envoyer la réponse", "Send answer")}</Button>
+          </div>
+        </footer>
+        {error ? <p className="plan-interaction-error" role="alert"><CircleAlert size={14} />{error}</p> : null}
+      </section>
+    );
+  }
+
+  const responseOptions = request.options ?? [];
+  const richOptions = decoded.payload.options;
+  const otherIndex = decoded.payload.allowOther ? responseOptions.length - 1 : -1;
+  return (
+    <section ref={cardRef} className="plan-interaction plan-question" role="region" aria-label={decoded.payload.prompt} aria-live="polite" aria-busy={busy} tabIndex={-1}>
+      <header className="plan-interaction-header">
+        <span className="plan-interaction-icon" aria-hidden="true"><ListTree size={18} /></span>
+        <div><strong>{decoded.payload.prompt}</strong>{decoded.payload.context ? <p>{decoded.payload.context}</p> : null}</div>
+        <Badge tone="warning">{bi(language, "Réponse attendue", "Answer needed")}</Badge>
+      </header>
+      <div className="plan-choice-list" role="group" aria-label={decoded.payload.prompt}>
+        {responseOptions.map((value, index) => {
+          const option = index < richOptions.length ? richOptions[index] : undefined;
+          const isOther = index === otherIndex && index >= richOptions.length;
+          return (
+            <button key={`${index}:${value}`} type="button" aria-pressed={selected === value} className={selected === value ? "is-selected" : ""} onClick={() => setSelected(value)}>
+              <span className="plan-choice-marker" aria-hidden="true">{selected === value ? <Check size={13} /> : null}</span>
+              <span><strong>{isOther ? bi(language, "Autre réponse", "Other answer") : option?.label ?? value}</strong>{isOther ? <small>{bi(language, "Saisir une réponse libre à l’étape suivante", "Enter a custom answer next")}</small> : option?.description ? <small>{option.description}</small> : null}</span>
+            </button>
+          );
+        })}
+      </div>
+      <footer className="plan-question-footer">
+        <small>{bi(language, "Cette question bloque la planification, sans modifier le projet.", "This question pauses planning without changing the project.")}</small>
+        <div>
+          <Button variant="ghost" disabled={busy} onClick={() => void answer({ cancelled: true })}>{bi(language, "Annuler", "Cancel")}</Button>
+          <Button variant="primary" loading={busy} disabled={!selected} onClick={() => selected && void answer({ value: selected })}>{bi(language, "Continuer", "Continue")}</Button>
+        </div>
+      </footer>
+      {error ? <p className="plan-interaction-error" role="alert"><CircleAlert size={14} />{error}</p> : null}
+    </section>
+  );
+}
+
 export function agentMessageRelationshipLabel(
   language: AppLanguage,
   relationship?: AgentMessageRelationship,
@@ -969,7 +1177,7 @@ const MessageItem = memo(function MessageItem({ message, onOpenLink, onRetryMess
           <ConversationMarkdown content={message.content || (message.status === "streaming" ? " " : "")} onOpenLink={onOpenLink} />
           {message.status === "streaming" ? <span className="streaming-cursor" aria-hidden="true" /> : null}
         </div>
-        {showTools && message.tools?.length ? <MessageToolSequence tools={message.tools} /> : null}
+        {showTools && message.tools?.length ? <MessageToolSequence tools={message.tools} onOpenLink={onOpenLink} /> : null}
         {message.role === "assistant" && message.status === "complete" && message.content.trim() ? (
           <footer className="message-actions">
             <IconButton label={bi(language, "Copier la réponse", "Copy response")} onClick={() => void navigator.clipboard.writeText(message.content)}><Copy size={14} /></IconButton>
@@ -1032,7 +1240,7 @@ const AssistantTurn = memo(function AssistantTurn({ messages, onOpenLink, onRetr
               </div>
               {segment.message.status === "error" ? <p className="assistant-turn-error" role="alert"><CircleAlert size={14} />{bi(language, "Cette partie de la réponse a été interrompue.", "This part of the response was interrupted.")}</p> : null}
             </div>
-          ) : <MessageToolSequence key={segment.id} tools={segment.tools} />)}
+          ) : <MessageToolSequence key={segment.id} tools={segment.tools} onOpenLink={onOpenLink} />)}
         </div>
         {!isActive && actionMessage ? (
           <footer className="message-actions">
@@ -1130,12 +1338,12 @@ function haveSameToolReferences(previous: readonly ToolActivity[], next: readonl
   return previous.length === next.length && previous.every((tool, index) => tool === next[index]);
 }
 
-const MessageToolSequence = memo(function MessageToolSequence({ tools }: { tools: ToolActivity[] }) {
+const MessageToolSequence = memo(function MessageToolSequence({ tools, onOpenLink }: { tools: ToolActivity[]; onOpenLink: (href: string) => Promise<void> }) {
   const segments = buildToolSequenceSegments(tools);
   return <div className="message-tools">{segments.map((segment) => segment.kind === "tool"
-    ? <ToolCard key={segment.tool.id} tool={segment.tool} />
-    : <PythonExecutionGroup key={`python:${segment.tools[0]!.id}`} tools={segment.tools} />)}</div>;
-}, (previous, next) => haveSameToolReferences(previous.tools, next.tools));
+    ? <ToolCard key={segment.tool.id} tool={segment.tool} onOpenLink={onOpenLink} />
+    : <PythonExecutionGroup key={`python:${segment.tools[0]!.id}`} tools={segment.tools} onOpenLink={onOpenLink} />)}</div>;
+}, (previous, next) => haveSameToolReferences(previous.tools, next.tools) && previous.onOpenLink === next.onOpenLink);
 
 const AttachmentStrip = memo(function AttachmentStrip({ attachments }: { attachments: Attachment[] }) {
   const { language, locale } = useI18n();
@@ -1186,7 +1394,7 @@ export function initialPythonExecutionGroupExpanded() {
   return false;
 }
 
-function PythonExecutionGroup({ tools }: { tools: ToolActivity[] }) {
+function PythonExecutionGroup({ tools, onOpenLink }: { tools: ToolActivity[]; onOpenLink: (href: string) => Promise<void> }) {
   const { language } = useI18n();
   const executions = mergeToolCalls(tools);
   const summary = summarizePythonTools(executions);
@@ -1215,7 +1423,7 @@ function PythonExecutionGroup({ tools }: { tools: ToolActivity[] }) {
         <ChevronDown size={15} className={open ? "is-open" : ""} />
       </button>
       {open ? <div className="python-execution-list">{executions.map((tool, index) => (
-        <ToolCard key={tool.id} tool={{ ...tool, title: `${bi(language, "Python", "Python")} #${index + 1}` }} compactByDefault />
+        <ToolCard key={tool.id} tool={{ ...tool, title: `${bi(language, "Python", "Python")} #${index + 1}` }} compactByDefault onOpenLink={onOpenLink} />
       ))}</div> : null}
     </section>
   );
@@ -1263,14 +1471,21 @@ export function initialToolCardExpanded(tool: Pick<ToolActivity, "status">, comp
   return !compactByDefault && tool.status === "running";
 }
 
-function ToolCard({ tool, compactByDefault = false }: { tool: ToolActivity; compactByDefault?: boolean }) {
+function ToolCard({ tool, compactByDefault = false, onOpenLink }: { tool: ToolActivity; compactByDefault?: boolean; onOpenLink: (href: string) => Promise<void> }) {
   const { language } = useI18n();
-  const [open, setOpen] = useState(() => initialToolCardExpanded(tool, compactByDefault));
+  const planInput = tool.name === "prime_orbit_plan_submit" && tool.input && typeof tool.input === "object"
+    ? tool.input as Record<string, unknown>
+    : undefined;
+  const planDocument = planInput
+    ? normalizePlanDocument({ name: planInput.title, markdown: planInput.document })
+    : undefined;
+  const [open, setOpen] = useState(() => Boolean(planDocument) || initialToolCardExpanded(tool, compactByDefault));
   const previousStatus = useRef(tool.status);
   useEffect(() => {
-    if (previousStatus.current === "running" && tool.status !== "running") setOpen(false);
+    if (planDocument) setOpen(true);
+    else if (previousStatus.current === "running" && tool.status !== "running") setOpen(false);
     previousStatus.current = tool.status;
-  }, [tool.status]);
+  }, [planDocument?.markdown, tool.status]);
   const statusIcon = tool.status === "running"
     ? <LoaderCircle size={15} className="spin" />
     : tool.status === "queued"
@@ -1292,7 +1507,13 @@ function ToolCard({ tool, compactByDefault = false }: { tool: ToolActivity; comp
         <span><strong>{tool.title}</strong><small>{statusText}</small></span>
         <ChevronDown size={15} className={open ? "is-open" : ""} />
       </button>
-      {open ? <div className="tool-details">{tool.input !== undefined ? <div><label>{bi(language, "Entrée", "Input")}</label><pre>{pretty(tool.input, language)}</pre></div> : null}{tool.output !== undefined ? <div><label>{bi(language, "Sortie", "Output")}</label><pre>{pretty(tool.output, language)}</pre></div> : null}</div> : null}
+      {open ? planDocument ? (
+        <div className="plan-tool-document">
+          <header><FileText size={14} /><span><strong>{planDocument.name}</strong><small>.prime/plans · Markdown</small></span></header>
+          <div className="assistant-message-body"><ConversationMarkdown content={planDocument.markdown} onOpenLink={onOpenLink} /></div>
+          {tool.output !== undefined ? <details><summary>{bi(language, "Décision et sortie de l’outil", "Decision and tool output")}</summary><pre>{pretty(tool.output, language)}</pre></details> : null}
+        </div>
+      ) : <div className="tool-details">{tool.input !== undefined ? <div><label>{bi(language, "Entrée", "Input")}</label><pre>{pretty(tool.input, language)}</pre></div> : null}{tool.output !== undefined ? <div><label>{bi(language, "Sortie", "Output")}</label><pre>{pretty(tool.output, language)}</pre></div> : null}</div> : null}
     </section>
   );
 }
@@ -1440,7 +1661,7 @@ export function buildContextUsageSnapshot(
   };
 }
 
-function Composer({ project, conversation, models, favoriteModels, commands, stats, sessionState, resourceReloadSupported, isRunning, isCompacting, isRefining, onDraftChange, onSend, onMutateQueuedMessage, onAbort, onModel, onToggleFavoriteModel, onThinking, onRunCommand, openPopover, onTogglePopover, onClosePopover }: {
+function Composer({ project, conversation, models, favoriteModels, commands, stats, sessionState, resourceReloadSupported, isRunning, isCompacting, isRefining, onDraftChange, onSend, onMutateQueuedMessage, onAbort, onModel, onToggleFavoriteModel, onThinking, onRunCommand, onPlanMode, openPopover, onTogglePopover, onClosePopover }: {
   project: Project;
   conversation: Conversation;
   models: ModelInfo[];
@@ -1460,6 +1681,7 @@ function Composer({ project, conversation, models, favoriteModels, commands, sta
   onToggleFavoriteModel: (ref: string) => void;
   onThinking: (level: ThinkingLevel) => Promise<void>;
   onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>;
+  onPlanMode: (mode: "normal" | "plan") => Promise<void>;
   openPopover: ConversationPopover;
   onTogglePopover: (popover: Exclude<ConversationPopover, null>) => void;
   onClosePopover: () => void;
@@ -1490,11 +1712,23 @@ function Composer({ project, conversation, models, favoriteModels, commands, sta
   const [composerFocused, setComposerFocused] = useState(false);
   const [commandError, setCommandError] = useState<string>();
   const [toolActionBusy, setToolActionBusy] = useState<"compact" | "refine">();
+  const [planModeBusy, setPlanModeBusy] = useState(false);
   const textarea = useRef<HTMLTextAreaElement>(null);
   const slashList = useRef<HTMLDivElement>(null);
   const activeModel = models.find((model) => `${model.provider}/${model.id}` === conversation.model);
   const isBusy = isRunning || isCompacting;
   const isConnecting = conversation.status === "starting";
+  const planModeState = resolvePlanState(conversation.planMode) ?? EMPTY_PLAN_MODE;
+  const isPlanMode = planModeState.phase !== "idle";
+  const goalBlocksPlan = !isPlanMode && sessionState?.goal?.status === "active";
+  const waitingForSessionState = !isPlanMode && Boolean(conversation.sessionPath) && !sessionState;
+  const planModeDisabledReason = waitingForSessionState
+    ? bi(language, "Attendez la synchronisation de la session avant d’activer le mode Plan.", "Wait for the session to sync before enabling Plan mode.")
+    : goalBlocksPlan
+      ? bi(language, "Mettez l’objectif persistant en pause avant d’activer le mode Plan.", "Pause the persistent goal before enabling Plan mode.")
+      : isBusy || isConnecting
+      ? bi(language, "Attendez la fin du travail en cours avant de changer de mode.", "Wait for current work to finish before changing mode.")
+      : undefined;
   const compactDisabledReason = isCompacting
     ? bi(language, "Un compactage du contexte est déjà en cours.", "Context compaction is already in progress.")
     : isConnecting
@@ -1653,6 +1887,29 @@ function Composer({ project, conversation, models, favoriteModels, commands, sta
     requestAnimationFrame(() => textarea.current?.focus());
   };
 
+  const changePlanMode = async (mode: "normal" | "plan"): Promise<boolean> => {
+    if ((mode === "plan") === isPlanMode) return true;
+    if (planModeBusy || planModeDisabledReason) {
+      if (planModeDisabledReason) setCommandError(planModeDisabledReason);
+      return false;
+    }
+    if (mode === "plan" && attachmentsRef.current.length > 0) {
+      setCommandError(bi(language, "Retirez les pièces jointes avant d’activer le mode Plan.", "Remove attachments before enabling Plan mode."));
+      return false;
+    }
+    setPlanModeBusy(true);
+    setCommandError(undefined);
+    try {
+      await onPlanMode(mode);
+      return true;
+    } catch (error) {
+      setCommandError(error instanceof Error ? error.message : String(error));
+      return false;
+    } finally {
+      setPlanModeBusy(false);
+    }
+  };
+
   const runToolAction = async (action: "compact" | "refine") => {
     if (toolActionBusy || (action === "refine" && isRefining)) return;
     setToolActionBusy(action);
@@ -1713,11 +1970,21 @@ function Composer({ project, conversation, models, favoriteModels, commands, sta
       }
       return;
     }
-    if (!hasComposerContent || adding || submittingRef.current) return;
+    let outgoingDraft = draft;
+    if (activeSlashCommand?.command.name === "plan") {
+      if (!await changePlanMode("plan")) return;
+      outgoingDraft = activeSlashCommand.argument.trim();
+      if (!outgoingDraft) {
+        updateDraft("");
+        reportDraftNow("");
+        return;
+      }
+    }
+    if ((!outgoingDraft.trim() && attachments.length === 0) || adding || submittingRef.current) return;
     submittingRef.current = true;
     const submittedConversationId = conversationIdRef.current;
     const submittedGeneration = dropAdmissionGenerationRef.current;
-    const sentDraft = draft;
+    const sentDraft = outgoingDraft;
     const sentAttachments = attachments;
     setDraft("");
     draftRef.current = "";
@@ -2092,11 +2359,15 @@ function Composer({ project, conversation, models, favoriteModels, commands, sta
       {attachmentError ? <p className="trust-note" role="alert"><Info size={14} />{attachmentError}</p> : null}
       {commandError ? <p className="trust-note composer-command-error" role="alert"><CircleAlert size={14} />{commandError}</p> : null}
       <div className="composer-editor">
-        <textarea ref={textarea} value={editorValue} onChange={(event) => updateEditorValue(event.target.value)} onKeyDown={handleKeyDown} onPaste={handlePaste} onFocus={() => setComposerFocused(true)} onBlur={() => { setComposerFocused(false); if (draftRef.current !== reportedDraftRef.current) reportDraftNow(draftRef.current); }} placeholder={activeSlashCommand ? activeSlashCommand.command.description : isCompacting ? bi(language, "Ajoutez un message après le compactage…", "Add a message after compaction…") : isRunning ? bi(language, "Ajoutez une instruction à la suite…", "Add a follow-up instruction…") : `${bi(language, "Demandez quelque chose sur", "Ask something about")} ${project.name}…`} rows={1} lang={typeof navigator === "undefined" ? language : navigator.language} spellCheck data-native-spellcheck-menu="true" aria-label={bi(language, "Message à Prime Agent", "Message Prime Agent")} aria-autocomplete="list" aria-expanded={slashPaletteOpen} aria-controls={slashPaletteOpen ? "composer-slash-command-list" : undefined} aria-activedescendant={slashPaletteOpen ? `composer-slash-command-${Math.min(slashSelection, filteredSlashCommands.length - 1)}` : undefined} />
+        <textarea ref={textarea} value={editorValue} onChange={(event) => updateEditorValue(event.target.value)} onKeyDown={handleKeyDown} onPaste={handlePaste} onFocus={() => setComposerFocused(true)} onBlur={() => { setComposerFocused(false); if (draftRef.current !== reportedDraftRef.current) reportDraftNow(draftRef.current); }} placeholder={activeSlashCommand ? activeSlashCommand.command.description : isCompacting ? bi(language, "Ajoutez un message après le compactage…", "Add a message after compaction…") : isRunning ? bi(language, "Ajoutez une instruction à la suite…", "Add a follow-up instruction…") : isPlanMode ? bi(language, "Décrivez ce que vous voulez planifier…", "Describe what you want to plan…") : `${bi(language, "Demandez quelque chose sur", "Ask something about")} ${project.name}…`} rows={1} lang={typeof navigator === "undefined" ? language : navigator.language} spellCheck data-native-spellcheck-menu="true" aria-label={bi(language, "Message à Prime Agent", "Message Prime Agent")} aria-autocomplete="list" aria-expanded={slashPaletteOpen} aria-controls={slashPaletteOpen ? "composer-slash-command-list" : undefined} aria-activedescendant={slashPaletteOpen ? `composer-slash-command-${Math.min(slashSelection, filteredSlashCommands.length - 1)}` : undefined} />
       </div>
       <div className="composer-toolbar">
         <div className="composer-tools-left">
-          <IconButton label={bi(language, "Joindre des fichiers", "Attach files")} onClick={() => void addFiles()} disabled={adding}>{adding ? <LoaderCircle size={17} className="spin" /> : <Plus size={18} />}</IconButton>
+          <IconButton label={isPlanMode ? bi(language, "Les pièces jointes sont désactivées en mode Plan", "Attachments are disabled in Plan mode") : bi(language, "Joindre des fichiers", "Attach files")} onClick={() => void addFiles()} disabled={adding || isPlanMode}>{adding ? <LoaderCircle size={17} className="spin" /> : <Plus size={18} />}</IconButton>
+          <div className={`plan-mode-selector ${isPlanMode ? "is-plan" : ""}`} role="group" aria-label={bi(language, "Mode de la conversation", "Conversation mode")} title={planModeDisabledReason}>
+            <button type="button" className={!isPlanMode ? "is-active" : ""} aria-pressed={!isPlanMode} disabled={planModeBusy || Boolean(planModeDisabledReason)} onClick={() => void changePlanMode("normal")}>{bi(language, "Normal", "Normal")}</button>
+            <button type="button" className={isPlanMode ? "is-active" : ""} aria-pressed={isPlanMode} disabled={planModeBusy || Boolean(planModeDisabledReason)} onClick={() => void changePlanMode("plan")}>{planModeBusy ? <LoaderCircle size={12} className="spin" /> : <ListTree size={12} />}{bi(language, "Plan", "Plan")}</button>
+          </div>
           {activeSlashCommand ? <button type="button" className="active-slash-command" onClick={clearActiveSlashCommand} title={bi(language, `Retirer la commande /${activeSlashCommand.command.name}`, `Remove /${activeSlashCommand.command.name} command`)}>{slashCommandIcon(activeSlashCommand.command)}<span>{activeSlashCommand.command.label}</span><X size={12} /></button> : null}
           <div className="composer-popover-wrap" data-dismissable-layer="composer-tools">
             <button type="button" className="composer-chip" aria-haspopup="menu" aria-expanded={openPopover === "composer-tools"} onClick={() => onTogglePopover("composer-tools")}><Box size={14} />{bi(language, "Outils", "Tools")}<ChevronDown size={13} /></button>

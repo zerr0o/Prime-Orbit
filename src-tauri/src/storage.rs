@@ -296,18 +296,72 @@ fn now_millis() -> u128 {
         .as_millis()
 }
 
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicCreateResult {
+    Created,
+    AlreadyExists,
+}
+
+/// Atomically publishes a new file without ever replacing an existing path.
+/// The temporary inode is hard-linked into place, so a foreign collision that
+/// appears after candidate selection fails closed instead of being overwritten.
+pub fn write_atomic_new(path: &Path, bytes: &[u8]) -> Result<AtomicCreateResult, String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("Chemin de destination invalide: {}", path.display()))?;
-    let parent_metadata = fs::metadata(parent).map_err(|error| {
+    let parent_metadata = fs::symlink_metadata(parent).map_err(|error| {
         format!(
             "Le dossier de destination {} est inaccessible: {error}",
             parent.display()
         )
     })?;
-    if !parent_metadata.is_dir() {
-        return Err(format!("{} n’est pas un dossier", parent.display()));
+    if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
+        return Err(format!(
+            "Le dossier de destination {} n’est pas un dossier physique.",
+            parent.display()
+        ));
+    }
+    let temporary = unique_temporary_path(path)?;
+    let result = (|| -> Result<AtomicCreateResult, String> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("Impossible de créer {}: {error}", temporary.display()))?;
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| format!("Impossible d’écrire {}: {error}", temporary.display()))?;
+        drop(file);
+        match fs::hard_link(&temporary, path) {
+            Ok(()) => Ok(AtomicCreateResult::Created),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(AtomicCreateResult::AlreadyExists)
+            }
+            Err(error) => Err(format!(
+                "Impossible de publier {} sans remplacement: {error}",
+                path.display()
+            )),
+        }
+    })();
+    let _ = fs::remove_file(&temporary);
+    result
+}
+
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Chemin de destination invalide: {}", path.display()))?;
+    let parent_metadata = fs::symlink_metadata(parent).map_err(|error| {
+        format!(
+            "Le dossier de destination {} est inaccessible: {error}",
+            parent.display()
+        )
+    })?;
+    if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{} n’est pas un dossier physique",
+            parent.display()
+        ));
     }
     if path.exists() {
         let metadata = fs::symlink_metadata(path)
@@ -764,9 +818,24 @@ pub fn load_typed_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Opti
 mod tests {
     use super::{
         compare_and_save_app_state, load_app_state_from_path, resolve_models_path_from_home,
-        validate_models_json,
+        validate_models_json, write_atomic_new, AtomicCreateResult,
     };
     use std::fs;
+
+    #[test]
+    fn atomic_new_file_never_replaces_a_collision() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("plan.md");
+        assert_eq!(
+            write_atomic_new(&path, b"first").unwrap(),
+            AtomicCreateResult::Created
+        );
+        assert_eq!(
+            write_atomic_new(&path, b"second").unwrap(),
+            AtomicCreateResult::AlreadyExists
+        );
+        assert_eq!(fs::read(path).unwrap(), b"first");
+    }
 
     #[test]
     fn validates_provider_model_ids() {

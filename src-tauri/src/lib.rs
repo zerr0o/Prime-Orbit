@@ -7,7 +7,9 @@ mod harness;
 mod install;
 #[cfg(windows)]
 mod node_compat;
+mod notifications;
 mod paths;
+mod plan_mode;
 mod runtime;
 mod session_history;
 mod session_lease;
@@ -87,6 +89,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .setup(desktop::setup_tray)
         .manage(AgentsState::default())
@@ -95,6 +98,8 @@ pub fn run() {
         .manage(InstallState::default())
         .manage(PersistenceLock::default())
         .manage(UpdateManager::default())
+        .manage(notifications::PlanAttentionState::default())
+        .manage(plan_mode::PlanDocumentState::default())
         .manage(webview_context_menu::ContextMenuRegistry::default())
         .invoke_handler(tauri::generate_handler![
             runtime::detect_prime_agent,
@@ -103,6 +108,7 @@ pub fn run() {
             runtime::save_runtime_config,
             runtime::open_prime_agent_terminal,
             agents::start_agent,
+            agents::list_pending_extension_ui_requests,
             agents::release_agent,
             agents::send_rpc,
             agents::mutate_agent_queue,
@@ -137,6 +143,8 @@ pub fn run() {
             connections::save_prime_agent_defaults,
             connections::check_ollama_health,
             spellcheck::get_spelling_suggestions,
+            notifications::notify_plan_attention,
+            plan_mode::write_plan_document,
             connections::save_mcp_server,
             connections::delete_mcp_server,
             updater::get_app_update_state,

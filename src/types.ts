@@ -1,3 +1,5 @@
+import type { PlanModeState } from "./lib/plan-mode";
+
 export type AppView = "home" | "projects" | "runs" | "connections" | "settings" | "chat";
 export type SettingsSectionId = "general" | "appearance" | "agent" | "models" | "security" | "about";
 export type ThemeMode = "dark" | "light" | "system";
@@ -152,6 +154,18 @@ export interface Conversation {
   draft: string;
   messages: ChatMessage[];
   activities: ActivityItem[];
+  /** Conversation-local Plan workflow; absent is the Normal-mode default. */
+  planMode?: PlanModeState;
+  /** Stable native document owner across multiple submit/revise tool calls. */
+  planArtifactId?: string;
+  /** Durable handoff used if the WebView reloads between approval and restart. */
+  pendingPlanAction?: {
+    decision: "apply" | "keep";
+    document: import("./lib/plan-mode").PlanDocument;
+    relativePath: string;
+    handoffId: string;
+    stage: "decisionRecorded" | "runtimeNormal" | "applySending";
+  };
   lastError?: string;
 }
 

@@ -302,6 +302,7 @@ function App() {
     ),
     discardSessionReference: discardConversationReference,
     updateConversation,
+    flushWorkspaceState: workspace.flushWorkspaceState,
     onInstallProgress,
     onInstallComplete,
     onNotice: handleRuntimeNotice,
@@ -721,6 +722,10 @@ function App() {
             inspectorOpen={state.preferences.inspectorOpen}
             changes={changes}
             resourceReloadSupported={detection.mode !== "system"}
+            planRequest={agent.planExtensionRequest}
+            onPlanMode={(mode) => agent.setConversationRuntimeMode(selectedConversation.id, mode)}
+            onRetryPlanFinalization={agent.retryPlanFinalization}
+            onAnswerPlanRequest={agent.answerExtensionRequest}
             onToggleInspector={toggleInspector}
             onDraftChange={(draft) => updateConversation(selectedConversation.id, { draft })}
             onSend={agent.sendPrompt}

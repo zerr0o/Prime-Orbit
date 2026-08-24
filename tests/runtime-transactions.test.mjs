@@ -26,17 +26,24 @@ const {
   compactResponseDisposition,
   compactionEndPresentation,
   commitPromptTransaction,
+  conversationHasPlanHandoff,
+  conversationPlanState,
+  planDocumentForReview,
+  runtimeModeForConversationPlan,
+  runtimeModeForPlan,
   durableAttachmentMetadata,
   enqueueExtensionRequest,
   extensionRequestKey,
   finalizeAuthoritativeIdleSnapshot,
   handleMessageEvent,
+  historicalToolInput,
   isAuthoritativeIdleSessionSnapshot,
   mapAgentMessages,
   mergeHistoricalAttachmentPreviews,
   normalizeConnectingPromptDelivery,
   promptAttachmentPayload,
   reconcileQueuedMessages,
+  recordedPlanResponseValue,
   rollbackPromptTransaction,
   selectForkEntryId,
   shouldApplyHistoryResponse,
@@ -53,6 +60,70 @@ const {
   refinementResultPresentation,
   rlmChildPresentation,
 } = compiledModule.exports;
+
+test("conversation Plan state selects the isolated runtime and recovers submitted Markdown", () => {
+  const normal = conversationPlanState({});
+  assert.deepEqual(normal, { phase: "idle", revision: 0 });
+  assert.equal(runtimeModeForPlan(normal), "normal");
+  const planning = conversationPlanState({ planMode: { phase: "planning", revision: 1 } });
+  assert.equal(runtimeModeForPlan(planning), "plan");
+  assert.equal(runtimeModeForConversationPlan({ planMode: planning }), "plan");
+  const pendingPlanAction = {
+    decision: "apply",
+    document: { name: "plan", markdown: "# Plan", round: 1 },
+    relativePath: ".prime/plans/plan.md",
+    handoffId: "handoff",
+    stage: "applySending",
+  };
+  assert.equal(runtimeModeForConversationPlan({ planMode: planning, pendingPlanAction }), "normal");
+  assert.equal(runtimeModeForConversationPlan({
+    planMode: { phase: "idle", revision: 2, outcome: "applied" },
+    pendingPlanAction: { ...pendingPlanAction, stage: "decisionRecorded" },
+  }), "plan");
+  assert.equal(recordedPlanResponseValue(
+    { ...pendingPlanAction, stage: "decisionRecorded" },
+    { options: ["apply-wire", "keep-wire", "revise-wire"] },
+    { payload: { kind: "review" } },
+  ), "apply-wire");
+
+  const document = planDocumentForReview({
+    messages: [{
+      id: "assistant-1",
+      role: "assistant",
+      content: "",
+      createdAt: new Date().toISOString(),
+      status: "complete",
+      tools: [{
+        id: "tool-plan",
+        name: "prime_orbit_plan_submit",
+        title: "Plan",
+        status: "running",
+        input: { title: "Plan sûr", document: "# Plan\r\n\r\nÉtape" },
+        startedAt: new Date().toISOString(),
+      }],
+    }],
+  }, "tool-plan", "Plan sûr");
+  assert.deepEqual(document, { name: "plan-sur", markdown: "# Plan\n\nÉtape" });
+  assert.equal(planDocumentForReview({ messages: [] }, "missing", "Plan"), undefined);
+});
+
+test("a stable Plan handoff marker reconciles an admitted Apply prompt after reload", () => {
+  const handoffId = "artifact-123";
+  assert.equal(conversationHasPlanHandoff({ messages: [{
+    role: "user",
+    content: `<!-- prime-orbit-plan-handoff:v1:${handoffId} -->\nImplement`,
+  }] }, handoffId), true);
+  assert.equal(conversationHasPlanHandoff({ messages: [] }, handoffId), false);
+});
+
+test("historical Plan submit keeps its typed Markdown projection above the generic history limit", () => {
+  const markdown = `# Large plan\n\n${"step\n".repeat(4_000)}`;
+  const input = historicalToolInput("prime_orbit_plan_submit", { title: "Large", document: markdown });
+  assert.equal(typeof input, "object");
+  assert.equal(input.title, "large");
+  assert.equal(input.document, markdown);
+  assert.ok(input.document.length > 16_000);
+});
 
 test("an empty RPC history cannot be relatched into local-history loading", () => {
   const hydratedEmptyConversation = conversation({

@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { open } from "@tauri-apps/plugin-dialog";
+import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import type {
   AgentExitPayload,
   AppUpdateInstallResult,
@@ -106,6 +107,8 @@ interface NativeInstallComplete {
   error?: string;
 }
 
+export type AgentRuntimeMode = "normal" | "plan";
+
 export interface RunningAgentInfo {
   conversationId: string;
   pid: number;
@@ -115,6 +118,7 @@ export interface RunningAgentInfo {
   provider?: string;
   model?: string;
   thinking?: string;
+  runtimeMode: AgentRuntimeMode;
   startedAt: number;
 }
 
@@ -266,6 +270,7 @@ export interface StartAgentOptions {
   thinking?: ThinkingLevel;
   /** Bounded advisory captured with the conversation for future RLM delegations. */
   appendSystemPrompt?: string;
+  runtimeMode?: AgentRuntimeMode;
 }
 
 export async function startAgent(options: StartAgentOptions): Promise<RunningAgentInfo | undefined> {
@@ -286,6 +291,12 @@ export async function releaseAgent(conversationId: string): Promise<boolean> {
 export async function sendRpc(conversationId: string, payload: Record<string, unknown>): Promise<void> {
   if (!isNative()) return;
   await invoke("send_rpc", { conversationId, payload });
+}
+
+/** Replays unanswered extension dialogs after a renderer reload or owner handoff. */
+export async function listPendingExtensionUiRequests(conversationId: string): Promise<NativeEventPayload[]> {
+  if (!isNative()) return [];
+  return invoke<NativeEventPayload[]>("list_pending_extension_ui_requests", { conversationId });
 }
 
 export type QueueMutationStatus = "applied" | "rejected" | "invalid" | "unsupported" | "inactive";
@@ -323,9 +334,12 @@ export async function stopAgent(conversationId: string): Promise<void> {
  * gracefully, attests daemon lease release, then relaunches it. Forced
  * termination is used only after the bounded graceful timeout.
  */
-export async function restartAgent(conversationId: string): Promise<RestartAgentResult | undefined> {
+export async function restartAgent(
+  conversationId: string,
+  runtimeMode?: AgentRuntimeMode,
+): Promise<RestartAgentResult | undefined> {
   if (!isNative()) return undefined;
-  return invoke<RestartAgentResult>("restart_agent", { conversationId });
+  return invoke<RestartAgentResult>("restart_agent", { conversationId, runtimeMode });
 }
 
 /**
@@ -715,6 +729,84 @@ export async function deleteMcpServer(cwd: string | undefined, scope: McpScope, 
   return invoke("delete_mcp_server", { cwd: cwd ?? null, scope, name });
 }
 
+/** Native plan-attention outcome decided by the Rust layer. */
+export type PlanAttentionOutcome = "shown" | "deduped" | "suppressedFocused";
+
+export interface PlanAttentionResult {
+  status: PlanAttentionOutcome;
+}
+
+export interface PlanAttentionRequest {
+  conversationId: string;
+  /** Caller-chosen idempotency key deduplicated natively across windows. */
+  requestKey: string;
+  language: "fr" | "en";
+}
+
+let planNotificationPermissionProbe: Promise<boolean> | undefined;
+
+/**
+ * Best-effort desktop permission preflight using the notification plugin.
+ * Desktop builds are granted by default, so a probe failure never blocks the
+ * native command itself.
+ */
+async function ensurePlanNotificationPermission(): Promise<boolean> {
+  if (!planNotificationPermissionProbe) {
+    planNotificationPermissionProbe = (async () => {
+      try {
+        if (!(await isPermissionGranted())) {
+          return (await requestPermission()) === "granted";
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+  }
+  return planNotificationPermissionProbe;
+}
+
+/**
+ * Asks the native layer to raise the generic Plan-mode attention toast. The
+ * backend suppresses toasts while any window stays visible and focused,
+ * deduplicates process-wide by requestKey over a short TTL, and returns the
+ * typed outcome. Toast content never includes transcript material and
+ * delivery failures come back as errors instead of crashing the app.
+ */
+export async function notifyPlanAttention(request: PlanAttentionRequest): Promise<PlanAttentionResult> {
+  if (!isNative()) return { status: "suppressedFocused" };
+  await ensurePlanNotificationPermission();
+  return invoke<PlanAttentionResult>("notify_plan_attention", {
+    input: {
+      conversationId: request.conversationId,
+      requestKey: request.requestKey,
+      language: request.language,
+    },
+  });
+}
+
+export interface WritePlanDocumentRequest {
+  conversationId: string;
+  requestId: string;
+  projectPath: string;
+  planId: string;
+  title: string;
+  markdown: string;
+}
+
+export interface WritePlanDocumentResult {
+  relativePath: string;
+  created: boolean;
+}
+
+/** Atomically writes the completed Plan artifact under the validated project. */
+export async function writePlanDocument(request: WritePlanDocumentRequest): Promise<WritePlanDocumentResult> {
+  if (!isNative()) {
+    return { relativePath: `.prime/plans/${request.planId}.md`, created: false };
+  }
+  return invoke<WritePlanDocumentResult>("write_plan_document", { input: request });
+}
+
 export async function createWorkspaceWindow(projectId?: string, conversationId?: string): Promise<void> {
   if (!isNative()) return;
   const label = `workspace-${crypto.randomUUID()}`;
@@ -744,6 +836,7 @@ export async function listenToAgentEvents(handlers: {
   onEvent: Handler<NativeEventPayload>;
   onStderr: Handler<NativeEventPayload>;
   onExit: Handler<AgentExitPayload>;
+  onExtensionUiResolved?: Handler<{ conversationId: string; requestId: string }>;
   onInstallProgress: Handler<InstallProgressPayload>;
   onInstallComplete: Handler<RuntimeDetection>;
 }): Promise<UnlistenFn> {
@@ -752,6 +845,10 @@ export async function listenToAgentEvents(handlers: {
     listen<NativeEventPayload>("prime-agent://event", (event) => handlers.onEvent(event.payload)),
     listen<NativeEventPayload>("prime-agent://stderr", (event) => handlers.onStderr(event.payload)),
     listen<AgentExitPayload>("prime-agent://exit", (event) => handlers.onExit(event.payload)),
+    listen<{ conversationId: string; requestId: string }>(
+      "prime-agent://extension-ui-resolved",
+      (event) => handlers.onExtensionUiResolved?.(event.payload),
+    ),
     listen<{ stage: string; message: string; percent?: number; stream?: "stdout" | "stderr" }>(
       "prime-agent://install-progress",
       (event) => handlers.onInstallProgress({

@@ -162,13 +162,15 @@ test("slash palette combines wired Orbit commands with authoritative Prime Agent
     { name: "not a command", source: "prompt" },
   ], "en");
 
-  assert.deepEqual(commands.slice(0, 5).map((command) => command.name), [
+  assert.deepEqual(commands.slice(0, 6).map((command) => command.name), [
+    "plan",
     "goal",
     "compact",
     "refine",
     "autonomous",
     "reload",
   ]);
+  assert.equal(commands.find((command) => command.name === "plan")?.source, "orbit");
   assert.equal(commands.filter((command) => command.name === "goal").length, 1);
   assert.equal(commands.find((command) => command.name === "goal")?.source, "session");
   assert.equal(commands.find((command) => command.name === "review")?.source, "prime");

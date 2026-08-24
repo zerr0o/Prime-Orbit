@@ -8,6 +8,7 @@ use crate::{
     session_lease::{reclaim_stale_session_lease, session_lease_exists},
     MAX_RPC_BYTES,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -42,6 +43,11 @@ const QUEUE_BRIDGE_SCRIPT: &str = include_str!("../assets/prime-agent-queue-brid
 const SESSION_CONTROL_BRIDGE_SCRIPT: &str =
     include_str!("../assets/prime-agent-session-control-bridge.cjs");
 const MAX_QUEUED_MESSAGE_TEXT: usize = 128 * 1024;
+const PLAN_RUNTIME_TOOLS: &str =
+    "prime_orbit_plan_inspect,prime_orbit_plan_question,prime_orbit_plan_submit";
+const PLAN_UI_TITLE_PREFIX: &str = "prime-orbit-plan-ui:v1:";
+const MAX_PENDING_EXTENSION_UI_REQUESTS: usize = 32;
+const MAX_PENDING_EXTENSION_UI_REQUEST_BYTES: usize = 512 * 1024;
 const MAX_PUBLIC_AGENT_MESSAGE_ID_SUFFIX_CHARS: usize = 200;
 const MAX_PUBLIC_AGENT_MESSAGE_TEXT_CHARS: usize = 16_000;
 const MAX_PUBLIC_AGENT_NAME_CHARS: usize = 160;
@@ -108,10 +114,25 @@ fn ensure_update_installation_is_idle(agents: &AgentsState) -> Result<(), String
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentRuntimeMode {
+    #[default]
+    Normal,
+    Plan,
+}
+
+#[derive(Clone)]
+struct PendingExtensionUiRecord {
+    id: String,
+    line: String,
+}
+
 #[derive(Clone)]
 struct RunningAgent {
     info: RunningAgentInfo,
     append_system_prompt: Option<String>,
+    pending_extension_ui_requests: Vec<PendingExtensionUiRecord>,
     daemon_socket: Option<PathBuf>,
     launch_spec: LaunchSpec,
     child: Arc<Mutex<Child>>,
@@ -197,6 +218,7 @@ pub struct RunningAgentInfo {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub thinking: Option<String>,
+    pub runtime_mode: AgentRuntimeMode,
     pub started_at: u64,
 }
 
@@ -218,9 +240,16 @@ struct SpawnedRpcAgent {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct AgentLineEvent {
+pub(crate) struct AgentLineEvent {
     conversation_id: String,
     line: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionUiResolvedEvent {
+    conversation_id: String,
+    request_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -458,6 +487,68 @@ fn emit_line(app: &AppHandle, event_name: &str, conversation_id: &str, line: Str
     );
 }
 
+fn parsed_extension_ui_request(record: &[u8]) -> Option<(String, bool, bool)> {
+    let event: Value = serde_json::from_slice(record).ok()?;
+    if event.get("type").and_then(Value::as_str) != Some("extension_ui_request") {
+        return None;
+    }
+    let id = event.get("id").and_then(Value::as_str)?;
+    if id.is_empty() || id.len() > 256 {
+        return None;
+    }
+    let method = event
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let awaits_response = matches!(method, "select" | "confirm" | "input" | "editor");
+    let claimed_plan_request = event
+        .get("title")
+        .and_then(Value::as_str)
+        .is_some_and(|title| title.starts_with(PLAN_UI_TITLE_PREFIX));
+    Some((id.to_string(), awaits_response, claimed_plan_request))
+}
+
+fn is_plan_review_request(event: &Value) -> bool {
+    if event.get("type").and_then(Value::as_str) != Some("extension_ui_request")
+        || event.get("method").and_then(Value::as_str) != Some("select")
+    {
+        return false;
+    }
+    let Some(title) = event.get("title").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(token) = title
+        .split_once('\n')
+        .map(|(marker, _)| marker)
+        .and_then(|marker| marker.strip_prefix(PLAN_UI_TITLE_PREFIX))
+    else {
+        return false;
+    };
+    if token.is_empty() || token.len() > 65_536 {
+        return false;
+    }
+    let Ok(bytes) = URL_SAFE_NO_PAD.decode(token) else {
+        return false;
+    };
+    if bytes.len() > 49_152 {
+        return false;
+    }
+    let Ok(payload) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    payload.get("v").and_then(Value::as_u64) == Some(1)
+        && payload.get("kind").and_then(Value::as_str) == Some("review")
+        && payload
+            .get("planId")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty() && value.len() <= 200)
+        && payload
+            .get("title")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty() && value.chars().count() <= 512)
+}
+
+#[cfg(test)]
 fn is_extension_ui_request(record: &[u8]) -> bool {
     serde_json::from_slice::<Value>(record)
         .ok()
@@ -471,17 +562,56 @@ fn is_extension_ui_request(record: &[u8]) -> bool {
         == Some("extension_ui_request")
 }
 
+fn cache_pending_extension_ui_request(
+    pending: &mut Vec<PendingExtensionUiRecord>,
+    id: String,
+    line: String,
+) -> bool {
+    if line.len() > MAX_PENDING_EXTENSION_UI_REQUEST_BYTES {
+        return false;
+    }
+    if let Some(existing) = pending.iter_mut().find(|request| request.id == id) {
+        existing.line = line;
+        return true;
+    }
+    if pending.len() >= MAX_PENDING_EXTENSION_UI_REQUESTS {
+        pending.remove(0);
+    }
+    pending.push(PendingExtensionUiRecord { id, line });
+    true
+}
+
+struct ExtensionRequestRoute {
+    owner: Option<String>,
+    plan_attention_request_id: Option<String>,
+}
+
 fn extension_request_target(
     agents: &AgentsState,
     conversation_id: &str,
+    pid: u32,
     record: &[u8],
-) -> Option<Option<String>> {
-    is_extension_ui_request(record).then(|| {
-        agents
-            .0
-            .lock()
-            .get(conversation_id)
-            .and_then(|agent| agent.interactive_owner.clone())
+    public_line: &str,
+) -> Option<ExtensionRequestRoute> {
+    let (id, awaits_response, claimed_plan_request) = parsed_extension_ui_request(record)?;
+    let mut map = agents.0.lock();
+    let agent = map
+        .get_mut(conversation_id)
+        .filter(|agent| agent.info.pid == pid && !agent.restarting)?;
+    if awaits_response {
+        cache_pending_extension_ui_request(
+            &mut agent.pending_extension_ui_requests,
+            id.clone(),
+            public_line.to_string(),
+        );
+    }
+    let plan_attention_request_id = (awaits_response
+        && claimed_plan_request
+        && agent.info.runtime_mode == AgentRuntimeMode::Plan)
+        .then_some(id);
+    Some(ExtensionRequestRoute {
+        owner: agent.interactive_owner.clone(),
+        plan_attention_request_id,
     })
 }
 
@@ -490,19 +620,28 @@ fn emit_runtime_line(
     event_name: &str,
     conversation_id: &str,
     line: String,
-    target: Option<Option<String>>,
+    target: Option<ExtensionRequestRoute>,
 ) {
     let event = AgentLineEvent {
         conversation_id: conversation_id.to_string(),
         line,
     };
     match target {
-        Some(Some(owner)) => {
-            let _ = app.emit_to(owner, event_name, event);
+        Some(route) => {
+            let delivered = route
+                .owner
+                .as_deref()
+                .is_some_and(|owner| app.emit_to(owner, event_name, event).is_ok());
+            if !delivered {
+                if let Some(request_id) = route.plan_attention_request_id {
+                    let _ = crate::notifications::notify_plan_attention_from_runtime(
+                        app,
+                        conversation_id,
+                        &request_id,
+                    );
+                }
+            }
         }
-        // An interactive request without a surviving owner must not be
-        // broadcast to unrelated windows, where it could be answered twice.
-        Some(None) => {}
         None => {
             let _ = app.emit(event_name, event);
         }
@@ -1063,8 +1202,8 @@ fn stream_records<R: Read>(
                 if let Some(diagnostic_tail) = diagnostic_tail.as_ref() {
                     append_diagnostic_tail(diagnostic_tail, &line);
                 }
-                let target = runtime_identity.as_ref().and_then(|(agents, _)| {
-                    extension_request_target(agents, &conversation_id, &record)
+                let target = runtime_identity.as_ref().and_then(|(agents, pid)| {
+                    extension_request_target(agents, &conversation_id, *pid, &record, &line)
                 });
                 emit_runtime_line(&app, event_name, &conversation_id, line, target);
             }
@@ -1154,6 +1293,18 @@ enum DirectSessionOperationRuntimeEvent {
         kind: DirectSessionOperationKind,
         acknowledgement_timed_out: bool,
     },
+}
+
+fn terminal_clears_pending_extension_ui(record: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(record)
+        .ok()
+        .and_then(|event| {
+            event
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|event_type| matches!(event_type.as_str(), "agent_end" | "turn_error"))
 }
 
 fn direct_session_operation_runtime_event(
@@ -1301,6 +1452,7 @@ fn is_current_agent_process(agents: &AgentsState, conversation_id: &str, pid: u3
 
 fn apply_runtime_record(agents: &AgentsState, conversation_id: &str, pid: u32, record: &[u8]) {
     let busy = runtime_busy_state(record);
+    let clear_pending_extension_ui = terminal_clears_pending_extension_ui(record);
     let direct_session_operation_event = direct_session_operation_runtime_event(record);
     let session_path = runtime_session_path(record).and_then(resolved_runtime_session_path);
     let session_id = runtime_session_id(record).filter(|id| {
@@ -1312,6 +1464,7 @@ fn apply_runtime_record(agents: &AgentsState, conversation_id: &str, pid: u32, r
     });
     let launch_options = runtime_launch_options(record);
     if busy.is_none()
+        && !clear_pending_extension_ui
         && direct_session_operation_event.is_none()
         && session_path.is_none()
         && session_id.is_none()
@@ -1329,6 +1482,9 @@ fn apply_runtime_record(agents: &AgentsState, conversation_id: &str, pid: u32, r
         }
         if let Some(busy) = busy {
             agent.busy = busy;
+        }
+        if clear_pending_extension_ui {
+            agent.pending_extension_ui_requests.clear();
         }
         if let Some(event) = direct_session_operation_event {
             apply_direct_session_operation_runtime_event(&mut agent.operations, event);
@@ -1569,6 +1725,7 @@ struct RuntimeWriteGuard {
     started_at: u64,
     restore_busy_on_error: Option<bool>,
     direct_session_operation_token: Option<u64>,
+    pending_extension_ui_claim: Option<PendingExtensionUiRecord>,
 }
 
 impl RuntimeWriteGuard {
@@ -1579,6 +1736,7 @@ impl RuntimeWriteGuard {
         started_at: u64,
         restore_busy_on_error: Option<bool>,
         direct_session_operation_token: Option<u64>,
+        pending_extension_ui_claim: Option<PendingExtensionUiRecord>,
     ) -> Self {
         Self {
             agents,
@@ -1587,12 +1745,14 @@ impl RuntimeWriteGuard {
             started_at,
             restore_busy_on_error,
             direct_session_operation_token,
+            pending_extension_ui_claim,
         }
     }
 
     fn commit(&mut self) {
         self.restore_busy_on_error = None;
         self.direct_session_operation_token = None;
+        self.pending_extension_ui_claim = None;
     }
 }
 
@@ -1611,6 +1771,15 @@ impl Drop for RuntimeWriteGuard {
             }
             if let Some(token) = self.direct_session_operation_token {
                 finish_direct_session_operation(&mut agent.operations, token);
+            }
+            if let Some(request) = self.pending_extension_ui_claim.take() {
+                if !agent
+                    .pending_extension_ui_requests
+                    .iter()
+                    .any(|pending| pending.id == request.id)
+                {
+                    agent.pending_extension_ui_requests.push(request);
+                }
             }
             finish_runtime_write(&mut agent.operations);
             idle_release_candidate(agent)
@@ -2120,12 +2289,15 @@ fn configure_bridge_daemon_socket(command: &mut std::process::Command, socket: O
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rpc_launch_arguments(
     session_path: Option<&Path>,
     provider: Option<&str>,
     model: Option<&str>,
     thinking: Option<&str>,
     append_system_prompt: Option<&str>,
+    runtime_mode: AgentRuntimeMode,
+    plan_extension: Option<&Path>,
     daemon_socket: Option<&Path>,
 ) -> Vec<OsString> {
     let mut arguments = vec![OsString::from("--mode"), OsString::from("rpc")];
@@ -2145,9 +2317,25 @@ fn rpc_launch_arguments(
         arguments.push(OsString::from("--thinking"));
         arguments.push(OsString::from(value));
     }
-    if let Some(value) = append_system_prompt {
-        arguments.push(OsString::from("--append-system-prompt"));
-        arguments.push(OsString::from(value));
+    if runtime_mode == AgentRuntimeMode::Normal {
+        if let Some(value) = append_system_prompt {
+            arguments.push(OsString::from("--append-system-prompt"));
+            arguments.push(OsString::from(value));
+        }
+    }
+    if runtime_mode == AgentRuntimeMode::Plan {
+        // Prime Agent treats --tools as both the initial active set and the
+        // registry allowlist. --no-extensions still admits the one explicit
+        // CLI extension, while project/global extensions and skills disappear.
+        arguments.push(OsString::from("--no-extensions"));
+        arguments.push(OsString::from("--no-skills"));
+        arguments.push(OsString::from("--no-prompt-templates"));
+        arguments.push(OsString::from("--tools"));
+        arguments.push(OsString::from(PLAN_RUNTIME_TOOLS));
+        if let Some(path) = plan_extension {
+            arguments.push(OsString::from("--extension"));
+            arguments.push(path.as_os_str().to_owned());
+        }
     }
     if let Some(path) = daemon_socket {
         arguments.push(OsString::from("--daemon-socket"));
@@ -2167,15 +2355,23 @@ fn spawn_rpc_agent(
     model: Option<String>,
     thinking: Option<String>,
     append_system_prompt: Option<String>,
+    runtime_mode: AgentRuntimeMode,
     daemon_socket: Option<&Path>,
     launch_spec: &LaunchSpec,
 ) -> Result<SpawnedRpcAgent, String> {
+    let plan_extension = if runtime_mode == AgentRuntimeMode::Plan {
+        Some(crate::plan_mode::ensure_plan_extension(app)?)
+    } else {
+        None
+    };
     let arguments = rpc_launch_arguments(
         session_path,
         provider.as_deref(),
         model.as_deref(),
         thinking.as_deref(),
         append_system_prompt.as_deref(),
+        runtime_mode,
+        plan_extension.as_deref(),
         daemon_socket,
     );
 
@@ -2217,6 +2413,7 @@ fn spawn_rpc_agent(
             provider,
             model,
             thinking,
+            runtime_mode,
             started_at: now_millis(),
         },
         child: Arc::new(Mutex::new(child)),
@@ -2313,6 +2510,7 @@ fn start_agent_blocking(
     model: Option<String>,
     thinking: Option<String>,
     append_system_prompt: Option<String>,
+    runtime_mode: AgentRuntimeMode,
 ) -> Result<RunningAgentInfo, String> {
     ensure_update_installation_is_idle(&agents)?;
     let conversation_id = validated_identifier(conversation_id)?;
@@ -2394,6 +2592,7 @@ fn start_agent_blocking(
         model,
         thinking,
         append_system_prompt.clone(),
+        runtime_mode,
         daemon_socket.as_deref(),
         &launch_spec,
     )?;
@@ -2406,6 +2605,7 @@ fn start_agent_blocking(
         RunningAgent {
             info: info.clone(),
             append_system_prompt,
+            pending_extension_ui_requests: Vec::new(),
             daemon_socket,
             launch_spec,
             child: Arc::clone(&spawned.child),
@@ -2478,7 +2678,7 @@ fn owner_may_send(
     payload_type: Option<&str>,
 ) -> bool {
     owners.contains(owner)
-        || (payload_type == Some("extension_ui_response") && interactive_owner == Some(owner))
+        && (payload_type != Some("extension_ui_response") || interactive_owner == Some(owner))
 }
 
 enum LaunchOptionUpdate {
@@ -2543,7 +2743,15 @@ fn send_rpc_blocking(
     }
     let option_update = requested_launch_option_update(&payload);
     let payload_type = payload.get("type").and_then(Value::as_str);
-    let (stdin, session_path, session_id, pid, started_at, admission_claim) = {
+    let extension_ui_response_id = (payload_type == Some("extension_ui_response"))
+        .then(|| {
+            payload
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .flatten();
+    let (stdin, session_path, session_id, pid, started_at, admission_claim, pending_ui_claim) = {
         let mut map = agents.0.lock();
         let agent = map
             .get_mut(&conversation_id)
@@ -2564,9 +2772,26 @@ fn send_rpc_blocking(
                 "Cette fenêtre ne possède pas la conversation Prime Agent demandée.".to_string(),
             );
         }
-        if agent.owners.contains(&owner) {
-            agent.interactive_owner = Some(owner.clone());
-        }
+        let pending_ui_position = if payload_type == Some("extension_ui_response") {
+            let response_id = extension_ui_response_id.as_deref().ok_or_else(|| {
+                "La réponse UI Prime Agent ne contient aucun identifiant valide.".to_string()
+            })?;
+            Some(
+                agent
+                    .pending_extension_ui_requests
+                    .iter()
+                    .position(|request| request.id == response_id)
+                    .ok_or_else(|| {
+                        "Cette requête UI Prime Agent est absente ou a déjà reçu une réponse."
+                            .to_string()
+                    })?,
+            )
+        } else {
+            if agent.owners.contains(&owner) {
+                agent.interactive_owner = Some(owner.clone());
+            }
+            None
+        };
         let admission_claim = begin_rpc_admission(
             &mut agent.busy,
             &mut agent.operations,
@@ -2584,6 +2809,8 @@ fn send_rpc_blocking(
                     .to_string()
             }
         })?;
+        let pending_ui_claim = pending_ui_position
+            .map(|position| agent.pending_extension_ui_requests.remove(position));
         (
             Arc::clone(&agent.stdin),
             agent.info.session_path.clone(),
@@ -2591,6 +2818,7 @@ fn send_rpc_blocking(
             agent.info.pid,
             agent.info.started_at,
             admission_claim,
+            pending_ui_claim,
         )
     };
     let mut runtime_write = RuntimeWriteGuard::new(
@@ -2600,6 +2828,7 @@ fn send_rpc_blocking(
         started_at,
         admission_claim.previous_busy,
         admission_claim.direct_session_operation_token,
+        pending_ui_claim,
     );
     // Attachment handles are owner-scoped and expanded only in native memory
     // at the last possible moment. Dropping the reservation on any
@@ -2636,13 +2865,15 @@ fn send_rpc_blocking(
         if let Some(reservation) = attachment_reservation {
             reservation.commit();
         }
-        if let Some(update) = option_update {
+        if option_update.is_some() {
             let mut map = agents.0.lock();
             if let Some(agent) = map
                 .get_mut(&conversation_id)
                 .filter(|agent| agent.info.pid == pid && !agent.restarting)
             {
-                apply_launch_option_update(&mut agent.info, update);
+                if let Some(update) = option_update {
+                    apply_launch_option_update(&mut agent.info, update);
+                }
             }
         }
     }
@@ -2743,6 +2974,7 @@ fn mutate_agent_queue_blocking(
         conversation_id.clone(),
         pid,
         started_at,
+        None,
         None,
         None,
     );
@@ -3028,6 +3260,7 @@ struct RestartSnapshot {
     model: Option<String>,
     thinking: Option<String>,
     append_system_prompt: Option<String>,
+    runtime_mode: AgentRuntimeMode,
     daemon_socket: Option<PathBuf>,
     launch_spec: LaunchSpec,
     child: Arc<Mutex<Child>>,
@@ -3040,6 +3273,7 @@ fn restart_agent_blocking(
     agents: AgentsState,
     owner: String,
     conversation_id: String,
+    requested_runtime_mode: Option<AgentRuntimeMode>,
 ) -> Result<RestartAgentResult, String> {
     ensure_update_installation_is_idle(&agents)?;
     let conversation_id = validated_identifier(conversation_id)?;
@@ -3048,6 +3282,17 @@ fn restart_agent_blocking(
         let agent = map
             .get_mut(&conversation_id)
             .ok_or_else(|| format!("Aucun Prime Agent actif pour {conversation_id}"))?;
+        if !agent.owners.contains(&owner) {
+            return Err(
+                "Cette fenêtre ne possède pas la conversation Prime Agent demandée.".to_string(),
+            );
+        }
+        if requested_runtime_mode.is_some() && agent.interactive_owner.as_deref() != Some(&owner) {
+            return Err(
+                "Seule la fenêtre interactive peut changer le mode de cette conversation."
+                    .to_string(),
+            );
+        }
         if agent.restarting {
             return Err("Le redémarrage de cette conversation est déjà en cours.".to_string());
         }
@@ -3060,6 +3305,12 @@ fn restart_agent_blocking(
         if agent.operations.runtime_writes > 0 {
             return Err(
                 "Une commande Prime Agent est en cours d’envoi. Réessayez le redémarrage dans un instant."
+                    .to_string(),
+            );
+        }
+        if requested_runtime_mode.is_some() && agent.busy {
+            return Err(
+                "Le mode de cette conversation ne peut changer que lorsque Prime Agent est au repos."
                     .to_string(),
             );
         }
@@ -3085,6 +3336,7 @@ fn restart_agent_blocking(
             model: agent.info.model.clone(),
             thinking: agent.info.thinking.clone(),
             append_system_prompt: agent.append_system_prompt.clone(),
+            runtime_mode: requested_runtime_mode.unwrap_or(agent.info.runtime_mode),
             daemon_socket: agent.daemon_socket.clone(),
             launch_spec: agent.launch_spec.clone(),
             child: Arc::clone(&agent.child),
@@ -3183,6 +3435,7 @@ fn restart_agent_blocking(
             snapshot.model.clone(),
             snapshot.thinking.clone(),
             snapshot.append_system_prompt.clone(),
+            snapshot.runtime_mode,
             snapshot.daemon_socket.as_deref(),
             &snapshot.launch_spec,
         ) {
@@ -3208,6 +3461,7 @@ fn restart_agent_blocking(
             RunningAgent {
                 info: info.clone(),
                 append_system_prompt: snapshot.append_system_prompt,
+                pending_extension_ui_requests: Vec::new(),
                 daemon_socket: snapshot.daemon_socket,
                 launch_spec: snapshot.launch_spec,
                 child: Arc::clone(&spawned.child),
@@ -3383,6 +3637,32 @@ fn stop_agent_blocking(
     Ok(true)
 }
 
+fn pending_extension_ui_requests_blocking(
+    agents: AgentsState,
+    owner: String,
+    conversation_id: String,
+) -> Result<Vec<AgentLineEvent>, String> {
+    let conversation_id = validated_identifier(conversation_id)?;
+    let map = agents.0.lock();
+    let Some(agent) = map.get(&conversation_id) else {
+        return Ok(Vec::new());
+    };
+    if agent.interactive_owner.as_deref() != Some(owner.as_str()) {
+        return Err(
+            "Cette fenêtre n’est pas propriétaire des demandes interactives de cette conversation."
+                .to_string(),
+        );
+    }
+    Ok(agent
+        .pending_extension_ui_requests
+        .iter()
+        .map(|request| AgentLineEvent {
+            conversation_id: conversation_id.clone(),
+            line: request.line.clone(),
+        })
+        .collect())
+}
+
 fn list_running_agents_blocking(agents: AgentsState) -> Result<Vec<RunningAgentInfo>, String> {
     let mut running: Vec<_> = agents
         .0
@@ -3407,9 +3687,11 @@ pub async fn start_agent(
     model: Option<String>,
     thinking: Option<String>,
     append_system_prompt: Option<String>,
+    runtime_mode: Option<AgentRuntimeMode>,
 ) -> Result<RunningAgentInfo, String> {
     let agents = agents.inner().clone();
     let owner = window.label().to_string();
+    let runtime_mode = runtime_mode.unwrap_or_default();
     crate::run_blocking(move || {
         start_agent_blocking(
             app,
@@ -3422,6 +3704,7 @@ pub async fn start_agent(
             model,
             thinking,
             append_system_prompt,
+            runtime_mode,
         )
     })
     .await
@@ -3450,8 +3733,17 @@ pub async fn send_rpc(
     let agents = agents.inner().clone();
     let attachments = attachments.inner().clone();
     let owner = window.label().to_string();
-    let app_data_dir = window
-        .app_handle()
+    let app = window.app_handle().clone();
+    let resolved_request_id = (payload.get("type").and_then(Value::as_str)
+        == Some("extension_ui_response"))
+    .then(|| {
+        payload
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
+    .flatten();
+    let app_data_dir = app
         .path()
         .app_data_dir()
         .map_err(|error| format!("Impossible de résoudre le stockage Prime Orbit: {error}"))?;
@@ -3461,6 +3753,7 @@ pub async fn send_rpc(
         &conversation_id,
         &payload,
     )?;
+    let resolved_conversation_id = conversation_id.clone();
     crate::run_blocking(move || {
         send_rpc_blocking(
             agents,
@@ -3471,7 +3764,17 @@ pub async fn send_rpc(
             payload,
         )
     })
-    .await
+    .await?;
+    if let Some(request_id) = resolved_request_id {
+        let _ = app.emit(
+            "prime-agent://extension-ui-resolved",
+            ExtensionUiResolvedEvent {
+                conversation_id: resolved_conversation_id,
+                request_id,
+            },
+        );
+    }
+    Ok(())
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -3548,10 +3851,68 @@ pub async fn restart_agent(
     window: tauri::WebviewWindow,
     agents: tauri::State<'_, AgentsState>,
     conversation_id: String,
+    runtime_mode: Option<AgentRuntimeMode>,
 ) -> Result<RestartAgentResult, String> {
     let agents = agents.inner().clone();
     let owner = window.label().to_string();
-    crate::run_blocking(move || restart_agent_blocking(app, agents, owner, conversation_id)).await
+    crate::run_blocking(move || {
+        restart_agent_blocking(app, agents, owner, conversation_id, runtime_mode)
+    })
+    .await
+}
+
+pub(crate) fn attest_plan_document_write(
+    agents: &AgentsState,
+    owner: &str,
+    conversation_id: &str,
+    request_id: &str,
+    project_path: &Path,
+) -> Result<(), String> {
+    let conversation_id = validated_identifier(conversation_id.to_string())?;
+    let request_id = validated_identifier(request_id.to_string())?;
+    let map = agents.0.lock();
+    let agent = map
+        .get(&conversation_id)
+        .ok_or_else(|| format!("Aucun Prime Agent actif pour {conversation_id}"))?;
+    if agent.info.runtime_mode != AgentRuntimeMode::Plan {
+        return Err("L’écriture d’un document Plan exige le runtime Plan isolé.".to_string());
+    }
+    let active_project = validated_cwd(agent.info.cwd.clone())?;
+    let requested_project = validated_cwd(project_path.to_string_lossy().into_owned())?;
+    if active_project != requested_project {
+        return Err("Le document Plan ne cible pas le projet du runtime actif.".to_string());
+    }
+    if !agent.owners.contains(owner) || agent.interactive_owner.as_deref() != Some(owner) {
+        return Err(
+            "Seule la fenêtre interactive du runtime Plan peut enregistrer ce document."
+                .to_string(),
+        );
+    }
+    let pending = agent
+        .pending_extension_ui_requests
+        .iter()
+        .find(|request| request.id == request_id)
+        .ok_or_else(|| "La demande de validation Plan est absente ou déjà résolue.".to_string())?;
+    let event: Value = serde_json::from_str(&pending.line)
+        .map_err(|_| "La demande de validation Plan native est invalide.".to_string())?;
+    if !is_plan_review_request(&event) {
+        return Err("La demande native n’autorise pas l’écriture d’un document Plan.".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn list_pending_extension_ui_requests(
+    window: tauri::WebviewWindow,
+    agents: tauri::State<'_, AgentsState>,
+    conversation_id: String,
+) -> Result<Vec<AgentLineEvent>, String> {
+    let agents = agents.inner().clone();
+    let owner = window.label().to_string();
+    crate::run_blocking(move || {
+        pending_extension_ui_requests_blocking(agents, owner, conversation_id)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -3688,22 +4049,24 @@ mod tests {
     use super::{
         acquire_owner_lease, append_diagnostic_tail, apply_direct_session_operation_runtime_event,
         apply_launch_option_update, begin_owned_resource_reload, begin_rpc_admission,
-        begin_runtime_write, begin_update_installation, close_rpc_stdin_for_restart,
-        conflicting_session_conversation, direct_session_operation_runtime_event,
-        ensure_update_installation_is_idle, finish_resource_reload, finish_runtime_write,
-        is_extension_ui_request, is_reload_acknowledgement_timeout, lease_absence_attests_release,
+        begin_runtime_write, begin_update_installation, cache_pending_extension_ui_request,
+        close_rpc_stdin_for_restart, conflicting_session_conversation,
+        direct_session_operation_runtime_event, ensure_update_installation_is_idle,
+        finish_resource_reload, finish_runtime_write, is_extension_ui_request,
+        is_plan_review_request, is_reload_acknowledgement_timeout, lease_absence_attests_release,
         managed_daemon_shutdown_target, managed_generation_daemon_socket,
-        mark_resource_reload_unknown, owner_may_send, public_runtime_line,
-        release_owner_lease_state, requested_launch_option_update, restart_slot_matches,
-        rpc_launch_arguments, rpc_starts_busy_operation, runtime_busy_state,
+        mark_resource_reload_unknown, owner_may_send, parsed_extension_ui_request,
+        public_runtime_line, release_owner_lease_state, requested_launch_option_update,
+        restart_slot_matches, rpc_launch_arguments, rpc_starts_busy_operation, runtime_busy_state,
         runtime_launch_options, runtime_session_id, runtime_session_path,
-        should_emit_resources_reloaded, validate_queue_lane, validate_queue_mutation,
-        validate_reload_result, wait_for_child_until, waiter_may_remove_slot, AgentOperations,
-        AgentResourcesReloadedEvent, AgentsState, DirectSessionOperationKind,
-        DirectSessionOperationRuntimeEvent, LaunchOptionUpdate, LaunchSpec, QueuedMessageMutation,
-        ReloadAgentResourcesResult, ResourceReloadClaimError, ResourceReloadPhase,
-        RestartAgentResult, RpcAdmissionError, RunningAgentInfo, INVALID_AGENT_MESSAGE_PLACEHOLDER,
-        MAX_EXIT_DIAGNOSTIC_BYTES,
+        should_emit_resources_reloaded, terminal_clears_pending_extension_ui, validate_queue_lane,
+        validate_queue_mutation, validate_reload_result, wait_for_child_until,
+        waiter_may_remove_slot, AgentOperations, AgentResourcesReloadedEvent, AgentRuntimeMode,
+        AgentsState, DirectSessionOperationKind, DirectSessionOperationRuntimeEvent,
+        LaunchOptionUpdate, LaunchSpec, QueuedMessageMutation, ReloadAgentResourcesResult,
+        ResourceReloadClaimError, ResourceReloadPhase, RestartAgentResult, RpcAdmissionError,
+        RunningAgentInfo, INVALID_AGENT_MESSAGE_PLACEHOLDER, MAX_EXIT_DIAGNOSTIC_BYTES,
+        MAX_PENDING_EXTENSION_UI_REQUESTS, MAX_PENDING_EXTENSION_UI_REQUEST_BYTES,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use parking_lot::Mutex;
@@ -3727,6 +4090,7 @@ mod tests {
             provider: None,
             model: None,
             thinking: None,
+            runtime_mode: AgentRuntimeMode::Normal,
             started_at: 0,
         }
     }
@@ -3800,6 +4164,70 @@ mod tests {
             br#"{"type":"extension_ui_request","id":"request-1","method":"confirm"}"#
         ));
         assert!(!is_extension_ui_request(br#"{"type":"agent_start"}"#));
+    }
+
+    #[test]
+    fn pending_extension_dialogs_are_bounded_replaced_and_terminally_cleared() {
+        let select = br#"{"type":"extension_ui_request","id":"request-1","method":"select"}"#;
+        assert_eq!(
+            parsed_extension_ui_request(select),
+            Some(("request-1".to_string(), true, false))
+        );
+        let notify = br#"{"type":"extension_ui_request","id":"notice-1","method":"notify"}"#;
+        assert_eq!(
+            parsed_extension_ui_request(notify),
+            Some(("notice-1".to_string(), false, false))
+        );
+
+        let plan = br#"{"type":"extension_ui_request","id":"plan-1","method":"select","title":"prime-orbit-plan-ui:v1:eyJ2IjoxLCJraW5kIjoicmV2aWV3IiwicGxhbklkIjoidG9vbC0xIiwidGl0bGUiOiJQbGFuIn0\nPlan"}"#;
+        assert_eq!(
+            parsed_extension_ui_request(plan),
+            Some(("plan-1".to_string(), true, true))
+        );
+        assert!(is_plan_review_request(
+            &serde_json::from_slice::<Value>(plan).unwrap()
+        ));
+
+        let mut pending = Vec::new();
+        cache_pending_extension_ui_request(
+            &mut pending,
+            "request-1".to_string(),
+            "first".to_string(),
+        );
+        cache_pending_extension_ui_request(
+            &mut pending,
+            "request-1".to_string(),
+            "replacement".to_string(),
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].line, "replacement");
+        assert!(!cache_pending_extension_ui_request(
+            &mut pending,
+            "oversized".to_string(),
+            "x".repeat(MAX_PENDING_EXTENSION_UI_REQUEST_BYTES + 1),
+        ));
+        assert_eq!(pending.len(), 1);
+        for index in 0..=MAX_PENDING_EXTENSION_UI_REQUESTS {
+            cache_pending_extension_ui_request(
+                &mut pending,
+                format!("request-{index}"),
+                format!("line-{index}"),
+            );
+        }
+        assert_eq!(pending.len(), MAX_PENDING_EXTENSION_UI_REQUESTS);
+        assert_eq!(
+            pending.last().map(|request| request.id.as_str()),
+            Some("request-32")
+        );
+        assert!(terminal_clears_pending_extension_ui(
+            br#"{"type":"agent_end"}"#
+        ));
+        assert!(terminal_clears_pending_extension_ui(
+            br#"{"type":"turn_error"}"#
+        ));
+        assert!(!terminal_clears_pending_extension_ui(
+            br#"{"type":"message_end"}"#
+        ));
     }
 
     #[test]
@@ -4076,8 +4504,8 @@ mod tests {
     }
 
     #[test]
-    fn only_an_owner_or_the_interactive_responder_can_write_rpc() {
-        let owners = HashSet::from(["workspace-2".to_string()]);
+    fn only_the_interactive_owner_can_answer_extension_ui() {
+        let owners = HashSet::from(["workspace-2".to_string(), "main".to_string()]);
         assert!(owner_may_send(
             &owners,
             Some("workspace-2"),
@@ -4087,13 +4515,19 @@ mod tests {
         assert!(!owner_may_send(
             &owners,
             Some("main"),
-            "main",
+            "foreign",
             Some("prompt"),
         ));
         assert!(owner_may_send(
             &owners,
             Some("main"),
             "main",
+            Some("extension_ui_response"),
+        ));
+        assert!(!owner_may_send(
+            &owners,
+            Some("main"),
+            "workspace-2",
             Some("extension_ui_response"),
         ));
     }
@@ -4747,6 +5181,8 @@ mod tests {
             Some("gpt-5.6-sol"),
             Some("xhigh"),
             Some("Prefer rlm.run thinking high."),
+            AgentRuntimeMode::Normal,
+            None,
             Some(daemon_socket),
         )
         .into_iter()
@@ -4771,6 +5207,41 @@ mod tests {
                 r"\\.\pipe\prime-orbit-daemon-prime-agent-v0.7.4-4a6f213a1ed44889a0f0b40ea4774f3d",
             ]
         );
+    }
+
+    #[test]
+    fn plan_runtime_launch_isolated_to_the_embedded_tools_and_extension() {
+        let extension = Path::new(r"C:\Orbit Runtime\prime-orbit-plan-mode.ts");
+        let arguments = rpc_launch_arguments(
+            None,
+            None,
+            None,
+            Some("high"),
+            Some("A normal-runtime prompt must be ignored."),
+            AgentRuntimeMode::Plan,
+            Some(extension),
+            None,
+        )
+        .into_iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            [
+                "--mode",
+                "rpc",
+                "--thinking",
+                "high",
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--tools",
+                "prime_orbit_plan_inspect,prime_orbit_plan_question,prime_orbit_plan_submit",
+                "--extension",
+                r"C:\Orbit Runtime\prime-orbit-plan-mode.ts",
+            ]
+        );
+        assert!(!arguments.iter().any(|argument| argument == "ipython"));
     }
 
     fn source_launch_spec(name: &str, managed: bool) -> LaunchSpec {

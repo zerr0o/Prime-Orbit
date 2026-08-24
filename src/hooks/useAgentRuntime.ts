@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { getAppLanguage } from "../i18n";
 import {
   beginHtmlExport,
   cancelHtmlExport,
@@ -7,17 +8,38 @@ import {
   listenToAgentEvents,
   listenToAgentResourceReloads,
   listenToAgentRestarts,
+  listPendingExtensionUiRequests,
   listRunningAgents,
+  notifyPlanAttention,
   loadSessionHistory,
   mutateAgentQueue,
   reloadAgentResources,
   restartAgent,
   sendRpc,
   startAgent,
+  writePlanDocument,
   stopAgent,
+  type AgentRuntimeMode,
   type QueueMutation,
   type StartAgentOptions,
 } from "../lib/bridge";
+import {
+  EMPTY_PLAN_MODE,
+  answerPlanQuestion,
+  cancelPlanMode,
+  decodePlanUiRequestTitle,
+  decidePlanReview,
+  isClaimedPlanUiRequest,
+  isTrustedPlanUiRequest,
+  normalizePlanDocument,
+  openPlanQuestion,
+  openPlanReview,
+  resolvePlanState,
+  startPlanMode,
+  type PlanDocument,
+  type PlanModeState,
+  type PlanReviewDecision,
+} from "../lib/plan-mode";
 import { redactText, redactValue } from "../lib/redaction";
 import { buildRlmDelegationPrompt } from "../lib/rlm-preferences";
 import {
@@ -946,6 +968,82 @@ export function enqueueExtensionRequest(
   return next;
 }
 
+function planRuntimeText(french: string, english: string): string {
+  return getAppLanguage() === "en" ? english : french;
+}
+
+type PendingPlanFinalization = NonNullable<Conversation["pendingPlanAction"]>;
+
+export function conversationPlanState(conversation: Pick<Conversation, "planMode"> | undefined): PlanModeState {
+  return resolvePlanState(conversation?.planMode) ?? EMPTY_PLAN_MODE;
+}
+
+export function runtimeModeForPlan(state: PlanModeState): AgentRuntimeMode {
+  return state.phase === "idle" ? "normal" : "plan";
+}
+
+export function runtimeModeForConversationPlan(
+  conversation: Pick<Conversation, "planMode" | "pendingPlanAction"> | undefined,
+): AgentRuntimeMode {
+  const pending = conversation?.pendingPlanAction;
+  if (pending?.stage === "decisionRecorded") return "plan";
+  if (pending) return "normal";
+  return runtimeModeForPlan(conversationPlanState(conversation));
+}
+
+export function recordedPlanResponseValue(
+  pending: Conversation["pendingPlanAction"] | undefined,
+  request: Pick<PendingExtensionUiRequest, "options">,
+  decoded: ReturnType<typeof decodePlanUiRequestTitle>,
+): string | undefined {
+  if (pending?.stage !== "decisionRecorded" || decoded?.payload.kind !== "review") return undefined;
+  return request.options?.[pending.decision === "apply" ? 0 : 1];
+}
+
+export function planDocumentForReview(
+  conversation: Pick<Conversation, "messages">,
+  planId: string,
+  title: string,
+): Omit<PlanDocument, "round"> | undefined {
+  for (let messageIndex = conversation.messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const tools = conversation.messages[messageIndex]?.tools ?? [];
+    for (let toolIndex = tools.length - 1; toolIndex >= 0; toolIndex -= 1) {
+      const tool = tools[toolIndex];
+      if (tool?.id !== planId || tool.name !== "prime_orbit_plan_submit") continue;
+      const input = tool.input && typeof tool.input === "object" ? tool.input as Record<string, unknown> : undefined;
+      return normalizePlanDocument({ name: title, markdown: input?.document });
+    }
+  }
+  return undefined;
+}
+
+const PLAN_HANDOFF_MARKER_PREFIX = "prime-orbit-plan-handoff:v1:";
+
+export function planHandoffMarker(handoffId: string): string {
+  return `<!-- ${PLAN_HANDOFF_MARKER_PREFIX}${handoffId} -->`;
+}
+
+export function conversationHasPlanHandoff(
+  conversation: Pick<Conversation, "messages"> | undefined,
+  handoffId: string,
+): boolean {
+  const marker = planHandoffMarker(handoffId);
+  return Boolean(conversation?.messages.some(
+    (message) => message.role === "user" && message.content.includes(marker),
+  ));
+}
+
+function planImplementationPrompt(document: PlanDocument, relativePath: string, handoffId: string): string {
+  return [
+    planHandoffMarker(handoffId),
+    `[Prime Orbit approved plan: ${relativePath}]`,
+    "Implement the approved plan now in this same conversation.",
+    "Use the normal runtime tools. Treat the saved Markdown below as the source of truth.",
+    "",
+    document.markdown,
+  ].join("\n");
+}
+
 /**
  * Builds the authoritative diagnostic for a process exit. stderr usually
  * contains the actionable Node/Python error, while the bridge error explains
@@ -990,6 +1088,7 @@ export function useAgentRuntime(options: {
   preserveSessionReference: (conversationId: string, title: string) => string | undefined;
   discardSessionReference: (conversationId: string) => void;
   updateConversation: (id: string, updater: Partial<Conversation> | ((current: Conversation) => Conversation)) => void;
+  flushWorkspaceState: () => Promise<boolean>;
   onInstallProgress: (phase: string, message: string) => void;
   onInstallComplete: (detection: RuntimeDetection) => void;
   onNotice?: (notice: RuntimeNotice) => void;
@@ -1004,6 +1103,7 @@ export function useAgentRuntime(options: {
     preserveSessionReference,
     discardSessionReference,
     updateConversation,
+    flushWorkspaceState,
     onInstallProgress,
     onInstallComplete,
     onNotice,
@@ -1012,6 +1112,9 @@ export function useAgentRuntime(options: {
   const [extensionRequests, setExtensionRequests] = useState<PendingExtensionUiRequest[]>([]);
   const [eventsReady, setEventsReady] = useState(!isNative());
   const started = useRef(new Set<string>());
+  const runtimeModes = useRef(new Map<string, AgentRuntimeMode>());
+  const pendingPlanFinalizations = useRef(new Map<string, PendingPlanFinalization>());
+  const planFinalizationsInFlight = useRef(new Set<string>());
   const startInFlight = useRef(new Map<string, Promise<void>>());
   const historyInFlight = useRef(new Map<string, HistoryLoad>());
   const historyLoaded = useRef(new Set<string>());
@@ -1058,6 +1161,7 @@ export function useAgentRuntime(options: {
   // run, while clearing it blindly could hide a genuinely running agent.
   const activeAgentLifecycles = useRef(new Set<string>());
   const extensionResponsesInFlight = useRef(new Set<string>());
+  const recordedPlanResponsesInFlight = useRef(new Set<string>());
   const maintenanceEventVersions = useRef(new Map<string, number>());
   const maintenanceRefreshes = useRef(new Map<string, Promise<void>>());
   const getProjectRef = useRef(getProject);
@@ -1918,6 +2022,139 @@ export function useAgentRuntime(options: {
     [addActivity, applySessionStateSnapshot, isCurrentSelection, loadConversationHistory, recentCompactionEnd, sendSelectionRequest, setRuntimeCompacting, updateConversation],
   );
 
+  const finalizePendingPlan = useCallback(async (conversationId: string) => {
+    if (planFinalizationsInFlight.current.has(conversationId)) return;
+    const initialPending = pendingPlanFinalizations.current.get(conversationId)
+      ?? getConversation(conversationId)?.pendingPlanAction;
+    if (!initialPending) return;
+    let pending: PendingPlanFinalization = initialPending;
+    pendingPlanFinalizations.current.set(conversationId, pending);
+    planFinalizationsInFlight.current.add(conversationId);
+
+    const persistStage = async (stage: PendingPlanFinalization["stage"]) => {
+      pending = { ...pending, stage };
+      pendingPlanFinalizations.current.set(conversationId, pending);
+      updateConversation(conversationId, (conversation) => ({
+        ...conversation,
+        pendingPlanAction: pending,
+        lastError: undefined,
+      }));
+      if (!await flushWorkspaceState()) {
+        throw new Error(planRuntimeText(
+          "Le handoff du plan n’a pas pu être enregistré de façon durable.",
+          "The plan handoff could not be saved durably.",
+        ));
+      }
+    };
+
+    const clearCompletedHandoff = async () => {
+      pendingPlanFinalizations.current.delete(conversationId);
+      updateConversation(conversationId, {
+        planMode: EMPTY_PLAN_MODE,
+        planArtifactId: undefined,
+        pendingPlanAction: undefined,
+        lastError: undefined,
+      });
+      await flushWorkspaceState();
+    };
+
+    try {
+      if (pending.stage === "applySending") {
+        const conversation = getConversation(conversationId);
+        if (conversationHasPlanHandoff(conversation, pending.handoffId)) {
+          await clearCompletedHandoff();
+          return;
+        }
+        if (conversation?.sessionPath && !historyLoaded.current.has(conversationId)) {
+          // The canonical transcript decides whether the stable handoff marker
+          // was admitted before a reload. Never retry until a fresh history
+          // snapshot has completed after the admission stage.
+          await loadConversationHistory(
+            conversationId,
+            activeSelection.current.generation,
+          );
+          if (historyLoaded.current.has(conversationId)) {
+            window.setTimeout(() => void finalizePendingPlan(conversationId), 0);
+            return;
+          }
+          throw new Error(planRuntimeText(
+            "L’historique Prime Agent requis pour vérifier le handoff est indisponible.",
+            "The Prime Agent history required to verify the handoff is unavailable.",
+          ));
+        }
+      }
+
+      if (pending.stage === "decisionRecorded") {
+        const result = await restartAgent(conversationId, "normal");
+        if (!result || result.agent.runtimeMode !== "normal") {
+          throw new Error(planRuntimeText(
+            "Prime Agent n’a pas pu quitter le runtime Plan.",
+            "Prime Agent could not exit the Plan runtime.",
+          ));
+        }
+        runtimeModes.current.set(conversationId, result.agent.runtimeMode);
+        started.current.add(conversationId);
+        await persistStage("runtimeNormal");
+      }
+
+      if (pending.decision === "keep") {
+        await clearCompletedHandoff();
+      } else {
+        if (pending.stage !== "applySending") await persistStage("applySending");
+        const message = planImplementationPrompt(
+          pending.document,
+          pending.relativePath,
+          pending.handoffId,
+        );
+        historyLoaded.current.delete(conversationId);
+        activePromptRuns.current.add(conversationId);
+        updateConversation(conversationId, { status: "starting", lastError: undefined });
+        await sendRpc(conversationId, {
+          id: `plan-apply-${pending.handoffId}`,
+          type: "prompt",
+          message,
+        });
+        updateConversation(conversationId, {
+          hasContent: true,
+          updatedAt: now(),
+        });
+      }
+
+      addActivity(conversationId, {
+        type: "plan_runtime_transition",
+        title: pending.decision === "apply"
+          ? planRuntimeText("Implémentation du plan lancée", "Plan implementation started")
+          : planRuntimeText("Plan conservé", "Plan kept"),
+        detail: pending.relativePath,
+        status: "success",
+      });
+    } catch (error) {
+      activePromptRuns.current.delete(conversationId);
+      const detail = error instanceof Error ? error.message : String(error);
+      addActivity(conversationId, {
+        type: "plan_runtime_transition",
+        title: planRuntimeText("Impossible de finaliser le mode Plan", "Could not finalize Plan mode"),
+        detail,
+        status: "error",
+      });
+      updateConversation(conversationId, { status: "error", lastError: detail });
+    } finally {
+      planFinalizationsInFlight.current.delete(conversationId);
+    }
+  }, [addActivity, flushWorkspaceState, getConversation, loadConversationHistory, updateConversation]);
+
+  useEffect(() => {
+    if (
+      selectedConversation?.pendingPlanAction
+      && selectedConversation.status === "idle"
+      && started.current.has(selectedConversation.id)
+      && eventsReady
+    ) {
+      pendingPlanFinalizations.current.set(selectedConversation.id, selectedConversation.pendingPlanAction);
+      void finalizePendingPlan(selectedConversation.id);
+    }
+  }, [eventsReady, finalizePendingPlan, selectedConversation]);
+
   const handleAgentEvent = useCallback(
     (conversationId: string, event: RpcEnvelope) => {
       const eventType = event.type;
@@ -1941,7 +2178,138 @@ export function useAgentRuntime(options: {
             conversationId,
             requestKey: extensionRequestKey(conversationId, request.id),
           };
-          setExtensionRequests((current) => enqueueExtensionRequest(current, pendingRequest));
+          const claimedPlanRequest = isClaimedPlanUiRequest(request);
+          const validPlanRequest = isTrustedPlanUiRequest(
+            request,
+            runtimeModes.current.get(conversationId),
+          );
+          const decoded = validPlanRequest ? decodePlanUiRequestTitle(request.title) : undefined;
+          const recordedPending = pendingPlanFinalizations.current.get(conversationId)
+            ?? getConversationRef.current(conversationId)?.pendingPlanAction;
+          const recordedValue = recordedPlanResponseValue(recordedPending, request, decoded);
+          if (recordedPending && recordedValue) {
+            pendingPlanFinalizations.current.set(conversationId, recordedPending);
+            if (!recordedPlanResponsesInFlight.current.has(pendingRequest.requestKey)) {
+              recordedPlanResponsesInFlight.current.add(pendingRequest.requestKey);
+              void sendRpc(conversationId, {
+                type: "extension_ui_response",
+                id: request.id,
+                value: recordedValue,
+              }).then(() => {
+                setExtensionRequests((current) => current.filter(
+                  (item) => item.requestKey !== pendingRequest.requestKey,
+                ));
+              }).catch((error) => {
+                setExtensionRequests((current) => enqueueExtensionRequest(current, pendingRequest));
+                const detail = error instanceof Error ? error.message : String(error);
+                updateConversation(conversationId, (conversation) => {
+                  let state = conversationPlanState(conversation);
+                  if (state.phase === "idle") {
+                    const startedPlan = startPlanMode(state);
+                    if (startedPlan.status === "accepted") state = startedPlan.state;
+                  }
+                  const opened = openPlanReview(state, { document: recordedPending.document });
+                  return {
+                    ...conversation,
+                    ...(opened.status === "accepted" ? { planMode: opened.state } : {}),
+                    status: "error",
+                    lastError: detail,
+                  };
+                });
+                addActivity(conversationId, {
+                  id: `plan-recorded-response-error:${request.id}`,
+                  type: "plan_recorded_response_error",
+                  title: planRuntimeText(
+                    "Décision Plan enregistrée mais non transmise",
+                    "Saved Plan decision not sent",
+                  ),
+                  detail,
+                  status: "error",
+                });
+              }).finally(() => {
+                recordedPlanResponsesInFlight.current.delete(pendingRequest.requestKey);
+              });
+            }
+            return;
+          }
+          if (claimedPlanRequest && !validPlanRequest) {
+            addActivity(conversationId, {
+              id: `plan-protocol-error:${request.id}`,
+              type: "plan_protocol_error",
+              title: planRuntimeText("Dialogue Plan invalide bloqué", "Invalid Plan dialog blocked"),
+              detail: planRuntimeText(
+                "Le marqueur interne est présent mais son contrat versionné est invalide.",
+                "The internal marker is present, but its versioned contract is invalid.",
+              ),
+              status: "error",
+              raw: request,
+            });
+            void sendRpc(conversationId, {
+              type: "extension_ui_response",
+              id: request.id,
+              cancelled: true,
+            }).catch(() => undefined);
+          } else {
+            setExtensionRequests((current) => enqueueExtensionRequest(current, pendingRequest));
+          }
+          if (validPlanRequest) {
+            updateConversation(conversationId, (conversation) => {
+              let state = conversationPlanState(conversation);
+              if (state.phase === "idle") {
+                const startedPlan = startPlanMode(state);
+                if (startedPlan.status === "accepted") state = startedPlan.state;
+              }
+              if (decoded?.payload.kind === "review") {
+                const document = planDocumentForReview(
+                  conversation,
+                  decoded.payload.planId,
+                  decoded.payload.title,
+                );
+                if (!document) return conversation;
+                const transition = openPlanReview(state, { document });
+                return transition.status === "accepted"
+                  ? {
+                      ...conversation,
+                      planMode: transition.state,
+                      planArtifactId: conversation.planArtifactId ?? crypto.randomUUID(),
+                    }
+                  : conversation;
+              }
+              const transition = openPlanQuestion(state, { request });
+              return transition.status === "accepted"
+                ? {
+                    ...conversation,
+                    planMode: transition.state,
+                    planArtifactId: conversation.planArtifactId ?? crypto.randomUUID(),
+                  }
+                : conversation;
+            });
+            void notifyPlanAttention({
+              conversationId,
+              requestKey: request.id,
+              language: getAppLanguage(),
+            }).catch((error) => {
+              addActivity(conversationId, {
+                id: `plan-notification-error:${request.id}`,
+                type: "plan_notification_error",
+                title: planRuntimeText(
+                  "Notification système indisponible",
+                  "System notification unavailable",
+                ),
+                detail: error instanceof Error ? error.message : String(error),
+                status: "warning",
+              });
+            });
+            addActivity(conversationId, {
+              id: `plan-attention:${request.id}`,
+              type: "plan_attention",
+              title: decoded?.payload.kind === "review"
+                ? planRuntimeText("Plan prêt à valider", "Plan ready to review")
+                : planRuntimeText("Question du mode Plan", "Plan mode question"),
+              status: "warning",
+              raw: request,
+            });
+          }
         }
         return;
       }
@@ -2124,6 +2492,19 @@ export function useAgentRuntime(options: {
           };
         });
         addActivity(conversationId, { type: eventType, title: "Exécution terminée", status: "success", raw: event });
+        const pendingPlan = pendingPlanFinalizations.current.get(conversationId);
+        if (pendingPlan?.stage === "applySending") {
+          pendingPlanFinalizations.current.delete(conversationId);
+          updateConversation(conversationId, {
+            planMode: EMPTY_PLAN_MODE,
+            planArtifactId: undefined,
+            pendingPlanAction: undefined,
+            lastError: undefined,
+          });
+          void flushWorkspaceState();
+        } else if (pendingPlan) {
+          void finalizePendingPlan(conversationId);
+        }
         window.setTimeout(() => {
           const actions = sessionActionsByConversation.current.get(conversationId);
           // agent_end is a stronger boundary than a possibly stale `active`
@@ -2151,6 +2532,22 @@ export function useAgentRuntime(options: {
       if (eventType === "message_start" || eventType === "message_update" || eventType === "message_end") {
         if (eventType === "message_start") {
           transcriptEpoch.current.set(conversationId, (transcriptEpoch.current.get(conversationId) ?? 0) + 1);
+          const pending = pendingPlanFinalizations.current.get(conversationId);
+          const message = asRecord(event.message);
+          if (
+            pending?.stage === "applySending"
+            && message?.role === "user"
+            && extractMessageText(message).includes(planHandoffMarker(pending.handoffId))
+          ) {
+            pendingPlanFinalizations.current.delete(conversationId);
+            updateConversation(conversationId, {
+              planMode: EMPTY_PLAN_MODE,
+              planArtifactId: undefined,
+              pendingPlanAction: undefined,
+              lastError: undefined,
+            });
+            void flushWorkspaceState();
+          }
         }
         handleMessageEvent(conversationId, event, updateConversation);
         if (shouldScheduleTerminalStateReconciliation(event)) {
@@ -2414,22 +2811,34 @@ export function useAgentRuntime(options: {
         addActivity(conversationId, { type: eventType, title: humanizeEvent(eventType), status: "info", raw: event });
       }
     },
-    [addActivity, cancelTerminalStateReconciliation, handleResponse, invalidateCompactionHistory, isCurrentSelection, recentCompactionEnd, refreshAfterCompaction, refreshLocalRefinements, reloadDeliveredQueueTranscript, removeActivity, scheduleTerminalStateReconciliation, sendSelectionRequest, setGoalMutationState, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation],
+    [addActivity, cancelTerminalStateReconciliation, finalizePendingPlan, flushWorkspaceState, handleResponse, invalidateCompactionHistory, isCurrentSelection, recentCompactionEnd, refreshAfterCompaction, refreshLocalRefinements, reloadDeliveredQueueTranscript, removeActivity, scheduleTerminalStateReconciliation, sendSelectionRequest, setGoalMutationState, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation],
   );
+
+  const consumeAgentEventLine = useCallback(({ conversationId, line }: { conversationId: string; line: string }) => {
+    try {
+      const event = JSON.parse(line) as RpcEnvelope;
+      addLog(conversationId, "rpc", summarizeRpcLog(line, event));
+      handleAgentEvent(conversationId, event);
+    } catch {
+      addLog(conversationId, "rpc", truncateRuntimeLog(line));
+      addActivity(conversationId, {
+        type: "protocol",
+        title: "Événement RPC illisible",
+        detail: line.slice(0, 220),
+        status: "warning",
+      });
+    }
+  }, [addActivity, addLog, handleAgentEvent]);
 
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     void listenToAgentEvents({
-      onEvent: ({ conversationId, line }) => {
-        try {
-          const event = JSON.parse(line) as RpcEnvelope;
-          addLog(conversationId, "rpc", summarizeRpcLog(line, event));
-          handleAgentEvent(conversationId, event);
-        } catch {
-          addLog(conversationId, "rpc", truncateRuntimeLog(line));
-          addActivity(conversationId, { type: "protocol", title: "Événement RPC illisible", detail: line.slice(0, 220), status: "warning" });
-        }
+      onEvent: consumeAgentEventLine,
+      onExtensionUiResolved: ({ conversationId, requestId }) => {
+        setExtensionRequests((current) => current.filter(
+          (request) => request.conversationId !== conversationId || request.id !== requestId,
+        ));
       },
       onStderr: ({ conversationId, line }) => {
         const detail = redactText(line.trim());
@@ -2455,6 +2864,7 @@ export function useAgentRuntime(options: {
         setRuntimeRefining(conversationId, false);
         setExtensionRequests((current) => current.filter((request) => request.conversationId !== conversationId));
         started.current.delete(conversationId);
+        runtimeModes.current.delete(conversationId);
         startInFlight.current.delete(conversationId);
         const expected = intentionallyStopped.current.delete(conversationId);
         sessionActionsByConversation.current.delete(conversationId);
@@ -2503,7 +2913,7 @@ export function useAgentRuntime(options: {
       if (isNative()) setEventsReady(false);
       unlisten?.();
     };
-  }, [addActivity, addLog, cancelConversationRequests, cancelPersistentConversationRequests, cancelTerminalStateReconciliation, handleAgentEvent, onInstallComplete, onInstallProgress, rejectGoalMutation, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation]);
+  }, [addActivity, addLog, cancelConversationRequests, cancelPersistentConversationRequests, cancelTerminalStateReconciliation, consumeAgentEventLine, onInstallComplete, onInstallProgress, rejectGoalMutation, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation]);
 
   const ensureProcessStarted = useCallback(
     async (conversation: Conversation, project: Project) => {
@@ -2512,7 +2922,21 @@ export function useAgentRuntime(options: {
       if (!detection?.installed) {
         throw new Error(detection?.error ?? "Prime Agent n’est pas installé.");
       }
-      if (started.current.has(conversation.id)) return;
+      const desiredRuntimeMode = runtimeModeForConversationPlan(
+        getConversation(conversation.id) ?? conversation,
+      );
+      if (started.current.has(conversation.id)) {
+        if (runtimeModes.current.get(conversation.id) === desiredRuntimeMode) return;
+        const restarted = await restartAgent(conversation.id, desiredRuntimeMode);
+        if (!restarted || restarted.agent.runtimeMode !== desiredRuntimeMode) {
+          throw new Error(planRuntimeText(
+            "Le runtime Prime Agent actif ne correspond pas au mode de la conversation.",
+            "The active Prime Agent runtime does not match the conversation mode.",
+          ));
+        }
+        runtimeModes.current.set(conversation.id, restarted.agent.runtimeMode);
+        return;
+      }
       const existing = startInFlight.current.get(conversation.id);
       if (existing) return existing;
 
@@ -2525,10 +2949,13 @@ export function useAgentRuntime(options: {
         provider: slash > 0 ? modelRef?.slice(0, slash) : undefined,
         model: slash > 0 ? modelRef?.slice(slash + 1) : modelRef,
         thinking: conversation.thinkingLevel,
-        appendSystemPrompt: buildRlmDelegationPrompt({
-          preferredModel: conversation.rlmPreferredModel,
-          thinkingLevel: conversation.rlmThinkingLevel,
-        }),
+        appendSystemPrompt: desiredRuntimeMode === "plan"
+          ? undefined
+          : buildRlmDelegationPrompt({
+              preferredModel: conversation.rlmPreferredModel,
+              thinkingLevel: conversation.rlmThinkingLevel,
+            }),
+        runtimeMode: desiredRuntimeMode,
       };
       // A retry starts a new process attempt. Discard the previous terminal
       // diagnostic only here (not in ensureStarted, which can join an existing
@@ -2536,11 +2963,28 @@ export function useAgentRuntime(options: {
       processExitErrors.current.delete(conversation.id);
       lastStderr.current.delete(conversation.id);
       const start = startAgent(startOptions)
-        .then(() => {
+        .then(async (agent) => {
+          if (!agent) throw new Error("Prime Agent n’a pas renvoyé d’état de lancement.");
+          let activeAgent = agent;
+          runtimeModes.current.set(conversation.id, agent.runtimeMode);
+          if (agent.runtimeMode !== desiredRuntimeMode) {
+            const restarted = await restartAgent(conversation.id, desiredRuntimeMode);
+            if (!restarted) throw new Error(planRuntimeText(
+              "Prime Agent n’a pas pu changer de mode d’exécution.",
+              "Prime Agent could not change runtime mode.",
+            ));
+            activeAgent = restarted.agent;
+          }
+          runtimeModes.current.set(conversation.id, activeAgent.runtimeMode);
           const earlyExit = processExitErrors.current.get(conversation.id);
           if (earlyExit) throw new Error(earlyExit);
           intentionallyStopped.current.delete(conversation.id);
           started.current.add(conversation.id);
+          // The native process retains unanswered dialogs across a renderer
+          // reload. Replay them only after this window has reacquired the
+          // interactive-owner lease; enqueueExtensionRequest is idempotent.
+          const pending = await listPendingExtensionUiRequests(conversation.id).catch(() => []);
+          pending.forEach(consumeAgentEventLine);
         })
         .finally(() => {
           if (startInFlight.current.get(conversation.id) === start) {
@@ -2550,8 +2994,50 @@ export function useAgentRuntime(options: {
       startInFlight.current.set(conversation.id, start);
       return start;
     },
-    [detection?.error, detection?.installed, ensureRuntime],
+    [consumeAgentEventLine, detection?.error, detection?.installed, ensureRuntime, getConversation],
   );
+
+  const setConversationRuntimeMode = useCallback(async (
+    conversationId: string,
+    mode: AgentRuntimeMode,
+  ) => {
+    const conversation = getConversation(conversationId);
+    if (!conversation) throw new Error(planRuntimeText("Conversation introuvable.", "Conversation not found."));
+    const previous = conversationPlanState(conversation);
+    const previousNativeRuntimeMode = runtimeModes.current.get(conversationId);
+    const transition = mode === "plan" ? startPlanMode(previous) : cancelPlanMode(previous);
+    if (transition.status === "rejected") throw new Error(planRuntimeText(
+      `Transition Plan refusée (${transition.reason}).`,
+      `Plan transition rejected (${transition.reason}).`,
+    ));
+
+    updateConversation(conversationId, {
+      planMode: transition.state,
+      planArtifactId: mode === "plan" ? conversation.planArtifactId ?? crypto.randomUUID() : undefined,
+      lastError: undefined,
+    });
+    try {
+      if (isNative()) {
+        await startInFlight.current.get(conversationId);
+      }
+      if (isNative() && started.current.has(conversationId)) {
+        const result = await restartAgent(conversationId, mode);
+        if (!result) throw new Error(planRuntimeText(
+              "Prime Agent n’a pas pu changer de mode d’exécution.",
+              "Prime Agent could not change runtime mode.",
+            ));
+        runtimeModes.current.set(conversationId, result.agent.runtimeMode);
+      }
+    } catch (error) {
+      if (previousNativeRuntimeMode) runtimeModes.current.set(conversationId, previousNativeRuntimeMode);
+      else runtimeModes.current.delete(conversationId);
+      updateConversation(conversationId, {
+        planMode: previous,
+        planArtifactId: conversation.planArtifactId,
+      });
+      throw error;
+    }
+  }, [getConversation, updateConversation]);
 
   const ensureStarted = useCallback(
     async (conversation: Conversation, project: Project) => {
@@ -2758,6 +3244,7 @@ export function useAgentRuntime(options: {
       }).catch(() => undefined);
     };
     register(listenToAgentRestarts((result) => {
+      runtimeModes.current.set(result.agent.conversationId, result.agent.runtimeMode);
       trackMaintenanceRefresh(result.agent.conversationId, "restart");
     }));
     register(listenToAgentResourceReloads(({ conversationId }) => {
@@ -3810,27 +4297,170 @@ export function useAgentRuntime(options: {
   ) => {
     if (extensionResponsesInFlight.current.has(request.requestKey)) return;
     extensionResponsesInFlight.current.add(request.requestKey);
-    // Close/dequeue first. A failed cancellation must never leave a stale modal
-    // blocking subsequent requests or accidentally target a newer request.
-    setExtensionRequests((current) => current.filter((item) => item.requestKey !== request.requestKey));
+    const isPlanRequest = isTrustedPlanUiRequest(
+      request,
+      runtimeModes.current.get(request.conversationId),
+    );
+    let previousPlanState: PlanModeState | undefined;
+    let previousPlanArtifactId: string | undefined;
+    let pendingFinalizationInstalled = false;
     try {
+      if (isPlanRequest) {
+        const conversation = getConversation(request.conversationId);
+        const project = conversation ? getProject(conversation.projectId) : undefined;
+        const decoded = decodePlanUiRequestTitle(request.title);
+        if (!conversation || !project || !decoded) throw new Error(planRuntimeText(
+          "Requête Plan invalide ou conversation indisponible.",
+          "Invalid Plan request or unavailable conversation.",
+        ));
+        previousPlanState = conversationPlanState(conversation);
+        previousPlanArtifactId = conversation.planArtifactId;
+        const planArtifactId = conversation.planArtifactId
+          ?? (decoded.payload.kind === "review" ? decoded.payload.planId : crypto.randomUUID());
+        let nextPlanState = previousPlanState;
+
+        if (decoded.payload.kind === "review") {
+          let document = previousPlanState.document;
+          if (!document) {
+            const recovered = planDocumentForReview(conversation, decoded.payload.planId, decoded.payload.title);
+            if (recovered) {
+              const opened = openPlanReview(previousPlanState, { document: recovered });
+              if (opened.status === "accepted") {
+                nextPlanState = opened.state;
+                document = opened.state.document;
+              }
+            }
+          }
+          if (!document) throw new Error(planRuntimeText(
+            "Le document du plan n’est plus disponible.",
+            "The plan document is no longer available.",
+          ));
+          const value = typeof response.value === "string" ? response.value : undefined;
+          const index = value === undefined ? -1 : (request.options ?? []).indexOf(value);
+          const decision = (["apply", "keep", "revise"] as const)[index] as PlanReviewDecision | undefined;
+          if (!decision) throw new Error(planRuntimeText("Décision de plan non reconnue.", "Unrecognized plan decision."));
+          const written = decision === "apply" || decision === "keep"
+            ? await writePlanDocument({
+                conversationId: request.conversationId,
+                requestId: request.id,
+                projectPath: project.path,
+                planId: planArtifactId,
+                title: document.name,
+                markdown: document.markdown,
+              })
+            : undefined;
+          const decided = decidePlanReview(nextPlanState, { decision });
+          if (decided.status === "rejected") throw new Error(planRuntimeText(
+            `Décision Plan refusée (${decided.reason}).`,
+            `Plan decision rejected (${decided.reason}).`,
+          ));
+          nextPlanState = decided.state;
+          if ((decision === "apply" || decision === "keep") && written) {
+            pendingPlanFinalizations.current.set(request.conversationId, {
+              decision,
+              document,
+              relativePath: written.relativePath,
+              handoffId: planArtifactId,
+              stage: "decisionRecorded",
+            });
+            pendingFinalizationInstalled = true;
+          }
+        } else {
+          const answered = answerPlanQuestion(previousPlanState, {
+            requestId: request.id,
+            cancelled: response.cancelled === true,
+            value: response.value,
+          });
+          if (answered.status === "rejected") throw new Error(planRuntimeText(
+            `Réponse Plan refusée (${answered.reason}).`,
+            `Plan answer rejected (${answered.reason}).`,
+          ));
+          nextPlanState = answered.state;
+        }
+
+        updateConversation(request.conversationId, {
+          planMode: nextPlanState,
+          planArtifactId,
+          pendingPlanAction: pendingFinalizationInstalled
+            ? pendingPlanFinalizations.current.get(request.conversationId)
+            : undefined,
+          lastError: undefined,
+        });
+        if (pendingFinalizationInstalled && !await flushWorkspaceState()) {
+          throw new Error(planRuntimeText(
+            "La décision du plan n’a pas pu être enregistrée avant sa transmission.",
+            "The plan decision could not be saved before it was sent.",
+          ));
+        }
+        await sendRpc(request.conversationId, {
+          type: "extension_ui_response",
+          id: request.id,
+          ...response,
+        });
+        setExtensionRequests((current) => current.filter((item) => item.requestKey !== request.requestKey));
+        return;
+      }
+
+      // Generic extension dialogs retain their historical cancel-and-dequeue
+      // semantics so a stale third-party modal can never block the queue.
+      setExtensionRequests((current) => current.filter((item) => item.requestKey !== request.requestKey));
       await sendRpc(request.conversationId, {
         type: "extension_ui_response",
         id: request.id,
         ...response,
       });
     } catch (error) {
+      if (isPlanRequest && previousPlanState) {
+        updateConversation(request.conversationId, {
+          planMode: previousPlanState,
+          planArtifactId: previousPlanArtifactId,
+          pendingPlanAction: undefined,
+        });
+        if (pendingFinalizationInstalled) {
+          pendingPlanFinalizations.current.delete(request.conversationId);
+          await flushWorkspaceState();
+        }
+      }
       addActivity(request.conversationId, {
         id: `extension-response:${request.id}`,
         type: "extension_ui_response_error",
-        title: "Réponse à l’extension non transmise",
+        title: planRuntimeText(
+          "Réponse à l’extension non transmise",
+          "Extension response not sent",
+        ),
         detail: error instanceof Error ? error.message : String(error),
         status: "warning",
       });
+      if (isPlanRequest) throw error;
     } finally {
       extensionResponsesInFlight.current.delete(request.requestKey);
     }
-  }, [addActivity]);
+  }, [addActivity, flushWorkspaceState, getConversation, getProject, updateConversation]);
+
+  const extensionRequest = extensionRequests.find((request) => !isClaimedPlanUiRequest(request));
+  const planExtensionRequest = extensionRequests.find((request) => (
+    request.conversationId === selectedConversation?.id
+      && isTrustedPlanUiRequest(request, runtimeModes.current.get(request.conversationId))
+  ));
+  useEffect(() => {
+    if (!planExtensionRequest || !selectedConversation) return;
+    const decoded = decodePlanUiRequestTitle(planExtensionRequest.title);
+    if (decoded?.payload.kind !== "review") return;
+    const currentState = conversationPlanState(selectedConversation);
+    if (currentState.document) return;
+    const document = planDocumentForReview(
+      selectedConversation,
+      decoded.payload.planId,
+      decoded.payload.title,
+    );
+    if (!document) return;
+    const opened = openPlanReview(currentState, { document });
+    if (opened.status !== "accepted") return;
+    updateConversation(selectedConversation.id, {
+      planMode: opened.state,
+      planArtifactId: selectedConversation.planArtifactId ?? crypto.randomUUID(),
+    });
+  }, [planExtensionRequest, selectedConversation, updateConversation]);
 
   const runtime = selectedConversation ? runtimes[selectedConversation.id] : undefined;
   const groupedModels = useMemo(() => {
@@ -3860,9 +4490,12 @@ export function useAgentRuntime(options: {
     subagents: runtime?.subagents ?? [],
     observedSubagent: runtime?.observedSubagent,
     logs: runtime?.logs ?? [],
-    extensionRequest: extensionRequests[0],
-    extensionRequestCount: extensionRequests.length,
+    extensionRequest,
+    extensionRequestCount: extensionRequests.filter((request) => !isClaimedPlanUiRequest(request)).length,
+    planExtensionRequest,
     ensureStarted,
+    setConversationRuntimeMode,
+    retryPlanFinalization: finalizePendingPlan,
     sendPrompt,
     mutateQueuedMessage,
     retryMessage,
@@ -4623,7 +5256,7 @@ export function mapAgentMessages(messages: unknown[]): ChatMessage[] {
           // A saved assistant toolCall without its matching toolResult has no
           // proof of success; represent it as terminal but cancelled.
           status: "cancelled",
-          input: truncateHistoricalPayload(block.arguments),
+          input: historicalToolInput(name, block.arguments),
           startedAt: createdAt,
           endedAt: createdAt,
         }];
@@ -4867,6 +5500,18 @@ function numberValue(value: unknown): number | undefined {
 }
 
 const MAX_HISTORICAL_PAYLOAD_CHARS = 16_000;
+
+export function historicalToolInput(toolName: string, value: unknown): unknown {
+  if (toolName === "prime_orbit_plan_submit") {
+    const input = asRecord(value);
+    const document = normalizePlanDocument({
+      name: textValue(input?.title) ?? "Plan",
+      markdown: input?.document,
+    });
+    if (document) return { title: document.name, document: document.markdown };
+  }
+  return truncateHistoricalPayload(value);
+}
 
 function truncateHistoricalPayload(value: unknown): unknown {
   if (value === undefined) return undefined;
