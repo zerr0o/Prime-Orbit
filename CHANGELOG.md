@@ -4,6 +4,30 @@ All notable changes to Prime Orbit are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-25
+
+### Global Prime Agent conversations
+
+- Replaced the executions catalog with a searchable view of every root Prime Agent conversation, including sessions created from terminals or other clients, without silently adding their folders to Orbit.
+- Added a read-only external transcript reader with lifecycle filters, safe native history attestation, deduplication, and an explicit action to add a valid folder before resuming work.
+
+### Session recovery
+
+- Reattached Orbit to the exact daemon-owned RPC session instead of starting a duplicate process when Prime Agent was already active.
+- Preserved canonical history while recovering inactive, moved, or temporarily unreachable sessions, and reconciled stale activity without making conversations disappear.
+- Persisted pending extension UI requests against the exact session identity so Plan questions survive reloads and RPC reconnection.
+
+### Plan and queue reliability
+
+- Restored interactive Plan question forms after reattachment, including events emitted during Prime Agent's attach handshake.
+- Added a native queue-resume path after stopping a blocked Plan turn so suspended input can be admitted again without manual daemon repair.
+- Made Plan recovery expose a clear retry action when questions cannot be reconstructed instead of leaving indefinite `Awaiting result` cards.
+
+### Validation
+
+- Added catalog, RPC reattachment, Plan recovery, queue resumption, history, and session lifecycle regressions.
+- Revalidated 233 frontend tests, 205 native tests, TypeScript, the production Vite build, Rust formatting, strict Clippy, and the Rust 1.88 dependency graph.
+
 ## [0.1.26] - 2026-08-24
 
 ### Native Plan mode

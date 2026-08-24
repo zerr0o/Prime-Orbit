@@ -65,7 +65,7 @@ Prime Agent's interactive `/login`, `/logout`, and OAuth MCP flows still run in 
 4. Let the onboarding flow detect Prime Agent, or use **Quick install** to install it from the official repository.
 5. Configure a provider, create a conversation, and start working.
 
-The 0.1.26 desktop build is validated on Windows 10/11 x64. Microsoft Edge WebView2 is normally already present on supported Windows installations.
+The 0.2.0 desktop build is validated on Windows 10/11 x64. Microsoft Edge WebView2 is normally already present on supported Windows installations.
 
 > [!IMPORTANT]
 > Prime Orbit 0.1.14 is the first updater-enabled release, so upgrades from 0.1.13 or earlier must be installed manually. Its updater payloads carry mandatory Tauri signatures, but the installers are not Authenticode-signed; Windows SmartScreen may still display an unknown-publisher warning. Verify the release SHA-256 manifest before running a manually downloaded installer.
