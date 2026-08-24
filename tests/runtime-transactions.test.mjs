@@ -25,12 +25,14 @@ const {
   beginPromptTransaction,
   compactResponseDisposition,
   compactionEndPresentation,
+  commitPlanRuntimeModeTransition,
   commitPromptTransaction,
   conversationHasPlanHandoff,
   conversationPlanState,
   planDocumentForReview,
   runtimeModeForConversationPlan,
   runtimeModeForPlan,
+  desiredRuntimeModeForConversation,
   durableAttachmentMetadata,
   enqueueExtensionRequest,
   extensionRequestKey,
@@ -38,6 +40,8 @@ const {
   handleMessageEvent,
   historicalToolInput,
   isAuthoritativeIdleSessionSnapshot,
+  isTransientHistoryReadFailure,
+  isTransientHistoryResponseFailure,
   mapAgentMessages,
   mergeHistoricalAttachmentPreviews,
   normalizeConnectingPromptDelivery,
@@ -65,6 +69,11 @@ test("conversation Plan state selects the isolated runtime and recovers submitte
   const normal = conversationPlanState({});
   assert.deepEqual(normal, { phase: "idle", revision: 0 });
   assert.equal(runtimeModeForPlan(normal), "normal");
+  assert.equal(
+    desiredRuntimeModeForConversation({ planMode: normal }, "plan"),
+    "plan",
+    "an in-flight native transition overrides the still-stale persisted mode",
+  );
   const planning = conversationPlanState({ planMode: { phase: "planning", revision: 1 } });
   assert.equal(runtimeModeForPlan(planning), "plan");
   assert.equal(runtimeModeForConversationPlan({ planMode: planning }), "plan");
@@ -107,6 +116,54 @@ test("conversation Plan state selects the isolated runtime and recovers submitte
   assert.equal(planDocumentForReview({ messages: [] }, "missing", "Plan"), undefined);
 });
 
+test("a Plan mode switch publishes intent, restarts, then commits UI state", async () => {
+  const events = [];
+  let expectedMode;
+  await commitPlanRuntimeModeTransition(
+    "plan",
+    async () => {
+      events.push(`restart:sees:${expectedMode}`);
+      await Promise.resolve();
+      events.push("restart:complete");
+      return "plan";
+    },
+    () => events.push(`persist:sees:${expectedMode}`),
+    (mode) => {
+      expectedMode = mode;
+      events.push(`expected:${mode ?? "clear"}`);
+    },
+  );
+  assert.deepEqual(events, [
+    "expected:plan",
+    "restart:sees:plan",
+    "restart:complete",
+    "persist:sees:plan",
+    "expected:clear",
+  ]);
+});
+
+test("a failed Plan mode restart leaves persisted mode untouched and clears intent", async () => {
+  let persisted = false;
+  let expectedMode;
+  await assert.rejects(
+    commitPlanRuntimeModeTransition(
+      "plan",
+      async () => "normal",
+      () => { persisted = true; },
+      (mode) => { expectedMode = mode; },
+    ),
+    /changer de mode|change runtime mode/,
+  );
+  assert.equal(persisted, false);
+  assert.equal(expectedMode, undefined);
+});
+
+test("a conversation without a running native process persists its next startup mode", async () => {
+  let persisted = false;
+  await commitPlanRuntimeModeTransition("plan", undefined, () => { persisted = true; });
+  assert.equal(persisted, true);
+});
+
 test("a stable Plan handoff marker reconciles an admitted Apply prompt after reload", () => {
   const handoffId = "artifact-123";
   assert.equal(conversationHasPlanHandoff({ messages: [{
@@ -123,6 +180,37 @@ test("historical Plan submit keeps its typed Markdown projection above the gener
   assert.equal(input.title, "large");
   assert.equal(input.document, markdown);
   assert.ok(input.document.length > 16_000);
+});
+
+test("a transient get_messages timeout never masquerades as a runtime failure", () => {
+  assert.equal(isTransientHistoryReadFailure(
+    new Error("Prime Agent n’a pas répondu à get_messages."),
+  ), true);
+  assert.equal(isTransientHistoryReadFailure(
+    new Error("Prime Agent n’a pas répondu à get_messages dans le délai prévu."),
+  ), true);
+  assert.equal(isTransientHistoryReadFailure(
+    new Error('Cannot send daemon command "get_messages" because the Prime Agent daemon is not connected. Socket: \\.\pipe\prime-orbit-daemon. Daemon log: C:\safe\daemon.log.'),
+  ), true);
+  assert.equal(isTransientHistoryReadFailure(
+    new Error('Cannot send daemon command "get_state" because the Prime Agent daemon is not connected.'),
+  ), false);
+  assert.equal(isTransientHistoryReadFailure(
+    new Error("Prime Agent n’a pas répondu à get_state."),
+  ), false);
+  assert.equal(isTransientHistoryReadFailure(
+    new Error("Prime Agent process exited unexpectedly"),
+  ), false);
+  assert.equal(isTransientHistoryResponseFailure({
+    command: "get_messages",
+    success: false,
+    error: 'Cannot send daemon command "get_messages" because the Prime Agent daemon is not connected.',
+  }), true);
+  assert.equal(isTransientHistoryResponseFailure({
+    command: "prompt",
+    success: false,
+    error: 'Cannot send daemon command "get_messages" because the Prime Agent daemon is not connected.',
+  }), false);
 });
 
 test("an empty RPC history cannot be relatched into local-history loading", () => {

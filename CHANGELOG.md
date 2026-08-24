@@ -15,6 +15,8 @@ All notable changes to Prime Orbit are documented in this file.
 
 ### Recovery and ownership
 
+- Fixed the Normal → Plan activation transaction so the renderer persists Plan state only after the native restart confirms the isolated runtime, preventing a duplicate restart, a false “Prime Agent must be idle” error, and selector flicker.
+- Kept transient `get_messages` timeouts and daemon-reconnect failures out of the global runtime-error banner; local canonical history remains visible while Orbit retries the read-only RPC refresh.
 - Persisted a staged Plan handoff before consuming the native review response, then reconciled reloads against cached extension UI requests and a stable canonical transcript marker so Apply cannot be silently lost or blindly sent twice.
 - Restricted extension UI responses and mode-changing restarts to the current native interactive owner, claimed each pending response atomically, and broadcast resolution so stale windows dismiss their copy.
 - Preserved full bounded Plan tool inputs through history reloads, including documents above the generic 16,000-character diagnostic limit, and replayed missing reviews after canonical history hydration.
@@ -23,7 +25,7 @@ All notable changes to Prime Orbit are documented in this file.
 ### Validation
 
 - Added 27 Plan state/protocol regressions, targeted runtime handoff coverage, native ownership/storage/notification tests, and a 47-check Prime Agent extension harness.
-- Revalidated 229 frontend tests, 195 native tests, TypeScript, the production Vite build, strict Clippy, Rust 1.88 compatibility, and the embedded extension's strict Prime Agent v0.8.0 type contract.
+- Revalidated 233 frontend tests, 195 native tests, TypeScript, the production Vite build, strict Clippy, Rust 1.88 compatibility, and the embedded extension's strict Prime Agent v0.8.0 type contract.
 
 ## [0.1.25] - 2026-08-24
 

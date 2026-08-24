@@ -991,6 +991,64 @@ export function runtimeModeForConversationPlan(
   return runtimeModeForPlan(conversationPlanState(conversation));
 }
 
+export function desiredRuntimeModeForConversation(
+  conversation: Pick<Conversation, "planMode" | "pendingPlanAction"> | undefined,
+  expectedTransitionMode?: AgentRuntimeMode,
+): AgentRuntimeMode {
+  return expectedTransitionMode ?? runtimeModeForConversationPlan(conversation);
+}
+
+export function isTransientHistoryReadFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message === "Prime Agent n’a pas répondu à get_messages."
+    || message === "Prime Agent n’a pas répondu à get_messages dans le délai prévu."
+    || message === "Prime Agent did not respond to get_messages."
+    || message === "Prime Agent did not respond to get_messages before the timeout."
+    || message.startsWith(
+      'Cannot send daemon command "get_messages" because the Prime Agent daemon is not connected.',
+    );
+}
+
+export function isTransientHistoryResponseFailure(message: {
+  command?: string;
+  success?: boolean;
+  error?: unknown;
+}): boolean {
+  return message.command === "get_messages"
+    && message.success === false
+    && isTransientHistoryReadFailure(message.error ?? "");
+}
+
+export async function commitPlanRuntimeModeTransition(
+  mode: AgentRuntimeMode,
+  restartNative: (() => Promise<AgentRuntimeMode | undefined>) | undefined,
+  persistPlanState: () => void,
+  setExpectedRuntimeMode: (mode: AgentRuntimeMode | undefined) => void = () => undefined,
+): Promise<void> {
+  // The native restarted event can refresh this conversation before the
+  // durable Plan state is committed. Publish the transaction-local intent so
+  // that refresh cannot interpret the replacement runtime as a mismatch and
+  // immediately restart it back to the old mode.
+  setExpectedRuntimeMode(mode);
+  try {
+    if (restartNative) {
+      const activeMode = await restartNative();
+      if (activeMode !== mode) {
+        throw new Error(planRuntimeText(
+          "Prime Agent n’a pas pu changer de mode d’exécution.",
+          "Prime Agent could not change runtime mode.",
+        ));
+      }
+    }
+    // Persist only after the native process reports the requested mode. This
+    // prevents the selection effect from observing the new Plan state early
+    // and racing a second restart against the first one.
+    persistPlanState();
+  } finally {
+    setExpectedRuntimeMode(undefined);
+  }
+}
+
 export function recordedPlanResponseValue(
   pending: Conversation["pendingPlanAction"] | undefined,
   request: Pick<PendingExtensionUiRequest, "options">,
@@ -1113,6 +1171,7 @@ export function useAgentRuntime(options: {
   const [eventsReady, setEventsReady] = useState(!isNative());
   const started = useRef(new Set<string>());
   const runtimeModes = useRef(new Map<string, AgentRuntimeMode>());
+  const expectedRuntimeModeTransitions = useRef(new Map<string, AgentRuntimeMode>());
   const pendingPlanFinalizations = useRef(new Map<string, PendingPlanFinalization>());
   const planFinalizationsInFlight = useRef(new Set<string>());
   const startInFlight = useRef(new Map<string, Promise<void>>());
@@ -1816,6 +1875,13 @@ export function useAgentRuntime(options: {
         return;
       }
       if (compactDisposition === "success" || compactDisposition === "lifecycle_handled") return;
+
+      if (isTransientHistoryResponseFailure(message)) {
+        // The local session reader remains authoritative for visible history.
+        // A shared-daemon reconnect must not make the healthy conversation
+        // flash through the global runtime-error banner.
+        return;
+      }
 
       if (message.success === false) {
         const error = cleanDiagnostic(message.error) ?? `La commande ${message.command ?? "RPC"} a échoué.`;
@@ -2922,8 +2988,9 @@ export function useAgentRuntime(options: {
       if (!detection?.installed) {
         throw new Error(detection?.error ?? "Prime Agent n’est pas installé.");
       }
-      const desiredRuntimeMode = runtimeModeForConversationPlan(
+      const desiredRuntimeMode = desiredRuntimeModeForConversation(
         getConversation(conversation.id) ?? conversation,
+        expectedRuntimeModeTransitions.current.get(conversation.id),
       );
       if (started.current.has(conversation.id)) {
         if (runtimeModes.current.get(conversation.id) === desiredRuntimeMode) return;
@@ -3004,39 +3071,40 @@ export function useAgentRuntime(options: {
     const conversation = getConversation(conversationId);
     if (!conversation) throw new Error(planRuntimeText("Conversation introuvable.", "Conversation not found."));
     const previous = conversationPlanState(conversation);
-    const previousNativeRuntimeMode = runtimeModes.current.get(conversationId);
     const transition = mode === "plan" ? startPlanMode(previous) : cancelPlanMode(previous);
     if (transition.status === "rejected") throw new Error(planRuntimeText(
       `Transition Plan refusée (${transition.reason}).`,
       `Plan transition rejected (${transition.reason}).`,
     ));
 
-    updateConversation(conversationId, {
-      planMode: transition.state,
-      planArtifactId: mode === "plan" ? conversation.planArtifactId ?? crypto.randomUUID() : undefined,
-      lastError: undefined,
-    });
-    try {
-      if (isNative()) {
-        await startInFlight.current.get(conversationId);
-      }
-      if (isNative() && started.current.has(conversationId)) {
-        const result = await restartAgent(conversationId, mode);
-        if (!result) throw new Error(planRuntimeText(
-              "Prime Agent n’a pas pu changer de mode d’exécution.",
-              "Prime Agent could not change runtime mode.",
-            ));
-        runtimeModes.current.set(conversationId, result.agent.runtimeMode);
-      }
-    } catch (error) {
-      if (previousNativeRuntimeMode) runtimeModes.current.set(conversationId, previousNativeRuntimeMode);
-      else runtimeModes.current.delete(conversationId);
-      updateConversation(conversationId, {
-        planMode: previous,
-        planArtifactId: conversation.planArtifactId,
-      });
-      throw error;
+    if (isNative()) {
+      await startInFlight.current.get(conversationId);
     }
+    const nativeMode = runtimeModes.current.get(conversationId);
+    const restartNative = isNative()
+      && started.current.has(conversationId)
+      && nativeMode !== mode
+      ? async () => {
+          const result = await restartAgent(conversationId, mode);
+          if (result) runtimeModes.current.set(conversationId, result.agent.runtimeMode);
+          return result?.agent.runtimeMode;
+        }
+      : undefined;
+    await commitPlanRuntimeModeTransition(
+      mode,
+      restartNative,
+      () => {
+        updateConversation(conversationId, {
+          planMode: transition.state,
+          planArtifactId: mode === "plan" ? conversation.planArtifactId ?? crypto.randomUUID() : undefined,
+          lastError: undefined,
+        });
+      },
+      (expectedMode) => {
+        if (expectedMode) expectedRuntimeModeTransitions.current.set(conversationId, expectedMode);
+        else expectedRuntimeModeTransitions.current.delete(conversationId);
+      },
+    );
   }, [getConversation, updateConversation]);
 
   const ensureStarted = useCallback(
@@ -3071,7 +3139,14 @@ export function useAgentRuntime(options: {
           bootstrapGeneration.current.set(conversation.id, token.generation);
           await sendSelectionRequest(conversation.id, token.generation, "get_state");
         }
-        await loadConversationHistory(conversation.id, token.generation);
+        try {
+          await loadConversationHistory(conversation.id, token.generation);
+        } catch (error) {
+          // Local canonical history is loaded independently from the session
+          // file. A slow read-only RPC refresh must not flash a global runtime
+          // failure while Prime Agent is otherwise healthy.
+          if (!isTransientHistoryReadFailure(error)) throw error;
+        }
         const currentConversation = getConversationRef.current(conversation.id);
         if (currentConversation?.sessionNameSyncPending && currentConversation.title.trim()) {
           try {
@@ -3185,7 +3260,11 @@ export function useAgentRuntime(options: {
         throw new Error(stateResponse.error ?? "Prime Agent n’a pas renvoyé son état après l’opération de maintenance.");
       }
       if (kind === "restart") {
-        await loadConversationHistory(conversationId, token.generation);
+        try {
+          await loadConversationHistory(conversationId, token.generation);
+        } catch (error) {
+          if (!isTransientHistoryReadFailure(error)) throw error;
+        }
       }
       await Promise.all([
         sendSelectionRequest(conversationId, token.generation, "get_available_models", true),
