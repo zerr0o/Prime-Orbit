@@ -83,7 +83,9 @@ import {
   EMPTY_PLAN_MODE,
   decodePlanUiRequestTitle,
   normalizePlanDocument,
+  recoverablePlanDialogKind,
   resolvePlanState,
+  unresolvedPlanDialogSummary,
 } from "../lib/plan-mode";
 import { useDismissableLayer } from "../hooks/useDismissableLayer";
 import { useI18n, type AppLanguage } from "../i18n";
@@ -147,7 +149,7 @@ interface ConversationViewProps {
   planRequest?: PendingExtensionUiRequest;
   onPlanMode: (mode: "normal" | "plan") => Promise<void>;
   onRetryPlanFinalization: (conversationId: string) => Promise<void>;
-  onRecoverPlanQuestions: () => Promise<void>;
+  onRecoverPlanDialogs: () => Promise<void>;
   onAnswerPlanRequest: (request: PendingExtensionUiRequest, response: Record<string, unknown>) => Promise<void>;
   onToggleInspector: () => void;
   onDraftChange: (draft: string) => void;
@@ -367,7 +369,7 @@ export function continueComposerMarkdownList(
 }
 
 export function ConversationView(props: ConversationViewProps) {
-  const { project, conversation, models, favoriteModels, commands, stats, sessionState, goalMutation, isCompacting: runtimeCompacting = false, isRefining = false, refinements, harnessEntries, schedules = [], heartbeat, heartbeats = [], subagents = [], observedSubagent, inspectorOpen, changes, resourceReloadSupported, planRequest, onPlanMode, onRetryPlanFinalization, onRecoverPlanQuestions, onAnswerPlanRequest, onToggleInspector, onDraftChange, onSend, onRetryMessage, onAbort, onModel, onToggleFavoriteModel, onThinking, onRunCommand, onObserveSubagent, onForkMessage, onCloneSession, onNewWindow, onOpenTerminal } = props;
+  const { project, conversation, models, favoriteModels, commands, stats, sessionState, goalMutation, isCompacting: runtimeCompacting = false, isRefining = false, refinements, harnessEntries, schedules = [], heartbeat, heartbeats = [], subagents = [], observedSubagent, inspectorOpen, changes, resourceReloadSupported, planRequest, onPlanMode, onRetryPlanFinalization, onRecoverPlanDialogs, onAnswerPlanRequest, onToggleInspector, onDraftChange, onSend, onRetryMessage, onAbort, onModel, onToggleFavoriteModel, onThinking, onRunCommand, onObserveSubagent, onForkMessage, onCloneSession, onNewWindow, onOpenTerminal } = props;
   const { language } = useI18n();
   const isCompacting = runtimeCompacting || Boolean(sessionState?.isCompacting);
   const isRunning = !isCompacting && isConversationTurnActive(conversation.status);
@@ -383,11 +385,12 @@ export function ConversationView(props: ConversationViewProps) {
   const [missingPlanDialogVisible, setMissingPlanDialogVisible] = useState(false);
   const [planRecoveryBusy, setPlanRecoveryBusy] = useState(false);
   const [planRecoveryError, setPlanRecoveryError] = useState<string>();
-  const unresolvedPlanQuestions = unresolvedPlanQuestionCount(conversation);
+  const unresolvedPlanDialogs = unresolvedPlanDialogSummary(conversation);
+  const recoverablePlanDialog = recoverablePlanDialogKind(conversation);
   const expectsPlanDialog = !planRequest
-    && isRunning
-    && unresolvedPlanQuestions > 0
-    && (conversationPlan.phase === "planning" || conversationPlan.phase === "question");
+    && (isRunning || conversation.status === "starting")
+    && Boolean(recoverablePlanDialog)
+    && (conversationPlan.phase === "planning" || conversationPlan.phase === "question" || conversationPlan.phase === "review");
   // Draft persistence updates the parent conversation object while the user is
   // typing. Stable event bridges let the transcript ignore those updates
   // without retaining callbacks that captured an older conversation.
@@ -417,20 +420,20 @@ export function ConversationView(props: ConversationViewProps) {
     }
     const timeout = window.setTimeout(() => setMissingPlanDialogVisible(true), 1_200);
     return () => window.clearTimeout(timeout);
-  }, [expectsPlanDialog, unresolvedPlanQuestions]);
+  }, [expectsPlanDialog, unresolvedPlanDialogs.latestKind, unresolvedPlanDialogs.total]);
 
   const recoverMissingPlanDialogs = useCallback(async () => {
     if (planRecoveryBusy) return;
     setPlanRecoveryBusy(true);
     setPlanRecoveryError(undefined);
     try {
-      await onRecoverPlanQuestions();
+      await onRecoverPlanDialogs();
       setPlanRecoveryBusy(false);
     } catch (error) {
       setPlanRecoveryError(error instanceof Error ? error.message : String(error));
       setPlanRecoveryBusy(false);
     }
-  }, [onRecoverPlanQuestions, planRecoveryBusy]);
+  }, [onRecoverPlanDialogs, planRecoveryBusy]);
 
   const confirmEmergencyRestart = useCallback(async () => {
     if (restartBusy) return;
@@ -490,18 +493,22 @@ export function ConversationView(props: ConversationViewProps) {
             <header className="plan-interaction-header">
               <span className="plan-interaction-icon" aria-hidden="true"><RefreshCw size={18} /></span>
               <div>
-                <strong>{bi(language, "Questions Plan à reconnecter", "Plan questions need reconnection")}</strong>
-                <p>{bi(
-                  language,
-                  `${unresolvedPlanQuestions} question${unresolvedPlanQuestions > 1 ? "s sont" : " est"} encore bloquée${unresolvedPlanQuestions > 1 ? "s" : ""} dans Prime Agent, mais leur formulaire n’a pas survécu à l’ancienne connexion.`,
-                  `${unresolvedPlanQuestions} question${unresolvedPlanQuestions === 1 ? " is" : "s are"} still blocked in Prime Agent, but the form did not survive the previous connection.`,
-                )}</p>
+                <strong>{recoverablePlanDialog === "review"
+                  ? bi(language, "Validation du plan à reconnecter", "Plan review needs reconnection")
+                  : bi(language, "Questions Plan à reconnecter", "Plan questions need reconnection")}</strong>
+                <p>{recoverablePlanDialog === "review"
+                  ? bi(language, "Prime Agent attend toujours votre décision sur le plan, mais le formulaire de validation n’a pas survécu à l’ancienne connexion.", "Prime Agent is still waiting for your plan decision, but the review form did not survive the previous connection.")
+                  : bi(
+                    language,
+                    `${unresolvedPlanDialogs.questionCount} question${unresolvedPlanDialogs.questionCount > 1 ? "s sont" : " est"} encore bloquée${unresolvedPlanDialogs.questionCount > 1 ? "s" : ""} dans Prime Agent, mais leur formulaire n’a pas survécu à l’ancienne connexion.`,
+                    `${unresolvedPlanDialogs.questionCount} question${unresolvedPlanDialogs.questionCount === 1 ? " is" : "s are"} still blocked in Prime Agent, but the form did not survive the previous connection.`,
+                  )}</p>
               </div>
               <Badge tone="warning">{bi(language, "Récupération", "Recovery")}</Badge>
             </header>
             <footer className="plan-question-footer">
-              <small>{bi(language, "Prime Orbit annule uniquement les appels orphelins puis laisse Prime Agent reprendre son instruction native.", "Prime Orbit cancels only the orphaned calls, then lets Prime Agent resume its native instruction.")}</small>
-              <Button variant="primary" loading={planRecoveryBusy} onClick={() => void recoverMissingPlanDialogs()}><RefreshCw size={14} />{bi(language, "Relancer les questions", "Ask the questions again")}</Button>
+              <small>{bi(language, "Prime Orbit annule uniquement l’appel orphelin, recrée sa connexion interactive puis laisse Prime Agent reprendre l’instruction.", "Prime Orbit cancels only the orphaned call, recreates its interactive connection, then lets Prime Agent resume the instruction.")}</small>
+              <Button variant="primary" loading={planRecoveryBusy} onClick={() => void recoverMissingPlanDialogs()}><RefreshCw size={14} />{recoverablePlanDialog === "review" ? bi(language, "Reconnecter le plan", "Reconnect plan review") : bi(language, "Reconnecter les questions", "Reconnect questions")}</Button>
             </footer>
             {planRecoveryError ? <p className="plan-interaction-error" role="alert"><CircleAlert size={14} />{planRecoveryError}</p> : null}
           </section>
@@ -1163,11 +1170,7 @@ export function isConversationTurnActive(status: Conversation["status"]): boolea
 }
 
 export function unresolvedPlanQuestionCount(conversation: Pick<Conversation, "messages">): number {
-  return conversation.messages.reduce((count, message) => (
-    count + (message.tools ?? []).filter((tool) => (
-      tool.name === "prime_orbit_plan_question" && tool.status === "unresolved"
-    )).length
-  ), 0);
+  return unresolvedPlanDialogSummary(conversation).questionCount;
 }
 
 export function isConversationMaintenanceBlocked(status: Conversation["status"]): boolean {

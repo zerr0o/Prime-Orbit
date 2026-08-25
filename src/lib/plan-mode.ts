@@ -1,5 +1,5 @@
 import type { AppLanguage } from "../i18n";
-import type { ExtensionUiRequest } from "../types";
+import type { ChatMessage, ExtensionUiRequest } from "../types";
 
 /**
  * Pure Plan-mode state machine for Prime Orbit.
@@ -28,6 +28,16 @@ export const PLAN_PAYLOAD_VERSION = 1;
 
 /** Reserved title marker identifying Prime Orbit's internal Plan dialogs. */
 export const PLAN_REQUEST_TITLE_PREFIX = "prime-orbit-plan-ui:v1:";
+/** Renderer-hidden prompt used only to recreate an extension dialog after the
+ * owning RPC client disappeared. It is persisted by Prime Agent, so transcript
+ * projections must recognize it narrowly instead of displaying implementation
+ * plumbing as a user message. */
+export const PLAN_RECOVERY_PROMPT_PREFIX = "[Prime Orbit internal Plan recovery v1]";
+const LEGACY_PLAN_RECOVERY_PROMPTS = [
+  "[Prime Orbit recovery] The previous Plan review dialog was lost during a client reconnection.",
+  "[Prime Orbit recovery] The previous Plan question dialogs were lost during a client reconnection.",
+  "[Prime Orbit recovery] The previous Plan dialogs were lost during a client reconnection.",
+] as const;
 export const PLAN_REQUEST_TOKEN_MAX_CHARS = 65_536;
 export const PLAN_REQUEST_JSON_MAX_CHARS = 12_000;
 
@@ -166,11 +176,71 @@ export interface PlanSnapshotPayload {
 
 export type PlanNotificationEvent = "question" | "review";
 
+export type PlanDialogRecoveryKind = "question" | "review";
+
+export interface PlanDialogRecoverySummary {
+  readonly total: number;
+  readonly questionCount: number;
+  readonly reviewCount: number;
+  /** The last unresolved blocking interaction in transcript order. */
+  readonly latestKind?: PlanDialogRecoveryKind;
+}
+
 export interface PlanNotification {
   readonly show: boolean;
   readonly title: string;
   readonly body: string;
   readonly sound: boolean;
+}
+
+/**
+ * Finds only unresolved, blocking Prime Orbit Plan tools. Inspect calls are
+ * deliberately excluded: they never require a renderer form. The latest kind
+ * lets recovery repeat the exact native interaction that was lost instead of
+ * turning a missing review into another round of questions.
+ */
+export function unresolvedPlanDialogSummary(
+  conversation: Pick<{ messages: ChatMessage[] }, "messages">,
+): PlanDialogRecoverySummary {
+  let questionCount = 0;
+  let reviewCount = 0;
+  let latestKind: PlanDialogRecoveryKind | undefined;
+  for (const message of conversation.messages) {
+    for (const tool of message.tools ?? []) {
+      if (tool.status !== "unresolved") continue;
+      if (tool.name === "prime_orbit_plan_question") {
+        questionCount += 1;
+        latestKind = "question";
+      } else if (tool.name === "prime_orbit_plan_submit") {
+        reviewCount += 1;
+        latestKind = "review";
+      }
+    }
+  }
+  return {
+    total: questionCount + reviewCount,
+    questionCount,
+    reviewCount,
+    ...(latestKind ? { latestKind } : {}),
+  };
+}
+
+/** Recovers the expected blocking interaction even when a reconnect has not
+ * yet refreshed the unresolved tool call into the renderer transcript. */
+export function recoverablePlanDialogKind(
+  conversation: { messages: ChatMessage[]; planMode?: unknown },
+): PlanDialogRecoveryKind | undefined {
+  const transcriptKind = unresolvedPlanDialogSummary(conversation).latestKind;
+  if (transcriptKind) return transcriptKind;
+  const phase = resolvePlanState(conversation.planMode)?.phase;
+  return phase === "question" || phase === "review" ? phase : undefined;
+}
+
+export function isInternalPlanRecoveryPrompt(value: unknown): boolean {
+  return typeof value === "string" && (
+    value.startsWith(`${PLAN_RECOVERY_PROMPT_PREFIX} `)
+    || LEGACY_PLAN_RECOVERY_PROMPTS.some((prefix) => value.startsWith(`${prefix} `))
+  );
 }
 
 /** Fresh, immutable Normal-mode state every conversation starts from. */

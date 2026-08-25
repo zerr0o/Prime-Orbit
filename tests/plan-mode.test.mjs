@@ -57,6 +57,9 @@ const {
   cancelPlanMode,
   reloadPlanMode,
   planNotificationChoice,
+  recoverablePlanDialogKind,
+  unresolvedPlanDialogSummary,
+  isInternalPlanRecoveryPrompt,
 } = compiledModule.exports;
 
 const QUESTION_PROMPT = "Quelle base de données faut-il utiliser ?";
@@ -94,6 +97,52 @@ function planRequest(overrides = {}) {
     ...overrides,
   };
 }
+
+test("distinguishes lost Plan questions from a lost review dialog", () => {
+  const summary = unresolvedPlanDialogSummary({
+    messages: [{
+      tools: [
+        { name: "prime_orbit_plan_question", status: "unresolved" },
+        { name: "prime_orbit_plan_inspect", status: "unresolved" },
+      ],
+    }, {
+      tools: [
+        { name: "prime_orbit_plan_question", status: "failed" },
+        { name: "prime_orbit_plan_submit", status: "unresolved" },
+      ],
+    }],
+  });
+  assert.deepEqual(summary, {
+    total: 2,
+    questionCount: 1,
+    reviewCount: 1,
+    latestKind: "review",
+  });
+});
+
+test("recovers a Plan review from persisted state before the tool call is reloaded", () => {
+  assert.equal(recoverablePlanDialogKind({
+    messages: [],
+    planMode: {
+      phase: "review",
+      revision: 4,
+      round: 1,
+      document: { name: "plan", markdown: "# Plan", round: 1 },
+    },
+  }), "review");
+  assert.equal(recoverablePlanDialogKind({
+    messages: [],
+    planMode: { phase: "planning", revision: 1 },
+  }), undefined);
+});
+
+test("recognizes current and legacy app-owned Plan recovery prompts", () => {
+  assert.equal(isInternalPlanRecoveryPrompt("[Prime Orbit internal Plan recovery v1] retry review"), true);
+  assert.equal(isInternalPlanRecoveryPrompt("[Prime Orbit recovery] The previous Plan review dialog was lost during a client reconnection. retry"), true);
+  assert.equal(isInternalPlanRecoveryPrompt("[Prime Orbit recovery] The previous Plan dialogs were lost during a client reconnection. retry"), true);
+  assert.equal(isInternalPlanRecoveryPrompt("[Prime Orbit recovery] visible user text"), false);
+  assert.equal(isInternalPlanRecoveryPrompt("normal message"), false);
+});
 
 function startedPlan() {
   return startPlanMode(EMPTY_PLAN_MODE).state;

@@ -20,6 +20,7 @@ new Function("module", "exports", "require", buildResult.outputFiles[0].text)(
 );
 const {
   activeStatusForSessionActions,
+  appendPendingDirectUserMessage,
   applyAuthoritativeUserMessageStart,
   applyRuntimeCompactingState,
   compactResponseDisposition,
@@ -52,6 +53,8 @@ const {
   promptAttachmentPayload,
   reconcileLocalTranscriptAfterRpc,
   reconcileRpcTranscript,
+  removePendingDirectUserMessage,
+  cancelUnresolvedPlanDialogs,
   recordedPlanResponseValue,
   selectForkEntryId,
   shouldApplyHistoryResponse,
@@ -67,6 +70,78 @@ const {
   refinementResultPresentation,
   rlmChildPresentation,
 } = compiledModule.exports;
+
+test("keeps an accepted direct prompt visible until Prime Agent supplies its identity", () => {
+  const pending = appendPendingDirectUserMessage(
+    conversation(),
+    "Build the feature",
+    "2026-08-25T00:00:00.000Z",
+    [],
+    "local-prompt",
+  );
+  assert.equal(pending.messages.length, 1);
+  assert.equal(pending.messages[0].id, "local-prompt");
+  assert.equal(pending.messages[0].status, "pending");
+
+  const authoritative = applyAuthoritativeUserMessageStart(
+    pending,
+    "Build the feature",
+    "2026-08-25T00:00:00.050Z",
+    [],
+    "entry-native",
+  );
+  assert.equal(authoritative.messages.length, 1);
+  assert.equal(authoritative.messages[0].id, "entry-native");
+  assert.equal(authoritative.messages[0].status, "complete");
+});
+
+test("rolls back only the rejected direct prompt placeholder", () => {
+  const pending = appendPendingDirectUserMessage(
+    conversation({ messages: [{ id: "older", role: "user", content: "Older", status: "complete" }] }),
+    "Rejected",
+    "2026-08-25T00:00:00.000Z",
+    [],
+    "local-rejected",
+  );
+  const rolledBack = removePendingDirectUserMessage(pending, "local-rejected");
+  assert.deepEqual(rolledBack.messages.map((message) => message.id), ["older"]);
+});
+
+test("keeps internal Plan recovery prompts out of live and restored transcripts", () => {
+  const internal = "[Prime Orbit internal Plan recovery v1] resubmit the same plan";
+  const current = conversation();
+  handleMessageEvent("conversation", {
+    type: "message_start",
+    message: { id: "internal-live", role: "user", content: [{ type: "text", text: internal }] },
+  }, (_id, updater) => {
+    const next = typeof updater === "function" ? updater(current) : { ...current, ...updater };
+    assert.equal(next.messages.length, 0);
+  });
+  assert.deepEqual(mapAgentMessages([
+    { id: "internal-history", role: "user", content: [{ type: "text", text: internal }] },
+    { id: "visible", role: "user", content: [{ type: "text", text: "Apply the plan" }] },
+  ]).map((message) => message.content), ["Apply the plan"]);
+});
+
+test("cancels orphaned Plan dialogs without rewriting unrelated unresolved tools", () => {
+  const recovered = cancelUnresolvedPlanDialogs(conversation({
+    messages: [{
+      id: "assistant",
+      role: "assistant",
+      content: "",
+      tools: [
+        { id: "question", name: "prime_orbit_plan_question", status: "unresolved" },
+        { id: "review", name: "prime_orbit_plan_submit", status: "unresolved" },
+        { id: "inspect", name: "prime_orbit_plan_inspect", status: "unresolved" },
+      ],
+    }],
+  }), "2026-08-25T00:00:01.000Z");
+  assert.deepEqual(recovered.messages[0].tools.map((tool) => tool.status), [
+    "cancelled",
+    "cancelled",
+    "unresolved",
+  ]);
+});
 
 test("conversation Plan state selects the isolated runtime and recovers submitted Markdown", () => {
   const normal = conversationPlanState({});

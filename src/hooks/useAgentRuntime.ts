@@ -33,8 +33,11 @@ import {
   normalizePlanDocument,
   openPlanQuestion,
   openPlanReview,
+  PLAN_RECOVERY_PROMPT_PREFIX,
+  recoverablePlanDialogKind,
   resolvePlanState,
   startPlanMode,
+  isInternalPlanRecoveryPrompt,
   type PlanDocument,
   type PlanModeState,
   type PlanReviewDecision,
@@ -588,6 +591,74 @@ export function applyAuthoritativeUserMessageStart(
       attachments: authoritativeAttachments.length ? authoritativeAttachments : undefined,
     }],
   };
+}
+
+/** Shows an accepted direct prompt immediately while Prime Agent assigns its
+ * durable message identity. Queued steering/follow-up prompts never use this
+ * path: their only renderer projection remains the daemon queue snapshot. */
+export function appendPendingDirectUserMessage(
+  conversation: Conversation,
+  text: string,
+  createdAt: string,
+  structuredAttachments: Attachment[],
+  provisionalId: string,
+): Conversation {
+  const appended = applyAuthoritativeUserMessageStart(
+    conversation,
+    text,
+    createdAt,
+    structuredAttachments,
+  );
+  const lastIndex = appended.messages.length - 1;
+  const last = appended.messages[lastIndex];
+  if (!last || last.role !== "user") return appended;
+  const messages = [...appended.messages];
+  messages[lastIndex] = {
+    ...last,
+    id: provisionalId,
+    entryId: undefined,
+    status: "pending",
+  };
+  return { ...appended, messages };
+}
+
+export function removePendingDirectUserMessage(
+  conversation: Conversation,
+  provisionalId: string,
+): Conversation {
+  const messages = conversation.messages.filter((message) => !(
+    message.id === provisionalId && message.role === "user" && message.status === "pending"
+  ));
+  return messages.length === conversation.messages.length
+    ? conversation
+    : { ...conversation, messages };
+}
+
+/** Marks only orphaned blocking Plan calls as cancelled before asking Prime
+ * Agent to recreate their native extension UI. Other unresolved tools remain
+ * untouched because Orbit cannot infer their outcome. */
+export function cancelUnresolvedPlanDialogs(
+  conversation: Conversation,
+  eventTime: string,
+): Conversation {
+  let changed = false;
+  const messages = conversation.messages.map((message) => {
+    if (!message.tools?.some((tool) => (
+      tool.status === "unresolved"
+      && (tool.name === "prime_orbit_plan_question" || tool.name === "prime_orbit_plan_submit")
+    ))) return message;
+    changed = true;
+    return {
+      ...message,
+      tools: message.tools.map((tool) => (
+        tool.status === "unresolved"
+        && (tool.name === "prime_orbit_plan_question" || tool.name === "prime_orbit_plan_submit")
+          ? { ...tool, status: "cancelled" as const, endedAt: eventTime }
+          : tool
+      )),
+    };
+  });
+  return changed ? { ...conversation, messages } : conversation;
 }
 
 export function extensionRequestKey(conversationId: string, requestId: string) {
@@ -3319,6 +3390,16 @@ export function useAgentRuntime(options: {
       const expectedRuntimeMode = runtimeModeForConversationPlan(
         getConversationRef.current(conversationId) ?? beforeStart,
       );
+      const provisionalMessageId = !forceQueued ? uid("user-pending") : undefined;
+      if (provisionalMessageId) {
+        updateConversation(conversationId, (conversation) => appendPendingDirectUserMessage(
+          conversation,
+          content,
+          now(),
+          attachments.map(durableAttachmentMetadata),
+          provisionalMessageId,
+        ));
+      }
       try {
         await sendRpc(conversationId, {
           id: uid("prompt"),
@@ -3337,9 +3418,14 @@ export function useAgentRuntime(options: {
           }, 50);
         }
       } catch (error) {
-        // The RPC was rejected before reaching Prime Agent's stdin. No local
-        // transcript or queue row exists to roll back: Prime Agent remains the
-        // only source of visible messages and queued actions.
+        // The RPC was rejected before reaching Prime Agent's stdin. Remove the
+        // direct-delivery placeholder; native queue rows never use one.
+        if (provisionalMessageId) {
+          updateConversation(conversationId, (conversation) => removePendingDirectUserMessage(
+            conversation,
+            provisionalMessageId,
+          ));
+        }
         activePromptRuns.current.delete(conversationId);
         throw error;
       }
@@ -3402,9 +3488,11 @@ export function useAgentRuntime(options: {
     }
   }, [isCurrentSelection, selectedConversation, sendSelectionRequest, setRuntimeRefining, updateConversation]);
 
-  const recoverPlanQuestions = useCallback(async () => {
+  const recoverPlanDialogs = useCallback(async () => {
     if (!selectedConversation) return;
     const conversationId = selectedConversation.id;
+    const recoveryKind = recoverablePlanDialogKind(selectedConversation);
+    if (!recoveryKind) return;
     const token = activeSelection.current;
     const queuedBeforeAbort = sessionActionsByConversation.current.get(conversationId)?.queuedCount ?? 0;
     await sendRpc(conversationId, { id: uid("recover-plan-abort"), type: "abort" }, {
@@ -3453,22 +3541,69 @@ export function useAgentRuntime(options: {
           uncertainRefinementConversations.current.delete(conversationId);
           setRuntimeRefining(conversationId, false);
           updateConversation(conversationId, (conversation) => ({
-            ...finalizeConversationTools(conversation, "cancelled", now()),
+            ...finalizeConversationTools(
+              cancelUnresolvedPlanDialogs(conversation, now()),
+              "cancelled",
+              now(),
+            ),
             status: "starting",
             lastError: undefined,
           }));
           stateEpoch.current.set(conversationId, (stateEpoch.current.get(conversationId) ?? 0) + 1);
           transcriptEpoch.current.set(conversationId, (transcriptEpoch.current.get(conversationId) ?? 0) + 1);
+
+          // A Plan dialog can be stranded precisely because the RPC client
+          // detached after Prime Agent admitted the tool call. Reusing that
+          // process would submit another dialog to the same broken transport.
+          // Restart only Orbit's RPC client; the resident daemon worker and its
+          // persisted session remain untouched. A successful get_state from
+          // the replacement is the readiness barrier before the recovery turn.
+          cancelConversationRequests(conversationId, planRuntimeText(
+            "La connexion Plan est recréée.",
+            "The Plan connection is being recreated.",
+          ));
+          const restarted = await restartAgent(conversationId, "plan");
+          if (!restarted || restarted.agent.runtimeMode !== "plan") {
+            throw new Error(planRuntimeText(
+              "Prime Orbit n’a pas pu recréer la connexion interactive Plan.",
+              "Prime Orbit could not recreate the interactive Plan connection.",
+            ));
+          }
+          started.current.add(conversationId);
+          runtimeModes.current.set(conversationId, restarted.agent.runtimeMode);
+          processExitErrors.current.delete(conversationId);
+          lastStderr.current.delete(conversationId);
+          const ready = await sendSelectionRequest(conversationId, token.generation, "get_state", true);
+          if (ready?.success === false) {
+            throw new Error(ready.error ?? planRuntimeText(
+              "La nouvelle connexion Plan ne répond pas.",
+              "The replacement Plan connection is not responding.",
+            ));
+          }
+
           activePromptRuns.current.add(conversationId);
+          const recoveryMessage = recoveryKind === "review"
+            ? `${PLAN_RECOVERY_PROMPT_PREFIX} The previous Plan review dialog was lost during a client reconnection. `
+              + "Submit the same current plan again with prime_orbit_plan_submit so the user can apply, keep, or revise it. "
+              + "Do not ask the completed planning questions again and do not create a different plan."
+            : `${PLAN_RECOVERY_PROMPT_PREFIX} The previous Plan question dialogs were lost during a client reconnection. `
+              + "Ask every still unresolved planning question again with prime_orbit_plan_question, one at a time. "
+              + "Do not reuse the cancelled tool calls.";
+          const submitRecoveryPrompt = () => sendRpc(conversationId, {
+            id: uid("recover-plan-prompt"),
+            type: "prompt",
+            message: recoveryMessage,
+          }, { expectedRuntimeMode: "plan" });
           try {
-            await sendRpc(conversationId, {
-              id: uid("recover-plan-prompt"),
-              type: "prompt",
-              message:
-                "[Prime Orbit recovery] The previous Plan dialogs were lost during a client reconnection. "
-                + "Ask every still unresolved planning question again with prime_orbit_plan_question, one at a time. "
-                + "Do not reuse the cancelled tool calls.",
-            }, { expectedRuntimeMode: "plan" });
+            try {
+              await submitRecoveryPrompt();
+            } catch (error) {
+              const detail = error instanceof Error ? error.message : String(error);
+              if (!detail.toLowerCase().includes("queued session input is suspended")) throw error;
+              const resumed = await resumeAgentQueue(conversationId);
+              if (resumed.status !== "resumed") throw error;
+              await submitRecoveryPrompt();
+            }
           } catch (error) {
             activePromptRuns.current.delete(conversationId);
             updateConversation(conversationId, { status: "idle" });
@@ -3480,10 +3615,10 @@ export function useAgentRuntime(options: {
       await new Promise<void>((resolve) => window.setTimeout(resolve, 100));
     }
     throw new Error(planRuntimeText(
-      "Prime Agent n’a pas libéré les anciennes questions dans le délai prévu.",
-      "Prime Agent did not release the previous questions in time.",
+      "Prime Agent n’a pas libéré l’ancien dialogue Plan dans le délai prévu.",
+      "Prime Agent did not release the previous Plan dialog in time.",
     ));
-  }, [isCurrentSelection, selectedConversation, sendSelectionRequest, setRuntimeRefining, updateConversation]);
+  }, [cancelConversationRequests, isCurrentSelection, selectedConversation, sendSelectionRequest, setRuntimeRefining, updateConversation]);
 
   const closeRuntime = useCallback(async () => {
     if (!selectedConversation) return;
@@ -4389,7 +4524,7 @@ export function useAgentRuntime(options: {
     ensureStarted,
     setConversationRuntimeMode,
     retryPlanFinalization: finalizePendingPlan,
-    recoverPlanQuestions,
+    recoverPlanDialogs,
     sendPrompt,
     retryMessage,
     abort,
@@ -4440,7 +4575,11 @@ export function handleMessageEvent(
       : sanitizePrimeOrbitDocumentAttachments(event.primeOrbitAttachments);
     const eventImages = historicalImageAttachments(rawMessage?.content, eventId || "runtime");
     const eventAttachments = [...eventImages, ...eventDocuments];
-    if (event.type !== "message_start" || (!extracted && !eventAttachments.length)) return;
+    if (
+      event.type !== "message_start"
+      || isInternalPlanRecoveryPrompt(extracted)
+      || (!extracted && !eventAttachments.length)
+    ) return;
     const timestamp = typeof rawMessage?.timestamp === "number" ? rawMessage.timestamp : undefined;
     const createdAt = timestamp && Number.isFinite(timestamp)
       ? new Date(timestamp).toISOString()
@@ -5181,6 +5320,7 @@ export function mapAgentMessages(messages: unknown[]): ChatMessage[] {
 
     if (role === "user" || role === "system") {
       const extracted = extractMessageText(message);
+      if (role === "user" && isInternalPlanRecoveryPrompt(extracted)) continue;
       const parsedContext = role === "user"
         ? parsePrimeOrbitAttachmentContext(extracted)
         : { visibleText: extracted, attachments: [] };

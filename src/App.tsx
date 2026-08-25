@@ -772,7 +772,7 @@ function App() {
             planRequest={agent.planExtensionRequest}
             onPlanMode={(mode) => agent.setConversationRuntimeMode(selectedConversation.id, mode)}
             onRetryPlanFinalization={agent.retryPlanFinalization}
-            onRecoverPlanQuestions={agent.recoverPlanQuestions}
+            onRecoverPlanDialogs={agent.recoverPlanDialogs}
             onAnswerPlanRequest={agent.answerExtensionRequest}
             onToggleInspector={toggleInspector}
             onDraftChange={(draft) => updateConversation(selectedConversation.id, { draft })}

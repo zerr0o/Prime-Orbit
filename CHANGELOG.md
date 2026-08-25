@@ -22,11 +22,14 @@ All notable changes to Prime Orbit are documented in this file.
 - Restored interactive Plan question forms after reattachment, including events emitted during Prime Agent's attach handshake.
 - Added a native queue-resume path after stopping a blocked Plan turn so suspended input can be admitted again without manual daemon repair.
 - Made Plan recovery expose a clear retry action when questions cannot be reconstructed instead of leaving indefinite `Awaiting result` cards.
+- Restored lost Plan review dialogs as well as questions; recovery now replaces the detached RPC client before resubmitting the same native interaction instead of leaving `needs_input` sessions blocked.
+- Kept internal Plan recovery instructions out of the visible transcript while preserving the real user and assistant turns.
+- Kept accepted direct prompts visible immediately while Prime Agent assigns their durable identity; steering and follow-up queues remain fully daemon-owned.
 
 ### Validation
 
 - Added catalog, RPC reattachment, Plan recovery, queue resumption, history, and session lifecycle regressions.
-- Revalidated 233 frontend tests, 205 native tests, TypeScript, the production Vite build, Rust formatting, strict Clippy, and the Rust 1.88 dependency graph.
+- Revalidated 240 frontend tests, 205 native tests, TypeScript, the production Vite build, Rust formatting, strict Clippy, and the Rust 1.88 dependency graph.
 
 ## [0.1.26] - 2026-08-24
 

@@ -120,13 +120,14 @@ test("maintenance stays unavailable while connecting or while a real turn is act
   assert.equal(isConversationMaintenanceBlocked("idle"), false);
 });
 
-test("detects only unresolved Prime Orbit Plan questions for dialog recovery", () => {
+test("keeps the legacy Plan question count scoped to unresolved question tools", () => {
   assert.equal(unresolvedPlanQuestionCount({
     messages: [{
       tools: [
         { name: "prime_orbit_plan_question", status: "unresolved" },
         { name: "prime_orbit_plan_question", status: "cancelled" },
         { name: "prime_orbit_plan_inspect", status: "unresolved" },
+        { name: "prime_orbit_plan_submit", status: "unresolved" },
       ],
     }, {
       tools: [{ name: "prime_orbit_plan_question", status: "unresolved" }],
