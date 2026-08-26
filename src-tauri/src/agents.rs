@@ -5411,14 +5411,14 @@ fn persisted_plan_submit(
                     });
                 }
             }
-            Some("toolResult") => {
-                if message.get("toolCallId").and_then(Value::as_str) == Some(request_id) {
-                    // Prime Agent owns the call lifecycle. Once its canonical
-                    // transcript contains any toolResult for this id, the
-                    // original blocking request is terminal and cannot be
-                    // recreated or answered, including Request was aborted.
-                    resolved = true;
-                }
+            // Prime Agent owns the call lifecycle. Once its canonical
+            // transcript contains any toolResult for this id, the original
+            // blocking request is terminal and cannot be recreated or
+            // answered, including Request was aborted.
+            Some("toolResult")
+                if message.get("toolCallId").and_then(Value::as_str) == Some(request_id) =>
+            {
+                resolved = true;
             }
             _ => {}
         }
