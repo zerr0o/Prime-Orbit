@@ -44,7 +44,7 @@ const {
   isTransientHistoryReadFailure,
   isTransientHistoryResponseFailure,
   isOptionalSelectionResponseFailure,
-  daemonResponseTimeoutCommand,
+  daemonDiagnosticCommand,
   isRecoverableConversationActivationError,
   isRecoverableRuntimeBootstrapError,
   mapAgentMessages,
@@ -418,11 +418,15 @@ test("optional bootstrap probes never masquerade as a conversation failure", () 
     success: false,
     error: "Unknown command: list_heartbeats",
   }), true);
+  // Policy: an enrichment read populates a panel, so no reason for its failure
+  // makes the conversation unhealthy. Enumerating "expected" wordings was
+  // wrong in both directions — the wording varies and the daemon renames
+  // commands — and every gap reached users as "Prime Agent needs attention".
   assert.equal(isOptionalSelectionResponseFailure({
     command: "list_heartbeats",
     success: false,
     error: "Session permission denied",
-  }), false, "unexpected passive-read failures remain visible");
+  }), true, "an enrichment read stays non-fatal whatever the reason");
   assert.equal(isOptionalSelectionResponseFailure({
     command: "get_state",
     success: false,
@@ -1641,57 +1645,64 @@ test("plan replay backs off while the runtime is not in Plan mode", () => {
   assert.ok(PLAN_REPLAY_IDLE_POLL_INTERVAL_MS >= 8 * PLAN_NATIVE_REPLAY_POLL_INTERVAL_MS);
 });
 
-test("a timed-out enrichment read never raises a runtime failure", () => {
-  // Observed against a contended daemon: the model picker read timed out and
-  // flipped the whole conversation into "Prime Agent needs attention" over a
-  // purely cosmetic fetch.
-  assert.equal(isOptionalSelectionResponseFailure({
-    command: "get_available_models",
-    success: false,
-    error: 'Timed out after 30000ms waiting for the Prime Agent daemon response to "get_available_models". Socket: \\.\pipe\prime-orbit-daemon-prime-agent-v0.8.0-3a60f74.',
-  }), true);
-  assert.equal(isOptionalSelectionResponseFailure({
-    command: "list_schedules",
-    success: false,
-    error: 'Timed out after 5000ms waiting for the Prime Agent daemon response to "list_schedules".',
-  }), true);
+test("the request Orbit sent decides whether a failure matters", () => {
+  // Observed against a contended daemon: enrichment reads timed out or were
+  // refused and flipped the whole conversation into "Prime Agent needs
+  // attention" over purely cosmetic fetches, dozens of times per minute.
+  for (const requested of [
+    "get_available_models",
+    "get_commands",
+    "get_session_stats",
+    "list_schedules",
+    "get_heartbeat",
+    "list_heartbeats",
+  ]) {
+    for (const error of [
+      'Timed out after 30000ms waiting for the Prime Agent daemon response to "heartbeat_get".',
+      'Cannot send daemon command "cron_list" because the Prime Agent daemon is not connected.',
+      "The provider rejected the catalog request.",
+    ]) {
+      assert.equal(
+        isOptionalSelectionResponseFailure({ command: requested, success: false, error }, requested),
+        true,
+        `${requested} must stay non-fatal for: ${error}`,
+      );
+    }
+  }
 
-  // The daemon quotes its own command name, which differs from the RPC name
-  // Orbit sent. Both heartbeat reads reached users as red banners because an
-  // exact-match rule rejected the daemon spelling.
-  assert.equal(isOptionalSelectionResponseFailure({
-    command: "get_heartbeat",
-    success: false,
-    error: 'Timed out after 30000ms waiting for the Prime Agent daemon response to "heartbeat_get".',
-  }), true);
-  assert.equal(isOptionalSelectionResponseFailure({
-    command: "list_heartbeats",
-    success: false,
-    error: 'Timed out after 30000ms waiting for the Prime Agent daemon response to "heartbeats_list".',
-  }), true);
-  // The daemon spelling alone identifies the read when it is all we are given.
-  assert.equal(isOptionalSelectionResponseFailure({
-    command: "heartbeats_list",
-    success: false,
-    error: 'Timed out after 30000ms waiting for the Prime Agent daemon response to "heartbeats_list".',
-  }), true);
-  assert.equal(
-    daemonResponseTimeoutCommand(
-      'Timed out after 30000ms waiting for the Prime Agent daemon response to "heartbeat_get". Socket: \\\\.\\pipe\\x.',
-    ),
-    "heartbeat_get",
-  );
-  assert.equal(daemonResponseTimeoutCommand("The provider rejected the catalog request."), undefined);
   // Critical-path reads keep surfacing their failures.
   assert.equal(isOptionalSelectionResponseFailure({
     command: "get_state",
     success: false,
     error: 'Timed out after 30000ms waiting for the Prime Agent daemon response to "get_state".',
-  }), false);
-  // A genuine refusal from an optional command still reads as a real answer.
+  }, "get_state"), false);
   assert.equal(isOptionalSelectionResponseFailure({
-    command: "get_available_models",
+    command: "prompt",
     success: false,
-    error: "The provider rejected the catalog request.",
+    error: "Prime Agent refused the prompt.",
+  }, "prompt"), false);
+});
+
+test("a late optional failure is still recognised from the daemon's own wording", () => {
+  // The pending entry is already cleared, so only the prose identifies the
+  // read. The daemon renames commands: get_heartbeat is quoted as
+  // "heartbeat_get" and list_schedules as "cron_list".
+  assert.equal(isOptionalSelectionResponseFailure({
+    success: false,
+    error: 'Cannot send daemon command "heartbeat_get" because the Prime Agent daemon is not connected.',
+  }), true);
+  assert.equal(isOptionalSelectionResponseFailure({
+    success: false,
+    error: 'Timed out after 30000ms waiting for the Prime Agent daemon response to "cron_list".',
+  }), true);
+  assert.equal(
+    daemonDiagnosticCommand('Cannot send daemon command "heartbeats_list" because the Prime Agent daemon is not connected.'),
+    "heartbeats_list",
+  );
+  assert.equal(daemonDiagnosticCommand("The provider rejected the catalog request."), undefined);
+  // An unrelated command named in prose stays fatal.
+  assert.equal(isOptionalSelectionResponseFailure({
+    success: false,
+    error: 'Cannot send daemon command "prompt" because the Prime Agent daemon is not connected.',
   }), false);
 });

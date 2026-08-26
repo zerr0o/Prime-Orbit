@@ -133,6 +133,9 @@ interface SelectionToken {
 interface PendingSelectionRequest {
   conversationId: string;
   generation: number;
+  /** The command Orbit actually sent. This, not the prose Prime Agent sends
+   * back, decides whether a failure matters to the conversation. */
+  type: string;
   timeout: number;
   transcriptEpoch?: number;
   statsEpoch?: number;
@@ -1033,12 +1036,14 @@ export function isTransientHistoryResponseFailure(message: {
     && isTransientHistoryReadFailure(message.error ?? "");
 }
 
-/** Daemon-side names for optional reads Orbit sends under a different name.
- * Prime Agent's daemon layer renames these, and its diagnostics quote the
- * daemon name rather than the RPC one, so both spellings must be recognised. */
+/** Daemon-side names for the same optional reads. Prime Agent's daemon layer
+ * renames these commands and its diagnostics quote the daemon name, never the
+ * RPC name Orbit sent, so a late response identified only by prose still has
+ * to be recognisable. */
 const OPTIONAL_DAEMON_COMMAND_ALIASES = new Set([
   "heartbeat_get",
   "heartbeats_list",
+  "cron_list",
 ]);
 
 function isOptionalCommandName(name: unknown): boolean {
@@ -1046,37 +1051,35 @@ function isOptionalCommandName(name: unknown): boolean {
     && (OPTIONAL_SELECTION_COMMANDS.has(name) || OPTIONAL_DAEMON_COMMAND_ALIASES.has(name));
 }
 
-/** The command quoted inside Prime Agent's daemon response timeout. */
-export function daemonResponseTimeoutCommand(detail: string): string | undefined {
-  if (!detail.trimStart().startsWith("Timed out after ")) return undefined;
-  return /waiting for the Prime Agent daemon response to "([^"]+)"/u.exec(detail)?.[1];
+/** The command Prime Agent quotes inside a daemon transport diagnostic. */
+export function daemonDiagnosticCommand(detail: string): string | undefined {
+  return /(?:waiting for the Prime Agent daemon response to|Cannot send daemon command) "([^"]+)"/u
+    .exec(detail)?.[1];
 }
 
-export function isOptionalSelectionResponseFailure(message: {
-  command?: string;
-  success?: boolean;
-  error?: unknown;
-}): boolean {
+/**
+ * Decides whether a failed response may be ignored by the conversation.
+ *
+ * `requestedType` is what Orbit actually sent and is the authority: an
+ * enrichment read populates a panel, so its failure leaves that panel showing
+ * the last known data and nothing else. Deciding this by matching Prime
+ * Agent's error prose was wrong in both directions — the wording changes, and
+ * the daemon renames commands (`get_heartbeat` is quoted as `heartbeat_get`,
+ * `list_schedules` as `cron_list`), which is how a stream of purely cosmetic
+ * failures reached users as "Prime Agent needs attention".
+ *
+ * The prose is consulted only as a fallback, for a late response whose pending
+ * entry has already been cleared.
+ */
+export function isOptionalSelectionResponseFailure(
+  message: { command?: string; success?: boolean; error?: unknown },
+  requestedType?: string,
+): boolean {
   if (message.success !== false) return false;
+  if (requestedType !== undefined) return isOptionalCommandName(requestedType);
+  if (isOptionalCommandName(message.command)) return true;
   const detail = message.error instanceof Error ? message.error.message : String(message.error ?? "");
-  // A busy or contended daemon can let one of these enrichment reads run out
-  // of time. That says nothing about the conversation's health: the model
-  // picker or heartbeat list simply keeps its last known data. Treating it as
-  // a runtime failure put the whole conversation into an error state and
-  // raised "Prime Agent needs attention" over a cosmetic read.
-  //
-  // The timeout text quotes the daemon's own command name, which differs from
-  // the RPC name Orbit sent, so either spelling identifying an optional read
-  // is enough. Requiring them to match is what let heartbeat timeouts through.
-  const timedOutCommand = daemonResponseTimeoutCommand(detail);
-  if (timedOutCommand !== undefined) {
-    return isOptionalCommandName(message.command) || isOptionalCommandName(timedOutCommand);
-  }
-  if (!isOptionalCommandName(message.command)) return false;
-  const lowerDetail = detail.toLowerCase();
-  return detail.startsWith(
-    `Cannot send daemon command "${message.command}" because the Prime Agent daemon is not connected.`,
-  ) || lowerDetail.includes("unknown command") || lowerDetail.includes("unsupported");
+  return isOptionalCommandName(daemonDiagnosticCommand(detail));
 }
 
 export async function commitPlanRuntimeModeTransition(
@@ -1492,6 +1495,7 @@ export function useAgentRuntime(options: {
     pendingSelectionRequests.current.set(requestId, {
       conversationId,
       generation,
+      type,
       timeout,
       transcriptEpoch: requestMetadata.transcriptEpoch,
       statsEpoch: type === "get_session_stats" ? (statsEpoch.current.get(conversationId) ?? 0) : undefined,
@@ -2192,18 +2196,33 @@ export function useAgentRuntime(options: {
         return;
       }
 
-      if (isOptionalSelectionResponseFailure(message)) {
-        // Catalog, schedule, and heartbeat reads enrich the inspector but are
-        // not runtime health signals. A reconnect or optional-capability miss
-        // keeps the last known data; unexpected failures still reach the
-        // normal conversation error path below.
+      if (isOptionalSelectionResponseFailure(message, pending?.type)) {
+        // Catalog, schedule, and heartbeat reads populate the inspector; they
+        // are not runtime health signals. Whatever the reason, the panel keeps
+        // its last known data and the conversation stays healthy. The failure
+        // is still recorded so a persistently empty panel can be explained.
+        addLog(
+          conversationId,
+          "rpc",
+          `${pending?.type ?? message.command ?? "RPC"}: ${cleanDiagnostic(message.error) ?? "no answer"}`,
+        );
         return;
       }
 
       if (message.success === false) {
         const error = cleanDiagnostic(message.error) ?? `La commande ${message.command ?? "RPC"} a échoué.`;
         updateConversation(conversationId, { status: "error", lastError: error });
-        addActivity(conversationId, { type: "error", title: "Prime Agent a signalé une erreur", detail: error, status: "error", raw: message });
+        // One row per distinct failure. A disconnected daemon rejects every
+        // command of every bootstrap retry, and giving each rejection its own
+        // row buried the timeline under scores of identical entries.
+        addActivity(conversationId, {
+          id: `rpc-error:${stableToken(error)}`,
+          type: "error",
+          title: "Prime Agent a signalé une erreur",
+          detail: error,
+          status: "error",
+          raw: message,
+        });
         return;
       }
 
@@ -2424,7 +2443,7 @@ export function useAgentRuntime(options: {
         updateConversation(conversationId, { model: `${model.provider}/${model.id}` });
       }
     },
-    [addActivity, applySessionStateSnapshot, isCurrentSelection, loadConversationHistory, loadLocalConversationHistory, recentCompactionEnd, sendSelectionRequest, setRuntimeCompacting, updateConversation],
+    [addActivity, addLog, applySessionStateSnapshot, isCurrentSelection, loadConversationHistory, loadLocalConversationHistory, recentCompactionEnd, sendSelectionRequest, setRuntimeCompacting, updateConversation],
   );
 
   const finalizePendingPlan = useCallback(async (conversationId: string) => {
@@ -3909,12 +3928,14 @@ export function useAgentRuntime(options: {
           if (!isTransientHistoryReadFailure(error)) throw error;
         }
       }
-      await Promise.all([
-        sendSelectionRequest(conversationId, token.generation, "get_available_models", true),
-        sendSelectionRequest(conversationId, token.generation, "get_commands", true),
-      ]);
       if (!isCurrentSelection(conversationId, token.generation)) return;
       updateConversation(conversationId, { status: "idle", lastError: undefined });
+      // The maintenance refresh succeeds on state and history. The catalogs
+      // below only populate pickers and panels, so they are never awaited:
+      // making the whole refresh fail because a model list timed out reported
+      // a broken conversation over a cosmetic read.
+      void sendSelectionRequest(conversationId, token.generation, "get_available_models").catch(() => undefined);
+      void sendSelectionRequest(conversationId, token.generation, "get_commands").catch(() => undefined);
       void sendSelectionRequest(conversationId, token.generation, "get_session_stats").catch(() => undefined);
       void sendSelectionRequest(conversationId, token.generation, "list_schedules", true, { includeInactive: false }).catch(() => undefined);
       void sendSelectionRequest(conversationId, token.generation, "get_heartbeat").catch(() => undefined);
