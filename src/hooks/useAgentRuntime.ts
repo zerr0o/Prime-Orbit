@@ -1043,9 +1043,17 @@ export function isOptionalSelectionResponseFailure(message: {
     || !OPTIONAL_SELECTION_COMMANDS.has(message.command)) return false;
   const detail = message.error instanceof Error ? message.error.message : String(message.error ?? "");
   const lowerDetail = detail.toLowerCase();
-  return detail.startsWith(
-    `Cannot send daemon command "${message.command}" because the Prime Agent daemon is not connected.`,
-  ) || lowerDetail.includes("unknown command") || lowerDetail.includes("unsupported");
+  // A busy or contended daemon can let one of these enrichment reads run out
+  // of time. That says nothing about the conversation's health: the model
+  // picker or schedule list simply keeps its last known data. Treating it as a
+  // runtime failure put the whole conversation into an error state and raised
+  // "Prime Agent needs attention" over a cosmetic read.
+  const timedOut = detail.trimStart().startsWith("Timed out after ")
+    && detail.includes(`waiting for the Prime Agent daemon response to "${message.command}".`);
+  return timedOut
+    || detail.startsWith(
+      `Cannot send daemon command "${message.command}" because the Prime Agent daemon is not connected.`,
+    ) || lowerDetail.includes("unknown command") || lowerDetail.includes("unsupported");
 }
 
 export async function commitPlanRuntimeModeTransition(

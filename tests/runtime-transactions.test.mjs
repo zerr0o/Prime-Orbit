@@ -1639,3 +1639,38 @@ test("plan replay backs off while the runtime is not in Plan mode", () => {
   // re-ran a bootstrap — and its dialog-queue replay — eight times a second.
   assert.ok(PLAN_REPLAY_IDLE_POLL_INTERVAL_MS >= 8 * PLAN_NATIVE_REPLAY_POLL_INTERVAL_MS);
 });
+
+test("a timed-out enrichment read never raises a runtime failure", () => {
+  // Observed against a contended daemon: the model picker read timed out and
+  // flipped the whole conversation into "Prime Agent needs attention" over a
+  // purely cosmetic fetch.
+  assert.equal(isOptionalSelectionResponseFailure({
+    command: "get_available_models",
+    success: false,
+    error: 'Timed out after 30000ms waiting for the Prime Agent daemon response to "get_available_models". Socket: \\.\pipe\prime-orbit-daemon-prime-agent-v0.8.0-3a60f74.',
+  }), true);
+  assert.equal(isOptionalSelectionResponseFailure({
+    command: "list_schedules",
+    success: false,
+    error: 'Timed out after 5000ms waiting for the Prime Agent daemon response to "list_schedules".',
+  }), true);
+
+  // A timeout naming a different command is not this command's excuse.
+  assert.equal(isOptionalSelectionResponseFailure({
+    command: "get_available_models",
+    success: false,
+    error: 'Timed out after 30000ms waiting for the Prime Agent daemon response to "get_state".',
+  }), false);
+  // Critical-path reads keep surfacing their failures.
+  assert.equal(isOptionalSelectionResponseFailure({
+    command: "get_state",
+    success: false,
+    error: 'Timed out after 30000ms waiting for the Prime Agent daemon response to "get_state".',
+  }), false);
+  // A genuine refusal from an optional command still reads as a real answer.
+  assert.equal(isOptionalSelectionResponseFailure({
+    command: "get_available_models",
+    success: false,
+    error: "The provider rejected the catalog request.",
+  }), false);
+});
