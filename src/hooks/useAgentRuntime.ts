@@ -115,6 +115,9 @@ interface ConversationRuntime {
   goalMutation?: GoalMutationRuntimeState;
   refinements?: SessionRefinementRecord[];
   harnessEntries?: SessionHarnessEntry[];
+  /** Corrections applied when an authoritative snapshot contradicted the
+   * renderer. Diagnostic evidence for lost-event investigations. */
+  divergences?: RuntimeDivergence[];
   logs: Array<{ id: string; stream: "rpc" | "stderr"; text: string; createdAt: string }>;
 }
 
@@ -225,6 +228,17 @@ const COMPACTION_LIFECYCLE_TIMEOUT_MS = 24 * 60 * 60_000;
 const GOAL_MUTATION_LIFECYCLE_TIMEOUT_MS = 24 * 60 * 60_000;
 const RECENT_COMPACTION_END_MS = 10_000;
 const TERMINAL_STATE_RECONCILIATION_DELAY_MS = 600;
+// Event-driven reconciliation only fires on a cue that itself travelled
+// through the stream. When that cue is the thing that was lost, nothing
+// re-synchronizes. This unconditional poll is the floor under every other
+// recovery path: while Prime Agent is believed to be working, Orbit keeps
+// asking it what is actually true.
+const RUNTIME_RECONCILIATION_INTERVAL_MS = 7_000;
+// A renderer activity row is never individually acknowledged by Prime Agent.
+// One still marked running long after its last update is either real work or
+// a lost terminal event, and only an authoritative snapshot separates the two.
+export const ACTIVITY_STALL_TIMEOUT_MS = 45_000;
+const MAX_RECORDED_DIVERGENCES = 20;
 const SESSION_FILE_POLL_INTERVAL_MS = 400;
 const PLAN_RESPONSE_ACK_TIMEOUT_MS = 12_000;
 const OPTIONAL_SELECTION_COMMANDS = new Set([
@@ -529,6 +543,57 @@ export function shouldScheduleTerminalStateReconciliation(event: { type: string;
   return record.role === "assistant" && record.stopReason !== "toolUse";
 }
 
+const STALLED_ACTIVITY_NOTE = "Ligne close après relecture de l’état Prime Agent.";
+
+/** Activity rows whose last update is older than the stall timeout. */
+export function stalledRunningActivities(
+  activities: readonly ActivityItem[],
+  nowMs: number,
+  stallTimeoutMs = ACTIVITY_STALL_TIMEOUT_MS,
+): ActivityItem[] {
+  return activities.filter((activity) => {
+    if (activity.status !== "running") return false;
+    const stamp = Date.parse(activity.updatedAt ?? activity.createdAt);
+    return Number.isFinite(stamp) && nowMs - stamp >= stallTimeoutMs;
+  });
+}
+
+/** Decides whether a conversation still owes Prime Agent a state check.
+ * Polling covers both directions of drift: a status that stayed active after a
+ * lost terminal event, and an idle status still presenting running rows. */
+export function shouldReconcileRuntimeState(
+  status: Conversation["status"],
+  hasStalledActivities: boolean,
+): boolean {
+  if (status === "streaming" || status === "tool" || status === "queued") return true;
+  return hasStalledActivities && status !== "offline";
+}
+
+/** Closes renderer-owned rows that Prime Agent's idle state has outlived.
+ * `finalizeConversationTools` only understands tool executions; lifecycle rows
+ * such as `agent_start` have no terminal event of their own once the stream
+ * that would have closed them was lost, so they would otherwise spin forever.
+ * The neutral status is deliberate: the snapshot proves the work is over, not
+ * that it succeeded. */
+export function finalizeStalledActivityRows(
+  activities: readonly ActivityItem[],
+  eventTime: string,
+): ActivityItem[] {
+  let changed = false;
+  const next = activities.map((activity) => {
+    if (activity.status !== "running") return activity;
+    changed = true;
+    return {
+      ...activity,
+      status: "info" as const,
+      detail: activity.detail ? `${activity.detail} · ${STALLED_ACTIVITY_NOTE}` : STALLED_ACTIVITY_NOTE,
+      updatedAt: eventTime,
+      updateCount: (activity.updateCount ?? 1) + 1,
+    };
+  });
+  return changed ? next : (activities as ActivityItem[]);
+}
+
 /** Finalize renderer-only tool/activity state after get_state proves that the
  * daemon has no active turn. A preserved native queue remains visible. */
 export function finalizeAuthoritativeIdleSnapshot(
@@ -538,9 +603,34 @@ export function finalizeAuthoritativeIdleSnapshot(
   const finalized = finalizeConversationTools(conversation, "completed", eventTime);
   return {
     ...finalized,
+    activities: finalizeStalledActivityRows(finalized.activities, eventTime),
     status: conversation.status === "starting" ? "starting" : "idle",
     lastError: undefined,
   };
+}
+
+export interface RuntimeDivergence {
+  id: string;
+  observedStatus: Conversation["status"];
+  stalledActivities: number;
+  detectedAt: string;
+  source: "reconciliation" | "resync";
+}
+
+/** Records only corrections that contradict what the renderer was presenting.
+ * A snapshot confirming an already-idle conversation is agreement, not drift,
+ * and logging it would bury the real losses in noise. */
+export function runtimeDivergenceForSnapshot(
+  observedStatus: Conversation["status"],
+  stalledActivities: number,
+  source: RuntimeDivergence["source"],
+  detectedAt = now(),
+): Omit<RuntimeDivergence, "id"> | undefined {
+  const statusDiverged = observedStatus === "streaming"
+    || observedStatus === "tool"
+    || observedStatus === "queued";
+  if (!statusDiverged && stalledActivities === 0) return undefined;
+  return { observedStatus, stalledActivities, detectedAt, source };
 }
 
 export function isCompactDaemonAcknowledgementTimeout(message: Pick<RpcEnvelope, "command" | "success" | "error">): boolean {
@@ -1701,6 +1791,25 @@ export function useAgentRuntime(options: {
     });
   }, [updateConversation]);
 
+  /** Keeps the evidence trail for a correction Orbit had to make on its own.
+   * Without it every lost event looks identical to a slow agent. */
+  const recordRuntimeDivergence = useCallback((
+    conversationId: string,
+    divergence: Omit<RuntimeDivergence, "id">,
+  ) => {
+    setRuntimes((current) => {
+      const runtime = current[conversationId] ?? { models: [], commands: [], logs: [] };
+      return {
+        ...current,
+        [conversationId]: {
+          ...runtime,
+          divergences: [...(runtime.divergences ?? []), { ...divergence, id: uid("divergence") }]
+            .slice(-MAX_RECORDED_DIVERGENCES),
+        },
+      };
+    });
+  }, []);
+
   const addLog = useCallback((conversationId: string, stream: "rpc" | "stderr", text: string) => {
     setRuntimes((current) => {
       const runtime = current[conversationId] ?? { models: [], commands: [], logs: [] };
@@ -1788,6 +1897,7 @@ export function useAgentRuntime(options: {
     conversationId: string,
     rawSessionState: AgentSessionState,
     requestedGoalEpoch: number,
+    divergenceSource: RuntimeDivergence["source"] = "reconciliation",
   ) => {
     const currentGoalEpoch = goalEpoch.current.get(conversationId) ?? 0;
     const goal = goalForSessionSnapshot({
@@ -1814,6 +1924,17 @@ export function useAgentRuntime(options: {
       pendingPromptAdmissions.current.has(conversationId),
     );
     if (shouldRecoverIdle) {
+      // At an authoritative idle boundary every running row is stale whatever
+      // its age, so the stall timeout is deliberately zero here.
+      const observed = getConversationRef.current(conversationId);
+      const divergence = observed
+        ? runtimeDivergenceForSnapshot(
+            observed.status,
+            stalledRunningActivities(observed.activities, Date.now(), 0).length,
+            divergenceSource,
+          )
+        : undefined;
+      if (divergence) recordRuntimeDivergence(conversationId, divergence);
       // get_state is the daemon's authoritative answer after a renderer
       // listener gap. Purging both refs is essential: conversation.status alone
       // is not used to close the rapid-submit race, and a stale prompt marker
@@ -1879,7 +2000,7 @@ export function useAgentRuntime(options: {
         }
       }, 0);
     }
-  }, [cancelTerminalStateReconciliation, isCurrentSelection, loadConversationHistory, loadLocalConversationHistory, updateConversation]);
+  }, [cancelTerminalStateReconciliation, isCurrentSelection, loadConversationHistory, loadLocalConversationHistory, recordRuntimeDivergence, updateConversation]);
 
   const handleResponse = useCallback(
     (conversationId: string, message: RpcEnvelope) => {
@@ -3867,6 +3988,37 @@ export function useAgentRuntime(options: {
     terminalStateReconciliationTimers.current.clear();
   }), [cancelConversationRequests, clearPendingConversationRequest, settleCompactionWaiter]);
 
+  // The reconciliation floor under every event-driven recovery path. Those
+  // paths all fire on a cue that itself travelled through the stream, so none
+  // of them can repair the loss of that very cue. The ticker is unconditional
+  // and the decision to send lives in the callback, reading current state:
+  // keeping the interval stable avoids tearing it down on every activity
+  // update during a stream. applySessionStateSnapshot remains the sole
+  // arbiter of what a snapshot is allowed to change.
+  useEffect(() => {
+    if (!active || !eventsReady || !isNative()) return;
+    const conversationId = selectedConversation?.id;
+    if (!conversationId) return;
+    const interval = window.setInterval(() => {
+      const conversation = getConversationRef.current(conversationId);
+      if (!conversation) return;
+      // A Plan runtime blocked in a question or review dialog is waiting on the
+      // user by design, not drifting. It cannot answer until the dialog is
+      // resolved, so polling it would only pile up requests that time out.
+      const planPhase = conversationPlanState(conversation).phase;
+      if (planPhase === "question" || planPhase === "review") return;
+      const stalled = stalledRunningActivities(conversation.activities, Date.now());
+      if (!shouldReconcileRuntimeState(conversation.status, stalled.length > 0)) return;
+      const token = activeSelection.current;
+      if (
+        token.conversationId !== conversationId
+        || !isCurrentSelection(conversationId, token.generation)
+      ) return;
+      void sendSelectionRequest(conversationId, token.generation, "get_state").catch(() => undefined);
+    }, RUNTIME_RECONCILIATION_INTERVAL_MS);
+    return () => window.clearInterval(interval);
+  }, [active, eventsReady, isCurrentSelection, selectedConversation?.id, sendSelectionRequest]);
+
   const sendPrompt = useCallback(
     async (message: string, attachments: Attachment[], requestedDelivery?: "steer" | "follow_up") => {
       if (!selectedConversation || !selectedProject) return;
@@ -4619,6 +4771,45 @@ export function useAgentRuntime(options: {
         });
         return;
       }
+      if (type === "resync_runtime") {
+        const conversationId = selectedConversation.id;
+        const observed = getConversationRef.current(conversationId) ?? selectedConversation;
+        const stalled = stalledRunningActivities(observed.activities, Date.now(), 0).length;
+        // Only renderer-owned inference markers are cleared here. Operations
+        // that have a real awaiting caller — compaction, refinement, a running
+        // bash command — keep their state: discarding them would report an
+        // outcome Orbit never observed. Emergency restart remains the escape
+        // hatch for those.
+        activePromptRuns.current.delete(conversationId);
+        activeAgentLifecycles.current.delete(conversationId);
+        pendingPromptAdmissions.current.delete(conversationId);
+        persistedIdleConversations.current.delete(conversationId);
+        cancelTerminalStateReconciliation(conversationId);
+        historyLoaded.current.delete(conversationId);
+        historyInFlight.current.delete(conversationId);
+        bootstrapGeneration.current.delete(conversationId);
+        stateEpoch.current.set(conversationId, (stateEpoch.current.get(conversationId) ?? 0) + 1);
+        transcriptEpoch.current.set(conversationId, (transcriptEpoch.current.get(conversationId) ?? 0) + 1);
+        const divergence = runtimeDivergenceForSnapshot(observed.status, stalled, "resync");
+        if (divergence) recordRuntimeDivergence(conversationId, divergence);
+        await ensureStarted(selectedConversation, selectedProject);
+        const token = activeSelection.current;
+        const conversation = getConversationRef.current(conversationId);
+        const project = conversation ? getProjectRef.current(conversation.projectId) : undefined;
+        if (isNative() && conversation?.sessionPath && project) {
+          await loadLocalConversationHistory(conversation, project, token.generation, true)
+            .catch(() => undefined);
+        }
+        addActivity(conversationId, {
+          type: "runtime_resync",
+          title: "État resynchronisé",
+          detail: stalled > 0
+            ? `${stalled} ligne(s) d’activité en cours ont été confrontées à l’état réel de Prime Agent.`
+            : "L’état et l’historique ont été relus depuis Prime Agent.",
+          status: "success",
+        });
+        return;
+      }
       if (type === "get_state" && Object.keys(fields).length === 0) {
         // A manual refresh is itself the bootstrap transaction. Invalidating
         // the successful generation makes ensureStarted await one authoritative
@@ -4890,7 +5081,7 @@ export function useAgentRuntime(options: {
       }
       await sendRpc(selectedConversation.id, { id: uid(type), type, ...fields });
     },
-    [addActivity, awaitMaintenanceRefresh, cancelConversationRequests, cancelPersistentConversationRequests, detection?.mode, ensureProcessStarted, ensureStarted, isCurrentSelection, loadConversationHistory, onNotice, recentCompactionEnd, refreshLocalRefinements, rejectGoalMutation, removeActivity, runGoalMutation, selectedConversation, selectedProject, sendConversationRequest, sendSelectionRequest, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation],
+    [addActivity, awaitMaintenanceRefresh, cancelConversationRequests, cancelPersistentConversationRequests, cancelTerminalStateReconciliation, detection?.mode, ensureProcessStarted, ensureStarted, isCurrentSelection, loadConversationHistory, loadLocalConversationHistory, onNotice, recentCompactionEnd, recordRuntimeDivergence, refreshLocalRefinements, rejectGoalMutation, removeActivity, runGoalMutation, selectedConversation, selectedProject, sendConversationRequest, sendSelectionRequest, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation],
   );
 
   const observeSubagent = useCallback(async (activeSessionId?: string) => {
@@ -5552,6 +5743,7 @@ export function useAgentRuntime(options: {
     goalMutation: runtime?.goalMutation,
     refinements: runtime?.refinements,
     harnessEntries: runtime?.harnessEntries,
+    divergences: runtime?.divergences ?? [],
     isCompacting: runtime?.isCompacting ?? runtime?.state?.isCompacting ?? false,
     isRefining: runtime?.isRefining ?? false,
     schedules: runtime?.schedules ?? [],

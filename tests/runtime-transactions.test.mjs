@@ -79,6 +79,11 @@ const {
   refineLifecycleDisposition,
   refinementResultPresentation,
   rlmChildPresentation,
+  finalizeStalledActivityRows,
+  runtimeDivergenceForSnapshot,
+  shouldReconcileRuntimeState,
+  stalledRunningActivities,
+  ACTIVITY_STALL_TIMEOUT_MS,
   PLAN_NATIVE_REPLAY_POLL_INTERVAL_MS,
   PLAN_NATIVE_REPLAY_PROBE_TIMEOUT_MS,
 } = compiledModule.exports;
@@ -1385,4 +1390,141 @@ test("falls back to the same user-message ordinal when display text was normaliz
     selectForkEntryId(messages, "assistant-1", [{ entryId: "entry-1", text: "[attachment] Local attachment prompt" }]),
     "entry-1",
   );
+});
+
+test("an authoritative idle snapshot closes lifecycle rows that lost their terminal event", () => {
+  // agent_start is not a tool execution, so finalizeConversationTools alone
+  // leaves it spinning forever once agent_end is lost. This is the exact
+  // "Prime Agent is working" symptom the reconciliation pass has to end.
+  const recovered = finalizeAuthoritativeIdleSnapshot(conversation({
+    status: "streaming",
+    activities: [
+      {
+        id: "activity-agent-start",
+        type: "agent_start",
+        title: "Prime Agent réfléchit",
+        status: "running",
+        createdAt: "2026-08-21T11:28:16.000Z",
+      },
+      {
+        id: "activity-done",
+        type: "agent_end",
+        title: "Exécution terminée",
+        status: "success",
+        createdAt: "2026-08-21T11:29:00.000Z",
+      },
+    ],
+  }), "2026-08-21T11:29:17.000Z");
+
+  assert.equal(recovered.status, "idle");
+  const lifecycle = recovered.activities.find((item) => item.id === "activity-agent-start");
+  assert.equal(lifecycle.status, "info");
+  assert.equal(lifecycle.updatedAt, "2026-08-21T11:29:17.000Z");
+  assert.match(lifecycle.detail, /Prime Agent/u);
+  // Rows that already reached a terminal status are untouched.
+  const settled = recovered.activities.find((item) => item.id === "activity-done");
+  assert.equal(settled.status, "success");
+  assert.equal(settled.updatedAt, undefined);
+});
+
+test("finalizing stalled rows preserves identity and returns the original array when nothing runs", () => {
+  const settled = [{
+    id: "activity-done",
+    type: "agent_end",
+    title: "Exécution terminée",
+    status: "success",
+    createdAt: "2026-08-21T11:29:00.000Z",
+  }];
+  assert.equal(finalizeStalledActivityRows(settled, "2026-08-21T11:30:00.000Z"), settled);
+
+  const withDetail = finalizeStalledActivityRows([{
+    id: "activity-bash",
+    type: "tool_execution_start",
+    title: "Commande en cours",
+    detail: "npm test",
+    status: "running",
+    createdAt: "2026-08-21T11:29:00.000Z",
+    updateCount: 3,
+  }], "2026-08-21T11:30:00.000Z");
+  assert.match(withDetail[0].detail, /^npm test · /u);
+  assert.equal(withDetail[0].updateCount, 4);
+});
+
+test("stalled activity detection uses the latest update, not creation time", () => {
+  const nowMs = Date.parse("2026-08-21T11:30:00.000Z");
+  const activities = [
+    {
+      id: "fresh",
+      type: "tool_execution_start",
+      title: "Fraîche",
+      status: "running",
+      createdAt: "2026-08-21T10:00:00.000Z",
+      updatedAt: "2026-08-21T11:29:59.000Z",
+    },
+    {
+      id: "stalled",
+      type: "tool_execution_start",
+      title: "Bloquée",
+      status: "running",
+      createdAt: "2026-08-21T11:00:00.000Z",
+    },
+    {
+      id: "settled",
+      type: "tool_execution_end",
+      title: "Terminée",
+      status: "success",
+      createdAt: "2026-08-21T11:00:00.000Z",
+    },
+    {
+      id: "unparseable",
+      type: "tool_execution_start",
+      title: "Horodatage illisible",
+      status: "running",
+      createdAt: "not-a-date",
+    },
+  ];
+
+  const stalled = stalledRunningActivities(activities, nowMs);
+  assert.deepEqual(stalled.map((item) => item.id), ["stalled"]);
+  // A zero timeout is how the authoritative idle boundary counts every row.
+  assert.deepEqual(
+    stalledRunningActivities(activities, nowMs, 0).map((item) => item.id),
+    ["fresh", "stalled"],
+  );
+  assert.ok(ACTIVITY_STALL_TIMEOUT_MS >= 30_000);
+});
+
+test("reconciliation polls active work and any status still showing stalled rows", () => {
+  for (const status of ["streaming", "tool", "queued"]) {
+    assert.equal(shouldReconcileRuntimeState(status, false), true);
+  }
+  // An idle conversation is only worth polling when it contradicts itself.
+  assert.equal(shouldReconcileRuntimeState("idle", false), false);
+  assert.equal(shouldReconcileRuntimeState("idle", true), true);
+  // The bootstrap owns `starting`; it is polled only to break a visible stall.
+  assert.equal(shouldReconcileRuntimeState("starting", false), false);
+  assert.equal(shouldReconcileRuntimeState("starting", true), true);
+  // A closed runtime has nothing to answer.
+  assert.equal(shouldReconcileRuntimeState("offline", true), false);
+});
+
+test("divergences record corrections only, never agreement", () => {
+  assert.equal(runtimeDivergenceForSnapshot("idle", 0, "reconciliation"), undefined);
+  assert.equal(runtimeDivergenceForSnapshot("offline", 0, "resync"), undefined);
+
+  const corrected = runtimeDivergenceForSnapshot(
+    "streaming",
+    2,
+    "reconciliation",
+    "2026-08-21T11:30:00.000Z",
+  );
+  assert.deepEqual(corrected, {
+    observedStatus: "streaming",
+    stalledActivities: 2,
+    detectedAt: "2026-08-21T11:30:00.000Z",
+    source: "reconciliation",
+  });
+
+  // An idle status that still carried running rows is drift worth recording.
+  assert.equal(runtimeDivergenceForSnapshot("idle", 1, "resync").stalledActivities, 1);
 });

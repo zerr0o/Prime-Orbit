@@ -761,6 +761,7 @@ function App() {
             isRefining={agent.isRefining}
             refinements={agent.refinements}
             harnessEntries={agent.harnessEntries}
+            divergences={agent.divergences}
             schedules={agent.schedules}
             heartbeat={agent.heartbeat}
             heartbeats={agent.heartbeats}

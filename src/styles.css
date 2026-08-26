@@ -1355,6 +1355,8 @@ kbd { padding: 2px 5px; border: 1px solid var(--border); border-radius: 5px; col
 .observed-message strong { color: var(--text-secondary); font-size: 7.5px; text-transform: uppercase; letter-spacing: .08em; }
 .observed-message p { margin: 4px 0 0; color: var(--text-secondary); font-size: 8px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
 .refinement-monitor { margin-top: 14px; padding-top: 5px; border-top: 1px solid var(--border-soft); }
+.divergence-monitor { margin-top: 14px; padding-top: 5px; border-top: 1px solid var(--border-soft); }
+.divergence-monitor .supervision-job > svg { color: var(--warning); }
 .refinement-live { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; padding: 9px; border: 1px solid color-mix(in srgb, var(--signal) 28%, var(--border)); border-radius: 8px; color: var(--signal); background: color-mix(in srgb, var(--signal) 7%, var(--surface-1)); }
 .refinement-live > span { min-width: 0; }
 .refinement-live strong, .refinement-live small { display: block; }
@@ -1876,6 +1878,8 @@ kbd { padding: 2px 5px; border: 1px solid var(--border); border-radius: 5px; col
 .runtime-diagnostic { display: flex; align-items: flex-start; gap: 9px; margin-bottom: 23px; padding: 11px 12px; border: 1px solid rgba(246, 95, 116, 0.2); border-radius: 10px; color: var(--danger); background: rgba(246, 95, 116, 0.055); }
 .runtime-diagnostic > svg { flex: 0 0 auto; margin-top: 1px; }
 .runtime-diagnostic pre { max-height: 116px; flex: 1; overflow: auto; margin: 0; color: #dba0a9; font-family: "Cascadia Code", Consolas, monospace; font-size: 8px; line-height: 1.5; text-align: left; white-space: pre-wrap; word-break: break-word; }
+.runtime-diagnostic.is-warning { border-color: rgba(233, 165, 84, 0.28); color: var(--warning); background: rgba(233, 165, 84, 0.06); }
+.runtime-diagnostic.is-warning pre { color: #d8b283; }
 .install-progress { margin-bottom: 22px; overflow: hidden; border: 1px solid var(--border-soft); border-radius: 11px; background: var(--bg-deep); }
 .install-progress header { display: flex; height: 37px; align-items: center; justify-content: space-between; padding: 0 11px; border-bottom: 1px solid var(--border-soft); color: var(--text-secondary); font-size: 9px; }
 .install-progress header span { display: flex; align-items: center; gap: 7px; }

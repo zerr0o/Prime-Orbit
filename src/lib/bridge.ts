@@ -57,6 +57,7 @@ interface NativeDetection {
   version?: string;
   managed: boolean;
   warnings: string[];
+  versionWarning?: string;
 }
 
 interface NativePrerequisite {
@@ -160,6 +161,7 @@ function mapDetection(raw: NativeDetection, items: NativePrerequisite[] = []): R
     mode: raw.managed ? "managed" : raw.runtimeKind === "source" ? "source" : raw.found ? "system" : undefined,
     sourceDir: raw.sourceDir,
     error: !raw.found && raw.warnings.length ? raw.warnings.join("\n") : undefined,
+    versionWarning: raw.versionWarning,
     prerequisites: items.map((item) => ({
       name: item.label,
       found: item.found,

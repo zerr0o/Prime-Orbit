@@ -116,6 +116,7 @@ import type {
   ThinkingLevel,
   ToolActivity,
 } from "../types";
+import type { RuntimeDivergence } from "../hooks/useAgentRuntime";
 import { Badge, Button, IconButton, Modal } from "./Ui";
 import { ModelPickerPopover } from "./ModelPickerPopover";
 
@@ -142,6 +143,7 @@ interface ConversationViewProps {
   isRefining?: boolean;
   refinements?: SessionRefinementRecord[];
   harnessEntries?: SessionHarnessEntry[];
+  divergences?: RuntimeDivergence[];
   schedules?: AgentSchedule[];
   heartbeat?: AgentSchedule | null;
   heartbeats?: AgentHeartbeatSummary[];
@@ -374,7 +376,7 @@ export function continueComposerMarkdownList(
 }
 
 export function ConversationView(props: ConversationViewProps) {
-  const { project, conversation, models, favoriteModels, commands, stats, sessionState, goalMutation, isCompacting: runtimeCompacting = false, isRefining = false, refinements, harnessEntries, schedules = [], heartbeat, heartbeats = [], subagents = [], observedSubagent, inspectorOpen, changes, resourceReloadSupported, planRequest, isPlanRequestReplayPending = false, onPlanMode, onRetryPlanFinalization, onRecoverPlanDialogs, onAnswerPlanRequest, onToggleInspector, onDraftChange, onSend, onRetryMessage, onAbort, onModel, onToggleFavoriteModel, onThinking, onRunCommand, onObserveSubagent, onForkMessage, onCloneSession, onNewWindow, onOpenTerminal } = props;
+  const { project, conversation, models, favoriteModels, commands, stats, sessionState, goalMutation, isCompacting: runtimeCompacting = false, isRefining = false, refinements, harnessEntries, divergences = [], schedules = [], heartbeat, heartbeats = [], subagents = [], observedSubagent, inspectorOpen, changes, resourceReloadSupported, planRequest, isPlanRequestReplayPending = false, onPlanMode, onRetryPlanFinalization, onRecoverPlanDialogs, onAnswerPlanRequest, onToggleInspector, onDraftChange, onSend, onRetryMessage, onAbort, onModel, onToggleFavoriteModel, onThinking, onRunCommand, onObserveSubagent, onForkMessage, onCloneSession, onNewWindow, onOpenTerminal } = props;
   const { language } = useI18n();
   const isCompacting = runtimeCompacting || Boolean(sessionState?.isCompacting);
   const isRunning = !isCompacting && isConversationTurnActive(conversation.status);
@@ -567,6 +569,7 @@ export function ConversationView(props: ConversationViewProps) {
           isRefining={isRefining}
           refinements={refinements}
           harnessEntries={harnessEntries}
+          divergences={divergences}
           schedules={schedules}
           heartbeat={heartbeat}
           heartbeats={heartbeats}
@@ -692,6 +695,7 @@ function SessionActionsPopover({ sessionState, resourceReloadSupported, onChoose
       <div className="popover-separator" />
       <div className="popover-label">{bi(language, "Diagnostic", "Diagnostics")}</div>
       <button type="button" disabled={Boolean(busyAction)} onClick={() => void runAction("get_state")}><RefreshCw size={15} /><span><strong>{bi(language, "Actualiser l’état", "Refresh state")}</strong><small>{bi(language, "Relire l’état sans interrompre Prime Agent", "Read state again without interrupting Prime Agent")}</small></span>{busyAction === "get_state" ? <LoaderCircle size={14} className="spin" /> : null}</button>
+      <button type="button" disabled={Boolean(busyAction)} onClick={() => void runAction("resync_runtime")}><RefreshCw size={15} /><span><strong>{bi(language, "Resynchroniser", "Resynchronize")}</strong><small>{bi(language, "Confronter l’affichage à l’état réel et relire l’historique", "Check the display against real state and read history again")}</small></span>{busyAction === "resync_runtime" ? <LoaderCircle size={14} className="spin" /> : null}</button>
       <button type="button" className={!resourceReloadSupported ? "is-capability-unavailable" : undefined} disabled={Boolean(busyAction) || !resourceReloadSupported} onClick={() => void runAction("reload_resources")}><RefreshCw size={15} /><span><strong>{bi(language, "Recharger les ressources", "Reload resources")}</strong><small>{resourceReloadSupported ? bi(language, "Réappliquer réglages, skills, extensions, prompts et MCP", "Reapply settings, skills, extensions, prompts, and MCP") : bi(language, "Indisponible avec l’exécutable système", "Unavailable with the system executable")}</small></span>{busyAction === "reload_resources" ? <LoaderCircle size={14} className="spin" /> : null}</button>
       <button type="button" disabled={Boolean(busyAction)} className="session-danger-action" onClick={onEmergencyRestart}><CircleAlert size={15} /><span><strong>{bi(language, "Redémarrage d’urgence", "Emergency restart")}</strong><small>{bi(language, "Relancer uniquement cette connexion et annuler son travail en cours", "Restart only this connection and cancel its current work")}</small></span></button>
       {actionError ? <div className="popover-inline-error" role="alert"><CircleAlert size={14} /><span>{actionError}</span></div> : null}
@@ -2664,7 +2668,7 @@ function ContextUsagePopover({ snapshot }: { snapshot: ContextUsageSnapshot }) {
   );
 }
 
-function RunInspector({ project, conversation, stats, sessionState, goalMutation, isCompacting, isRefining, refinements, harnessEntries, schedules, heartbeat, heartbeats, subagents, observedSubagent, changes, tab, onTab, onClose, onRunCommand, onObserveSubagent, onCloneSession, onDraftChange }: {
+function RunInspector({ project, conversation, stats, sessionState, goalMutation, isCompacting, isRefining, refinements, harnessEntries, divergences = [], schedules, heartbeat, heartbeats, subagents, observedSubagent, changes, tab, onTab, onClose, onRunCommand, onObserveSubagent, onCloneSession, onDraftChange }: {
   project: Project;
   conversation: Conversation;
   stats?: SessionStats;
@@ -2674,6 +2678,7 @@ function RunInspector({ project, conversation, stats, sessionState, goalMutation
   isRefining: boolean;
   refinements?: SessionRefinementRecord[];
   harnessEntries?: SessionHarnessEntry[];
+  divergences?: RuntimeDivergence[];
   schedules: AgentSchedule[];
   heartbeat?: AgentSchedule | null;
   heartbeats: AgentHeartbeatSummary[];
@@ -2701,7 +2706,7 @@ function RunInspector({ project, conversation, stats, sessionState, goalMutation
       <nav className="inspector-tabs" aria-label={bi(language, "Inspecteur de session", "Session inspector")}>{tabs.map((item) => { const TabIcon = item.icon; return <button key={item.id} type="button" className={tab === item.id ? "is-active" : ""} onClick={() => onTab(item.id)}><TabIcon size={14} />{item.label}{item.count ? <span>{item.count}</span> : null}</button>; })}</nav>
       <div className="inspector-content">
         {tab === "activity" ? <ActivityPanel activities={conversation.activities} conversation={conversation} /> : null}
-        {tab === "session" ? <SessionPanel project={project} conversation={conversation} sessionState={sessionState} goalMutation={goalMutation} isRefining={isRefining} refinements={refinements} harnessEntries={harnessEntries} schedules={schedules} heartbeat={heartbeat} heartbeats={heartbeats} subagents={subagents} observedSubagent={observedSubagent} onRunCommand={onRunCommand} onObserveSubagent={onObserveSubagent} /> : null}
+        {tab === "session" ? <SessionPanel project={project} conversation={conversation} sessionState={sessionState} goalMutation={goalMutation} isRefining={isRefining} refinements={refinements} harnessEntries={harnessEntries} divergences={divergences} schedules={schedules} heartbeat={heartbeat} heartbeats={heartbeats} subagents={subagents} observedSubagent={observedSubagent} onRunCommand={onRunCommand} onObserveSubagent={onObserveSubagent} /> : null}
         {tab === "changes" ? <ChangesPanel projectPath={project.path} changes={changes} draft={conversation.draft} onDraftChange={onDraftChange} /> : null}
         {tab === "details" ? <DetailsPanel project={project} conversation={conversation} stats={stats} sessionState={sessionState} isCompacting={isCompacting} isRefining={isRefining} onRunCommand={onRunCommand} onCloneSession={onCloneSession} /> : null}
       </div>
@@ -2779,7 +2784,7 @@ export function buildSessionPanelSummary(
   };
 }
 
-function SessionPanel({ project, conversation, sessionState, goalMutation, isRefining, refinements, harnessEntries, schedules, heartbeat, heartbeats, subagents, observedSubagent, onRunCommand, onObserveSubagent }: { project: Project; conversation: Conversation; sessionState?: AgentSessionState; goalMutation?: GoalMutationRuntimeState; isRefining: boolean; refinements?: SessionRefinementRecord[]; harnessEntries?: SessionHarnessEntry[]; schedules: AgentSchedule[]; heartbeat?: AgentSchedule | null; heartbeats: AgentHeartbeatSummary[]; subagents: AgentRlmChild[]; observedSubagent?: { activeSessionId: string; messages: ChatMessage[]; closed?: boolean; error?: string }; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onObserveSubagent: (activeSessionId?: string) => Promise<void> }) {
+function SessionPanel({ project, conversation, sessionState, goalMutation, isRefining, refinements, harnessEntries, divergences, schedules, heartbeat, heartbeats, subagents, observedSubagent, onRunCommand, onObserveSubagent }: { project: Project; conversation: Conversation; sessionState?: AgentSessionState; goalMutation?: GoalMutationRuntimeState; isRefining: boolean; refinements?: SessionRefinementRecord[]; harnessEntries?: SessionHarnessEntry[]; divergences?: RuntimeDivergence[]; schedules: AgentSchedule[]; heartbeat?: AgentSchedule | null; heartbeats: AgentHeartbeatSummary[]; subagents: AgentRlmChild[]; observedSubagent?: { activeSessionId: string; messages: ChatMessage[]; closed?: boolean; error?: string }; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void>; onObserveSubagent: (activeSessionId?: string) => Promise<void> }) {
   const { language, locale } = useI18n();
   const [section, setSection] = useState<SessionPanelSection>("runtime");
   const [refreshing, setRefreshing] = useState(false);
@@ -2846,7 +2851,7 @@ function SessionPanel({ project, conversation, sessionState, goalMutation, isRef
         </> : null}
         {section === "goal" ? <GoalPanel key={`goal:${conversation.id}`} conversation={conversation} goal={sessionState?.goal} goalMutation={goalMutation} onRunCommand={onRunCommand} /> : null}
         {section === "agents" ? <SubagentsPanel key={`agents:${conversation.id}`} subagents={subagents} observed={observedSubagent} onObserve={onObserveSubagent} /> : null}
-        {section === "supervision" ? <SupervisionPanel key={`supervision:${conversation.id}`} projectPath={project.path} conversation={conversation} isRefining={isRefining} refinements={refinements} harnessEntries={harnessEntries} schedules={schedules} heartbeat={heartbeat} heartbeats={heartbeats} onRunCommand={onRunCommand} /> : null}
+        {section === "supervision" ? <SupervisionPanel key={`supervision:${conversation.id}`} projectPath={project.path} conversation={conversation} isRefining={isRefining} refinements={refinements} harnessEntries={harnessEntries} divergences={divergences} schedules={schedules} heartbeat={heartbeat} heartbeats={heartbeats} onRunCommand={onRunCommand} /> : null}
       </div>
     </div>
   );
@@ -2984,7 +2989,7 @@ function SubagentsPanel({ subagents, observed, onObserve }: { subagents: AgentRl
   );
 }
 
-function SupervisionPanel({ projectPath, conversation, isRefining, refinements, harnessEntries, schedules, heartbeat, heartbeats, onRunCommand }: { projectPath: string; conversation: Conversation; isRefining: boolean; refinements?: SessionRefinementRecord[]; harnessEntries?: SessionHarnessEntry[]; schedules: AgentSchedule[]; heartbeat?: AgentSchedule | null; heartbeats: AgentHeartbeatSummary[]; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void> }) {
+function SupervisionPanel({ projectPath, conversation, isRefining, refinements, harnessEntries, divergences = [], schedules, heartbeat, heartbeats, onRunCommand }: { projectPath: string; conversation: Conversation; isRefining: boolean; refinements?: SessionRefinementRecord[]; harnessEntries?: SessionHarnessEntry[]; divergences?: RuntimeDivergence[]; schedules: AgentSchedule[]; heartbeat?: AgentSchedule | null; heartbeats: AgentHeartbeatSummary[]; onRunCommand: (type: string, fields?: Record<string, unknown>) => Promise<void> }) {
   const { language, locale } = useI18n();
   const [editor, setEditor] = useState<"schedule" | "heartbeat">();
   const [schedule, setSchedule] = useState("every 30m");
@@ -3034,8 +3039,46 @@ function SupervisionPanel({ projectPath, conversation, isRefining, refinements, 
       <div className="supervision-actions"><Button variant="ghost" onClick={() => setEditor((current) => current === "heartbeat" ? undefined : "heartbeat")}><HeartPulse size={14} />{bi(language, "Heartbeat", "Heartbeat")}</Button><Button variant="ghost" onClick={() => setEditor((current) => current === "schedule" ? undefined : "schedule")}><CalendarClock size={14} />{bi(language, "Planifier", "Schedule")}</Button></div>
       {error && !editor ? <p className="trust-note" role="alert"><CircleAlert size={14} />{error}</p> : null}
       {editor ? <div className="supervision-editor"><label><span>{bi(language, "Fréquence ou date", "Frequency or date")}</span><input value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="every 30m" /></label><label><span>{bi(language, "Instruction à exécuter", "Instruction to run")}</span><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={3} /></label>{editor === "heartbeat" ? <label><span>{bi(language, "Si l’agent travaille déjà", "If the agent is already working")}</span><select value={deliveryMode} onChange={(event) => setDeliveryMode(event.target.value as "steer" | "follow_up")}><option value="steer">{bi(language, "Orienter le travail en cours", "Steer current work")}</option><option value="follow_up">{bi(language, "Attendre puis ouvrir un nouveau tour", "Wait, then start a new turn")}</option></select></label> : null}{error ? <p className="trust-note" role="alert"><CircleAlert size={14} />{error}</p> : null}<Button disabled={!prompt.trim() || !schedule.trim() || submitting} onClick={() => void submit()}>{submitting ? <LoaderCircle size={14} className="spin" /> : <Check size={14} />}{bi(language, "Activer", "Enable")}</Button></div> : null}
+      <DivergenceMonitor divergences={divergences} />
       <RefinementMonitor projectPath={projectPath} conversation={conversation} isRefining={isRefining} refinements={refinements} harnessEntries={harnessEntries} onRunCommand={onRunCommand} />
     </section>
+  );
+}
+
+/** Surfaces every correction Orbit had to apply because Prime Agent's event
+ * stream and the rendered state disagreed. Without this trail a lost event is
+ * indistinguishable from a slow agent, and the cause can never be narrowed
+ * down to the transport, the parser, or Prime Agent itself. */
+function DivergenceMonitor({ divergences }: { divergences: RuntimeDivergence[] }) {
+  const { language, locale } = useI18n();
+  if (divergences.length === 0) return null;
+  const statusLabel = (status: RuntimeDivergence["observedStatus"]) => {
+    if (status === "streaming") return bi(language, "génération", "streaming");
+    if (status === "tool") return bi(language, "outil", "tool");
+    if (status === "queued") return bi(language, "file d’attente", "queued");
+    return status;
+  };
+  return (
+    <div className="divergence-monitor">
+      <div className="section-title">
+        <span>{bi(language, "Écarts de synchronisation", "Synchronization drift")}</span>
+        <Badge tone="warning">{divergences.length}</Badge>
+      </div>
+      <p className="supervision-explainer">{bi(language, "Corrections appliquées après relecture de l’état réel de Prime Agent. Un écart signale un événement perdu entre l’agent et cette fenêtre.", "Corrections applied after re-reading Prime Agent's real state. Drift means an event was lost between the agent and this window.")}</p>
+      {divergences.slice(-8).reverse().map((item) => (
+        <div className="supervision-job" key={item.id}>
+          <CircleAlert size={16} />
+          <span>
+            <strong>{item.source === "resync" ? bi(language, "Resynchronisation manuelle", "Manual resynchronization") : bi(language, "Réconciliation automatique", "Automatic reconciliation")}</strong>
+            <small>
+              {bi(language, `Affiché « ${statusLabel(item.observedStatus)} » alors que Prime Agent était inactif`, `Displayed "${statusLabel(item.observedStatus)}" while Prime Agent was idle`)}
+              {item.stalledActivities > 0 ? ` · ${item.stalledActivities} ${bi(language, "ligne(s) close(s)", "row(s) closed")}` : ""}
+              {` · ${new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(item.detectedAt))}`}
+            </small>
+          </span>
+        </div>
+      ))}
+    </div>
   );
 }
 

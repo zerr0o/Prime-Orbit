@@ -377,6 +377,9 @@ export interface RuntimeDetection {
   configDir?: string;
   sourceDir?: string;
   error?: string;
+  /** Present when a usable runtime reports a version Prime Orbit was not
+   * validated against. The app stays functional; the risk stays visible. */
+  versionWarning?: string;
   prerequisites: Array<{
     name: string;
     found: boolean;

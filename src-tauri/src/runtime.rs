@@ -62,6 +62,11 @@ pub struct PrimeAgentDetection {
     pub version: Option<String>,
     pub managed: bool,
     pub warnings: Vec<String>,
+    /// Set when a usable runtime reports a version Prime Orbit was not built
+    /// against. Orbit's bridges bind to Prime Agent's daemon internals, so an
+    /// unvalidated version is a real risk that must stay visible instead of
+    /// surfacing later as unexplained protocol drift.
+    pub version_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -355,6 +360,28 @@ pub async fn save_runtime_config(
     .await
 }
 
+/// Compares a runtime's self-reported version against the pinned tag Orbit's
+/// bridges were validated against. Returns the operator-facing warning when
+/// they differ; `None` means the version is exactly the supported one.
+pub fn unsupported_version_warning(version: &str) -> Option<String> {
+    let expected = SUPPORTED_PRIME_AGENT_TAG
+        .strip_prefix('v')
+        .unwrap_or(SUPPORTED_PRIME_AGENT_TAG);
+    let reported = version.trim();
+    if reported.is_empty() {
+        return None;
+    }
+    if reported
+        .split_whitespace()
+        .any(|token| token.trim_start_matches('v') == expected)
+    {
+        return None;
+    }
+    Some(format!(
+        "Prime Orbit est validé avec Prime Agent {SUPPORTED_PRIME_AGENT_TAG}, mais le runtime détecté annonce {reported}. Les intégrations daemon (mode Plan, réattachement, rechargement) peuvent se comporter différemment."
+    ))
+}
+
 fn detection_from_spec(spec: &LaunchSpec, mut warnings: Vec<String>) -> PrimeAgentDetection {
     let version = match capture_launch_version(spec) {
         Ok(version) => Some(version),
@@ -371,6 +398,7 @@ fn detection_from_spec(spec: &LaunchSpec, mut warnings: Vec<String>) -> PrimeAge
         }
     };
     let found = version.is_some();
+    let version_warning = version.as_deref().and_then(unsupported_version_warning);
     match spec {
         LaunchSpec::Executable { executable, .. } => PrimeAgentDetection {
             found,
@@ -382,6 +410,7 @@ fn detection_from_spec(spec: &LaunchSpec, mut warnings: Vec<String>) -> PrimeAge
             version,
             managed: spec.managed(),
             warnings,
+            version_warning,
         },
         LaunchSpec::Source {
             node,
@@ -398,6 +427,7 @@ fn detection_from_spec(spec: &LaunchSpec, mut warnings: Vec<String>) -> PrimeAge
             version,
             managed: spec.managed(),
             warnings,
+            version_warning,
         },
     }
 }
@@ -536,6 +566,7 @@ pub fn detect_internal(
             version: None,
             managed: false,
             warnings,
+            version_warning: None,
         },
         None,
     ))
@@ -1246,7 +1277,7 @@ mod tests {
     use super::{
         capture_command_output_with_timeout, detection_from_spec, ensure_supported_node,
         inspect_launch_candidate, is_managed_source_dir_under_root, parse_semver_prefix,
-        LaunchSpec,
+        unsupported_version_warning, LaunchSpec, SUPPORTED_PRIME_AGENT_TAG,
     };
     #[cfg(windows)]
     use std::ffi::OsString;
@@ -1450,6 +1481,22 @@ mod tests {
 
         assert_eq!(warnings.len(), warning_count);
         assert_eq!(inspected_candidates.len(), 1);
+    }
+
+    #[test]
+    fn flags_only_runtimes_outside_the_validated_version() {
+        let supported = SUPPORTED_PRIME_AGENT_TAG.trim_start_matches('v');
+        assert!(unsupported_version_warning(supported).is_none());
+        assert!(unsupported_version_warning(&format!("v{supported}")).is_none());
+        assert!(unsupported_version_warning(&format!("prime-agent v{supported}")).is_none());
+        // An unreadable version is already reported through `warnings`; adding
+        // a second speculative message would only dilute the real one.
+        assert!(unsupported_version_warning("   ").is_none());
+
+        let warning = unsupported_version_warning("0.9.1").expect("newer runtime must warn");
+        assert!(warning.contains("0.9.1"));
+        assert!(warning.contains(SUPPORTED_PRIME_AGENT_TAG));
+        assert!(unsupported_version_warning("0.7.3").is_some());
     }
 
     #[cfg(windows)]

@@ -596,6 +596,7 @@ export function SettingsView({ section, onSectionChange, state, setState, detect
             </div>
           </div>
           {runtimeBroken ? <div className="runtime-diagnostic" role="alert"><ShieldAlert size={17} /><pre>{detection?.error}</pre></div> : null}
+          {detection?.installed && detection.versionWarning ? <div className="runtime-diagnostic is-warning" role="status"><ShieldAlert size={17} /><pre>{detection.versionWarning}</pre></div> : null}
           {installState.running || installState.lines.length ? <div className="install-progress"><header><span><LoaderCircle size={15} className={installState.running ? "spin" : ""} />{installState.phase ?? t("settings.installation")}</span><small>{installState.running ? t("common.running") : installState.outcome === "error" ? t("common.failed") : t("common.complete")}</small></header><pre>{installState.lines.slice(-18).join("\n")}</pre></div> : null}
           <SettingsGroup title={t("settings.prerequisites")}>{(detection?.prerequisites ?? []).map((item) => <SettingRow key={item.name} title={item.name} description={item.path ?? t("common.systemComponent")}><Badge tone={item.found ? "success" : "danger"}>{item.found ? item.version ?? t("common.detected") : t("common.missing")}</Badge></SettingRow>)}</SettingsGroup>
           <div className="warning-card"><ShieldAlert size={19} /><div><strong>{t("settings.notSandbox")}</strong><p>{t("settings.notSandboxText")}</p></div></div>
