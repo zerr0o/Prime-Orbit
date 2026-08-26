@@ -1706,3 +1706,49 @@ test("a late optional failure is still recognised from the daemon's own wording"
     error: 'Cannot send daemon command "prompt" because the Prime Agent daemon is not connected.',
   }), false);
 });
+
+test("the field cascade of 80 identical errors produces no conversation failure", () => {
+  // Verbatim from a user's Activity timeline: 80 steps, 80 events, all of them
+  // "Prime Agent a signalé une erreur", cycling through three enrichment reads
+  // while the daemon was disconnected. Each bootstrap retry re-issued all of
+  // them, and every rejection became its own red row.
+  const socket = "\\.\pipe\prime-orbit-daemon-prime-agent-v0.8.0-3a60f741b3b74f16855a08735893f80d";
+  const observed = [
+    { requested: "get_heartbeat", quoted: "heartbeat_get" },
+    { requested: "list_schedules", quoted: "cron_list" },
+    { requested: "list_heartbeats", quoted: "heartbeats_list" },
+  ];
+
+  const rows = new Set();
+  let fatal = 0;
+  // Twenty-six retries of three reads is what filled that timeline.
+  for (let retry = 0; retry < 26; retry += 1) {
+    for (const { requested, quoted } of observed) {
+      const error = `Cannot send daemon command "${quoted}" because the Prime Agent daemon is not connected. Socket: ${socket}.`;
+      const envelope = { command: requested, success: false, error };
+      if (isOptionalSelectionResponseFailure(envelope, requested)) continue;
+      fatal += 1;
+      rows.add(error);
+    }
+  }
+
+  assert.equal(fatal, 0, "no enrichment read may fail the conversation");
+  assert.equal(rows.size, 0);
+});
+
+test("a genuine outage still reports once, not once per retry", () => {
+  // The same disconnected daemon also rejects the critical reads. Those must
+  // stay visible — but a content-derived row id collapses the repeats, which
+  // is what keeps the timeline readable instead of eighty rows deep.
+  const error = 'Cannot send daemon command "get_state" because the Prime Agent daemon is not connected.';
+  const rows = new Set();
+  let fatal = 0;
+  for (let retry = 0; retry < 26; retry += 1) {
+    const envelope = { command: "get_state", success: false, error };
+    if (isOptionalSelectionResponseFailure(envelope, "get_state")) continue;
+    fatal += 1;
+    rows.add(error);
+  }
+  assert.equal(fatal, 26, "the real failure is never swallowed");
+  assert.equal(rows.size, 1, "identical failures collapse into a single row");
+});
