@@ -393,13 +393,45 @@ export function conversationStatusForSessionSnapshot(
   sessionState: Pick<AgentSessionState, "isCompacting" | "isStreaming" | "sessionActions">,
   currentStatus: Conversation["status"],
   localOperationBlocksIdleRecovery: boolean,
+  transcriptIsPresentable = false,
 ): Conversation["status"] {
   if (sessionState.isCompacting) return "tool";
   if (sessionState.isStreaming) return "streaming";
   const actionStatus = activeStatusForSessionActions(sessionState.sessionActions);
   if (actionStatus) return actionStatus;
   if (localOperationBlocksIdleRecovery) return currentStatus;
-  return currentStatus === "starting" ? "starting" : "idle";
+  // `starting` keeps the loading screen up until the transcript can be shown.
+  // It must not outlive that purpose: a rendered transcript under a
+  // "Connecting to Prime Agent" banner is a contradiction, and an idle
+  // snapshot is the authority that resolves it.
+  if (currentStatus === "starting") return transcriptIsPresentable ? "idle" : "starting";
+  return "idle";
+}
+
+/** A conversation may only claim to be connecting while something is actually
+ * connecting it. When neither a bootstrap nor a process start is in flight,
+ * the transaction that owned `starting` is gone and no response will ever
+ * arrive to clear it — the conversation is stranded on "Connecting to Prime
+ * Agent" with an empty timeline until the window is reloaded. */
+export function shouldRestartStalledBootstrap(
+  status: Conversation["status"],
+  bootstrapInFlight: boolean,
+  processStartInFlight: boolean,
+): boolean {
+  return status === "starting" && !bootstrapInFlight && !processStartInFlight;
+}
+
+/** `starting` means the transcript is not yet presentable. The bootstrap owns
+ * that state and must clear it itself once it succeeds. Leaving the exit to
+ * the `get_messages` response strands the conversation whenever
+ * `loadConversationHistory` legitimately skips that request because history is
+ * already loaded — which is exactly what a bootstrap retry, a runtime-mode
+ * switch, or a reattach produces. */
+export function statusAfterCompletedBootstrap(
+  status: Conversation["status"],
+  transcriptIsPresentable: boolean,
+): Conversation["status"] {
+  return status === "starting" && transcriptIsPresentable ? "idle" : status;
 }
 
 export function canFinalizePendingPlanDecision(
@@ -565,9 +597,16 @@ export function stalledRunningActivities(
 export function shouldReconcileRuntimeState(
   status: Conversation["status"],
   hasStalledActivities: boolean,
+  transcriptIsPresentable = false,
 ): boolean {
+  if (status === "offline") return false;
   if (status === "streaming" || status === "tool" || status === "queued") return true;
-  return hasStalledActivities && status !== "offline";
+  // `starting` normally belongs to the bootstrap transaction. But a transcript
+  // already on screen under a "Connecting to Prime Agent" banner means that
+  // transaction failed to close its own state, so it earns one authoritative
+  // check rather than stranding the conversation.
+  if (status === "starting") return transcriptIsPresentable || hasStalledActivities;
+  return hasStalledActivities;
 }
 
 /** Closes renderer-owned rows that Prime Agent's idle state has outlived.
@@ -1976,6 +2015,7 @@ export function useAgentRuntime(options: {
           sessionState,
           conversation.status,
           localOperationBlocksIdleRecovery,
+          conversation.messages.length > 0,
         ),
         lastError: undefined,
       });
@@ -3633,6 +3673,22 @@ export function useAgentRuntime(options: {
               void sendSelectionRequest(conversation.id, token.generation, "get_heartbeat").catch(() => undefined);
               void sendSelectionRequest(conversation.id, token.generation, "list_heartbeats").catch(() => undefined);
             }
+            // The bootstrap is the transaction that owns `starting`, so it
+            // closes it here instead of depending on a `get_messages` response
+            // that may never have been requested.
+            if (isCurrentSelection(conversation.id, token.generation)) {
+              updateConversation(conversation.id, (current) => {
+                const status = statusAfterCompletedBootstrap(
+                  current.status,
+                  historyLoaded.current.has(conversation.id)
+                    || current.messages.length > 0
+                    || !current.hasContent,
+                );
+                return status === current.status
+                  ? current
+                  : { ...current, status, lastError: undefined };
+              });
+            }
             return;
           } catch (error) {
             const diagnostic = startupErrorMessage(
@@ -3655,15 +3711,22 @@ export function useAgentRuntime(options: {
             started.current.delete(conversation.id);
             runtimeModes.current.delete(conversation.id);
             bootstrapGeneration.current.delete(conversation.id);
-            updateConversation(conversation.id, (current) => {
-              const status = statusDuringRuntimeRecovery(
-                current.status,
-                persistedIdleConversations.current.has(conversation.id),
-              );
-              return current.status === status && current.lastError === undefined
-                ? current
-                : { ...current, status, lastError: undefined };
-            });
+            // Mirror the entry guard: an already-loaded transcript must not be
+            // hidden behind the loading screen again. Beyond the flicker, the
+            // retry would otherwise re-enter `starting` while
+            // loadConversationHistory skips `get_messages` as already done,
+            // and nothing would ever clear it.
+            if (!historyLoaded.current.has(conversation.id)) {
+              updateConversation(conversation.id, (current) => {
+                const status = statusDuringRuntimeRecovery(
+                  current.status,
+                  persistedIdleConversations.current.has(conversation.id),
+                );
+                return current.status === status && current.lastError === undefined
+                  ? current
+                  : { ...current, status, lastError: undefined };
+              });
+            }
             await new Promise<void>((resolve) => window.setTimeout(resolve, retryDelay));
             retryDelay = Math.min(retryDelay * 2, RUNTIME_RECOVERY_MAX_DELAY_MS);
           }
@@ -4025,8 +4088,32 @@ export function useAgentRuntime(options: {
       // resolved, so polling it would only pile up requests that time out.
       const planPhase = conversationPlanState(conversation).phase;
       if (planPhase === "question" || planPhase === "review") return;
+      // Re-enter a bootstrap that no longer exists. get_state cannot rescue
+      // this case: there is no RPC client left to answer it.
+      if (shouldRestartStalledBootstrap(
+        conversation.status,
+        runtimeBootstraps.current.has(conversationId),
+        startInFlight.current.has(conversationId),
+      )) {
+        const project = getProjectRef.current(conversation.projectId);
+        if (!project) return;
+        void ensureStarted(conversation, project).catch((error) => {
+          if (!isCurrentSelection(conversationId, activeSelection.current.generation)) return;
+          const message = redactText(error instanceof Error ? error.message : String(error));
+          updateConversation(conversationId, (current) => (
+            current.status === "error" && current.lastError === message
+              ? current
+              : { ...current, status: "error", lastError: message }
+          ));
+        });
+        return;
+      }
       const stalled = stalledRunningActivities(conversation.activities, Date.now());
-      if (!shouldReconcileRuntimeState(conversation.status, stalled.length > 0)) return;
+      if (!shouldReconcileRuntimeState(
+        conversation.status,
+        stalled.length > 0,
+        conversation.messages.length > 0,
+      )) return;
       const token = activeSelection.current;
       if (
         token.conversationId !== conversationId
@@ -4035,7 +4122,7 @@ export function useAgentRuntime(options: {
       void sendSelectionRequest(conversationId, token.generation, "get_state").catch(() => undefined);
     }, RUNTIME_RECONCILIATION_INTERVAL_MS);
     return () => window.clearInterval(interval);
-  }, [active, eventsReady, isCurrentSelection, selectedConversation?.id, sendSelectionRequest]);
+  }, [active, ensureStarted, eventsReady, isCurrentSelection, selectedConversation?.id, sendSelectionRequest, updateConversation]);
 
   const sendPrompt = useCallback(
     async (message: string, attachments: Attachment[], requestedDelivery?: "steer" | "follow_up") => {

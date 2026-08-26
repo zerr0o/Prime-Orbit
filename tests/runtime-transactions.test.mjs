@@ -83,6 +83,8 @@ const {
   STOPPED_ACTIVITY_NOTE,
   runtimeDivergenceForSnapshot,
   shouldReconcileRuntimeState,
+  statusAfterCompletedBootstrap,
+  shouldRestartStalledBootstrap,
   stalledRunningActivities,
   ACTIVITY_STALL_TIMEOUT_MS,
   PLAN_NATIVE_REPLAY_POLL_INTERVAL_MS,
@@ -1554,4 +1556,65 @@ test("a caller-supplied outcome closes running rows with the right verdict", () 
   });
   assert.equal(stopped[0].status, "info");
   assert.match(stopped[0].detail, /processus Prime Agent/u);
+});
+
+test("a completed bootstrap closes starting instead of waiting on get_messages", () => {
+  // loadConversationHistory skips get_messages when history is already loaded,
+  // which is exactly what a bootstrap retry, a runtime-mode switch, or a
+  // reattach produces. Depending on that response to leave `starting` is what
+  // stranded conversations under "Connecting to Prime Agent" forever.
+  assert.equal(statusAfterCompletedBootstrap("starting", true), "idle");
+  // Nothing to show yet: the loading screen is still the honest state.
+  assert.equal(statusAfterCompletedBootstrap("starting", false), "starting");
+  // A bootstrap completing behind real work must never contradict it.
+  assert.equal(statusAfterCompletedBootstrap("streaming", true), "streaming");
+  assert.equal(statusAfterCompletedBootstrap("tool", true), "tool");
+  assert.equal(statusAfterCompletedBootstrap("idle", true), "idle");
+});
+
+test("an idle snapshot releases starting once the transcript is on screen", () => {
+  const idleSnapshot = { isCompacting: false, isStreaming: false, sessionActions: {} };
+
+  // A rendered transcript under a "Connecting" banner is a contradiction.
+  assert.equal(
+    conversationStatusForSessionSnapshot(idleSnapshot, "starting", false, true),
+    "idle",
+  );
+  // With nothing rendered yet, the loading screen must survive the snapshot.
+  assert.equal(
+    conversationStatusForSessionSnapshot(idleSnapshot, "starting", false, false),
+    "starting",
+  );
+  // Real work still wins over both.
+  assert.equal(
+    conversationStatusForSessionSnapshot({ ...idleSnapshot, isStreaming: true }, "starting", false, true),
+    "streaming",
+  );
+  // A local operation that owns the session keeps the current status.
+  assert.equal(
+    conversationStatusForSessionSnapshot(idleSnapshot, "starting", true, true),
+    "starting",
+  );
+});
+
+test("reconciliation rescues a starting conversation that already shows a transcript", () => {
+  // The new-conversation case: nothing rendered, bootstrap owns the state.
+  assert.equal(shouldReconcileRuntimeState("starting", false, false), false);
+  // The stuck case from the field: messages visible, banner still "Connecting".
+  assert.equal(shouldReconcileRuntimeState("starting", false, true), true);
+  assert.equal(shouldReconcileRuntimeState("starting", true, false), true);
+  assert.equal(shouldReconcileRuntimeState("offline", true, true), false);
+});
+
+test("a starting conversation with nothing connecting it is re-bootstrapped", () => {
+  // The stranded new-conversation case: the banner claims to be connecting
+  // but no transaction owns that state, so no response can ever clear it.
+  assert.equal(shouldRestartStalledBootstrap("starting", false, false), true);
+  // A bootstrap or a process start already in flight owns the state.
+  assert.equal(shouldRestartStalledBootstrap("starting", true, false), false);
+  assert.equal(shouldRestartStalledBootstrap("starting", false, true), false);
+  // Any other status is not a connection claim and must be left alone.
+  for (const status of ["idle", "streaming", "tool", "queued", "error", "offline"]) {
+    assert.equal(shouldRestartStalledBootstrap(status, false, false), false);
+  }
 });
