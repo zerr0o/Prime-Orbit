@@ -332,6 +332,30 @@ export interface PlanQuestionOption {
 /** Label shown for the free-text answer when allowOther is enabled. */
 export const OTHER_ANSWER_LABEL = "Other... (type your own answer)";
 
+/**
+ * Fill in whichever of `value`/`label` the caller omitted. Models routinely
+ * send only one of the pair; rejecting that wasted a tool call and showed the
+ * user a failed step for a question that was otherwise perfectly well formed.
+ * An option carrying neither is still refused, with a message naming the
+ * offending index instead of a raw schema path.
+ */
+export function normalizePlanQuestionOptions(
+	options: readonly Partial<PlanQuestionOption>[],
+): PlanQuestionOption[] {
+	return options.map((option, index) => {
+		const label = option.label?.trim() || option.value?.trim();
+		const value = option.value?.trim() || option.label?.trim();
+		if (!label || !value) {
+			throw new Error(`options[${index}] needs at least one of "label" or "value"`);
+		}
+		return {
+			value,
+			label,
+			...(option.description ? { description: option.description } : {}),
+		};
+	});
+}
+
 /** Build the exact option strings passed to ctx.ui.select, de-duplicated. */
 export function composeOptionLabels(options: readonly PlanQuestionOption[]): string[] {
 	const seen = new Set<string>();
@@ -611,17 +635,21 @@ export function buildPlanDoctrine(): string {
 // TypeBox schemas
 // ---------------------------------------------------------------------------
 
+// `value` and `label` are each optional and default to the other. Requiring
+// both made a routine omission fail the whole call, costing the user a visible
+// tool error and the agent a full retry round-trip for a question it had
+// already composed correctly enough to ask.
 const OptionSchema = Type.Object({
-	value: Type.String({
-		description: "Stable value reported back to you in the payload",
+	value: Type.Optional(Type.String({
+		description: "Stable value reported back to you in the payload (defaults to label)",
 		minLength: 1,
 		maxLength: PLAN_UI_LIMITS.optionValueChars,
-	}),
-	label: Type.String({
-		description: "Short button text shown to the user",
+	})),
+	label: Type.Optional(Type.String({
+		description: "Short button text shown to the user (defaults to value)",
 		minLength: 1,
 		maxLength: PLAN_UI_LIMITS.optionLabelChars,
-	}),
+	})),
 	description: Type.Optional(Type.String({
 		description: "Optional one-line explanation shown under the label",
 		minLength: 1,
@@ -1073,8 +1101,9 @@ export default function primeOrbitPlanMode(pi: ExtensionAPI): void {
 				});
 			}
 
+			const options = normalizePlanQuestionOptions(params.options);
 			const title = params.context ? `${params.prompt}\n\n${params.context}` : params.prompt;
-			const labels = [...composeOptionLabels(params.options)];
+			const labels = [...composeOptionLabels(options)];
 			if (params.allowOther !== false) labels.push(OTHER_ANSWER_LABEL);
 			const questionTitle = encodePlanUiTitle(
 				{
@@ -1082,7 +1111,7 @@ export default function primeOrbitPlanMode(pi: ExtensionAPI): void {
 					toolCallId,
 					prompt: params.prompt,
 					...(params.context !== undefined ? { context: params.context } : {}),
-					options: params.options,
+					options,
 					allowOther: params.allowOther !== false,
 				},
 				title,
@@ -1093,7 +1122,7 @@ export default function primeOrbitPlanMode(pi: ExtensionAPI): void {
 				throw new Error("question dialog returned a value outside its allowed choices");
 			}
 			const selection = resolveSelection(
-				params.options,
+				options,
 				params.allowOther === false && selected === OTHER_ANSWER_LABEL ? undefined : selected,
 			);
 
