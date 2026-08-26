@@ -80,6 +80,7 @@ const {
   refinementResultPresentation,
   rlmChildPresentation,
   finalizeStalledActivityRows,
+  STOPPED_ACTIVITY_NOTE,
   runtimeDivergenceForSnapshot,
   shouldReconcileRuntimeState,
   stalledRunningActivities,
@@ -1527,4 +1528,30 @@ test("divergences record corrections only, never agreement", () => {
 
   // An idle status that still carried running rows is drift worth recording.
   assert.equal(runtimeDivergenceForSnapshot("idle", 1, "resync").stalledActivities, 1);
+});
+
+test("a caller-supplied outcome closes running rows with the right verdict", () => {
+  const running = [{
+    id: "activity-agent-start",
+    type: "agent_start",
+    title: "Prime Agent réfléchit",
+    status: "running",
+    createdAt: "2026-08-21T11:28:16.000Z",
+  }];
+
+  // Process exit is terminal for every row, but a crash must not be dressed
+  // up as the calm outcome used when a snapshot proves the work simply ended.
+  const crashed = finalizeStalledActivityRows(running, "2026-08-21T11:29:00.000Z", {
+    status: "error",
+    note: "Prime Agent s’est arrêté (code 1).",
+  });
+  assert.equal(crashed[0].status, "error");
+  assert.equal(crashed[0].detail, "Prime Agent s’est arrêté (code 1).");
+
+  const stopped = finalizeStalledActivityRows(running, "2026-08-21T11:29:00.000Z", {
+    status: "info",
+    note: STOPPED_ACTIVITY_NOTE,
+  });
+  assert.equal(stopped[0].status, "info");
+  assert.match(stopped[0].detail, /processus Prime Agent/u);
 });

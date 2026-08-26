@@ -544,6 +544,7 @@ export function shouldScheduleTerminalStateReconciliation(event: { type: string;
 }
 
 const STALLED_ACTIVITY_NOTE = "Ligne close après relecture de l’état Prime Agent.";
+export const STOPPED_ACTIVITY_NOTE = "Ligne close : le processus Prime Agent s’est arrêté.";
 
 /** Activity rows whose last update is older than the stall timeout. */
 export function stalledRunningActivities(
@@ -578,6 +579,10 @@ export function shouldReconcileRuntimeState(
 export function finalizeStalledActivityRows(
   activities: readonly ActivityItem[],
   eventTime: string,
+  outcome: { status: ActivityItem["status"]; note: string } = {
+    status: "info",
+    note: STALLED_ACTIVITY_NOTE,
+  },
 ): ActivityItem[] {
   let changed = false;
   const next = activities.map((activity) => {
@@ -585,8 +590,8 @@ export function finalizeStalledActivityRows(
     changed = true;
     return {
       ...activity,
-      status: "info" as const,
-      detail: activity.detail ? `${activity.detail} · ${STALLED_ACTIVITY_NOTE}` : STALLED_ACTIVITY_NOTE,
+      status: outcome.status,
+      detail: activity.detail ? `${activity.detail} · ${outcome.note}` : outcome.note,
       updatedAt: eventTime,
       updateCount: (activity.updateCount ?? 1) + 1,
     };
@@ -3302,13 +3307,26 @@ export function useAgentRuntime(options: {
         const recovering = runtimeBootstraps.current.has(conversationId);
         const terminalToolStatus: ToolActivity["status"] = expected ? "cancelled" : "failed";
         const boundaryTime = now();
-        updateConversation(conversationId, (conversation) => ({
-          ...(shouldProjectLiveTranscript(isNative(), conversation.sessionPath)
+        updateConversation(conversationId, (conversation) => {
+          const projected = shouldProjectLiveTranscript(isNative(), conversation.sessionPath)
             ? finalizeConversationTools(conversation, terminalToolStatus, boundaryTime)
-            : conversation),
-          status: expected ? "idle" : recovering ? "starting" : "error",
-          lastError: recovering ? undefined : exitDiagnostic,
-        }));
+            : conversation;
+          return {
+            ...projected,
+            // Process exit is an authoritative terminal boundary for every
+            // running row. Activities are renderer-owned and have no durable
+            // source that could ever repair them, so they must close even when
+            // the persisted transcript stays authoritative for messages —
+            // which is the normal native case, and the one that left
+            // "Prime Agent réfléchit" spinning after a crash.
+            activities: finalizeStalledActivityRows(projected.activities, boundaryTime, {
+              status: expected ? "info" : "error",
+              note: expected ? STOPPED_ACTIVITY_NOTE : exitDiagnostic ?? STOPPED_ACTIVITY_NOTE,
+            }),
+            status: expected ? "idle" : recovering ? "starting" : "error",
+            lastError: recovering ? undefined : exitDiagnostic,
+          };
+        });
         refreshPersistedTranscript(conversationId, 0);
       },
       onInstallProgress: ({ phase, message }) => onInstallProgress(phase, redactText(message)),
