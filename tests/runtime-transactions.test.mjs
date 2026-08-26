@@ -85,6 +85,8 @@ const {
   shouldReconcileRuntimeState,
   statusAfterCompletedBootstrap,
   shouldRestartStalledBootstrap,
+  planHandoffTranscriptRefreshed,
+  PLAN_REPLAY_IDLE_POLL_INTERVAL_MS,
   stalledRunningActivities,
   ACTIVITY_STALL_TIMEOUT_MS,
   PLAN_NATIVE_REPLAY_POLL_INTERVAL_MS,
@@ -1617,4 +1619,23 @@ test("a starting conversation with nothing connecting it is re-bootstrapped", ()
   for (const status of ["idle", "streaming", "tool", "queued", "error", "offline"]) {
     assert.equal(shouldRestartStalledBootstrap(status, false, false), false);
   }
+});
+
+test("handoff verification reads the flag its own transcript source writes", () => {
+  // A published session is projected from the local JSONL. Testing the RPC
+  // get_messages flag after a local read can never succeed, which turned every
+  // verification into a visible "history unavailable" error while the plan was
+  // in fact running.
+  assert.equal(planHandoffTranscriptRefreshed(true, true, false), true);
+  assert.equal(planHandoffTranscriptRefreshed(true, false, true), false);
+  // Without a published session the RPC projection stays authoritative.
+  assert.equal(planHandoffTranscriptRefreshed(false, false, true), true);
+  assert.equal(planHandoffTranscriptRefreshed(false, true, false), false);
+});
+
+test("plan replay backs off while the runtime is not in Plan mode", () => {
+  // The tight interval exists to catch a lost dialog fast. There is no dialog
+  // to catch once the runtime left Plan mode, and probing at that cadence
+  // re-ran a bootstrap — and its dialog-queue replay — eight times a second.
+  assert.ok(PLAN_REPLAY_IDLE_POLL_INTERVAL_MS >= 8 * PLAN_NATIVE_REPLAY_POLL_INTERVAL_MS);
 });

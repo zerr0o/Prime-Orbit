@@ -206,6 +206,10 @@ const PASSIVE_RESPONSE_TIMEOUT_MS = 30_000;
 const SELECTION_ACTIVATION_TIMEOUT_MS = 5_000;
 export const PLAN_NATIVE_REPLAY_PROBE_TIMEOUT_MS = 5_000;
 export const PLAN_NATIVE_REPLAY_POLL_INTERVAL_MS = 125;
+// Cadence used while a live runtime is simply not in Plan mode. The tight
+// interval above exists to catch a lost dialog quickly; there is no dialog to
+// catch here, so polling stays cheap instead of hammering native IPC.
+export const PLAN_REPLAY_IDLE_POLL_INTERVAL_MS = 1_000;
 // A client-owned Prime Agent daemon session keeps its lease for up to 30 s
 // after an abrupt RPC-client disconnect. Stay in one reconnect transaction
 // across that grace period instead of flashing an error and requiring a
@@ -432,6 +436,20 @@ export function statusAfterCompletedBootstrap(
   transcriptIsPresentable: boolean,
 ): Conversation["status"] {
   return status === "starting" && transcriptIsPresentable ? "idle" : status;
+}
+
+/** Which flag proves that a transcript refresh actually completed after the
+ * plan handoff was admitted. A published session is projected from the local
+ * JSONL, which reports through `localHistoryApplied`; `historyLoaded` only ever
+ * tracks the RPC `get_messages` projection. Testing the RPC flag after a local
+ * read can never succeed, which turned every verification of a published
+ * session into a visible "history unavailable" failure. */
+export function planHandoffTranscriptRefreshed(
+  usedLocalTranscript: boolean,
+  localHistoryApplied: boolean,
+  rpcHistoryLoaded: boolean,
+): boolean {
+  return usedLocalTranscript ? localHistoryApplied : rpcHistoryLoaded;
 }
 
 export function canFinalizePendingPlanDecision(
@@ -1803,6 +1821,22 @@ export function useAgentRuntime(options: {
         const id = activity.id ?? uid("activity");
         const index = conversation.activities.findIndex((item) => item.id === id);
         const previous = index >= 0 ? conversation.activities[index] : undefined;
+        // Re-presenting a settled row unchanged carries no new information.
+        // Callers that replay a still-pending native request would otherwise
+        // inflate its counter and force a re-render on every replay. Rows still
+        // marked running are excluded so genuine progress keeps counting, and
+        // auto-generated ids never match a previous row, so only stable-id
+        // rows are affected at all.
+        if (
+          previous
+          && previous.status !== "running"
+          && previous.type === activity.type
+          && previous.status === activity.status
+          && previous.title === redactText(activity.title)
+          && previous.detail === (activity.detail ? redactText(activity.detail) : previous.detail)
+        ) {
+          return conversation;
+        }
         const eventTime = activity.updatedAt ?? activity.createdAt ?? now();
         const next: ActivityItem = {
           ...previous,
@@ -2408,9 +2442,10 @@ export function useAgentRuntime(options: {
         }
         if (conversation?.sessionPath && !historyLoaded.current.has(conversationId)) {
           // The canonical transcript decides whether the stable handoff marker
-          // was admitted before a reload. Never retry until a fresh history
+          // was admitted before a reload. Never conclude anything until a fresh
           // snapshot has completed after the admission stage.
           const project = getProject(conversation.projectId);
+          const usedLocalTranscript = Boolean(project);
           if (project) {
             await loadLocalConversationHistory(
               conversation,
@@ -2424,14 +2459,25 @@ export function useAgentRuntime(options: {
               activeSelection.current.generation,
             );
           }
-          if (historyLoaded.current.has(conversationId)) {
-            window.setTimeout(() => void finalizePendingPlan(conversationId), 0);
+          if (!planHandoffTranscriptRefreshed(
+            usedLocalTranscript,
+            localHistoryApplied.current.has(conversationId),
+            historyLoaded.current.has(conversationId),
+          )) {
+            throw new Error(planRuntimeText(
+              "L’historique Prime Agent requis pour vérifier le handoff est indisponible.",
+              "The Prime Agent history required to verify the handoff is unavailable.",
+            ));
+          }
+          if (conversationHasPlanHandoff(getConversation(conversationId), pending.handoffId)) {
+            await clearCompletedHandoff();
             return;
           }
-          throw new Error(planRuntimeText(
-            "L’historique Prime Agent requis pour vérifier le handoff est indisponible.",
-            "The Prime Agent history required to verify the handoff is unavailable.",
-          ));
+          // The refresh succeeded and the marker is simply not published yet.
+          // Waiting is the only safe move: the implementation prompt was
+          // already admitted, so re-sending it here would run the plan twice.
+          // agent_end clears this pending finalization once the turn lands.
+          return;
         }
       }
 
@@ -5638,8 +5684,17 @@ export function useAgentRuntime(options: {
             if (!runningAgent || runningAgent.runtimeMode !== "plan") {
               resetAbsenceEvidence();
               observedRuntimeIdentity = undefined;
-              ownershipEstablished = false;
-              await waitForNextProbe();
+              // A live runtime that simply is not in Plan mode — the normal
+              // state during plan implementation — is not an ownership
+              // problem. Re-establishing ownership here re-ran a full
+              // bootstrap every probe interval, and each bootstrap replays the
+              // native dialog queue: that is what inflated one Plan row by
+              // more than a thousand updates and stalled the interface. Only a
+              // missing runtime genuinely needs the handshake again.
+              if (!runningAgent) ownershipEstablished = false;
+              await waitForNextProbe(
+                runningAgent ? PLAN_REPLAY_IDLE_POLL_INTERVAL_MS : PLAN_NATIVE_REPLAY_POLL_INTERVAL_MS,
+              );
               continue;
             }
 
