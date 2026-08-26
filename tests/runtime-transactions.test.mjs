@@ -44,6 +44,7 @@ const {
   isTransientHistoryReadFailure,
   isTransientHistoryResponseFailure,
   isOptionalSelectionResponseFailure,
+  daemonResponseTimeoutCommand,
   isRecoverableConversationActivationError,
   isRecoverableRuntimeBootstrapError,
   mapAgentMessages,
@@ -1655,12 +1656,32 @@ test("a timed-out enrichment read never raises a runtime failure", () => {
     error: 'Timed out after 5000ms waiting for the Prime Agent daemon response to "list_schedules".',
   }), true);
 
-  // A timeout naming a different command is not this command's excuse.
+  // The daemon quotes its own command name, which differs from the RPC name
+  // Orbit sent. Both heartbeat reads reached users as red banners because an
+  // exact-match rule rejected the daemon spelling.
   assert.equal(isOptionalSelectionResponseFailure({
-    command: "get_available_models",
+    command: "get_heartbeat",
     success: false,
-    error: 'Timed out after 30000ms waiting for the Prime Agent daemon response to "get_state".',
-  }), false);
+    error: 'Timed out after 30000ms waiting for the Prime Agent daemon response to "heartbeat_get".',
+  }), true);
+  assert.equal(isOptionalSelectionResponseFailure({
+    command: "list_heartbeats",
+    success: false,
+    error: 'Timed out after 30000ms waiting for the Prime Agent daemon response to "heartbeats_list".',
+  }), true);
+  // The daemon spelling alone identifies the read when it is all we are given.
+  assert.equal(isOptionalSelectionResponseFailure({
+    command: "heartbeats_list",
+    success: false,
+    error: 'Timed out after 30000ms waiting for the Prime Agent daemon response to "heartbeats_list".',
+  }), true);
+  assert.equal(
+    daemonResponseTimeoutCommand(
+      'Timed out after 30000ms waiting for the Prime Agent daemon response to "heartbeat_get". Socket: \\\\.\\pipe\\x.',
+    ),
+    "heartbeat_get",
+  );
+  assert.equal(daemonResponseTimeoutCommand("The provider rejected the catalog request."), undefined);
   // Critical-path reads keep surfacing their failures.
   assert.equal(isOptionalSelectionResponseFailure({
     command: "get_state",

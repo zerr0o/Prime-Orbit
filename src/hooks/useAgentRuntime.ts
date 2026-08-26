@@ -1033,27 +1033,50 @@ export function isTransientHistoryResponseFailure(message: {
     && isTransientHistoryReadFailure(message.error ?? "");
 }
 
+/** Daemon-side names for optional reads Orbit sends under a different name.
+ * Prime Agent's daemon layer renames these, and its diagnostics quote the
+ * daemon name rather than the RPC one, so both spellings must be recognised. */
+const OPTIONAL_DAEMON_COMMAND_ALIASES = new Set([
+  "heartbeat_get",
+  "heartbeats_list",
+]);
+
+function isOptionalCommandName(name: unknown): boolean {
+  return typeof name === "string"
+    && (OPTIONAL_SELECTION_COMMANDS.has(name) || OPTIONAL_DAEMON_COMMAND_ALIASES.has(name));
+}
+
+/** The command quoted inside Prime Agent's daemon response timeout. */
+export function daemonResponseTimeoutCommand(detail: string): string | undefined {
+  if (!detail.trimStart().startsWith("Timed out after ")) return undefined;
+  return /waiting for the Prime Agent daemon response to "([^"]+)"/u.exec(detail)?.[1];
+}
+
 export function isOptionalSelectionResponseFailure(message: {
   command?: string;
   success?: boolean;
   error?: unknown;
 }): boolean {
-  if (message.success !== false
-    || typeof message.command !== "string"
-    || !OPTIONAL_SELECTION_COMMANDS.has(message.command)) return false;
+  if (message.success !== false) return false;
   const detail = message.error instanceof Error ? message.error.message : String(message.error ?? "");
-  const lowerDetail = detail.toLowerCase();
   // A busy or contended daemon can let one of these enrichment reads run out
   // of time. That says nothing about the conversation's health: the model
-  // picker or schedule list simply keeps its last known data. Treating it as a
-  // runtime failure put the whole conversation into an error state and raised
-  // "Prime Agent needs attention" over a cosmetic read.
-  const timedOut = detail.trimStart().startsWith("Timed out after ")
-    && detail.includes(`waiting for the Prime Agent daemon response to "${message.command}".`);
-  return timedOut
-    || detail.startsWith(
-      `Cannot send daemon command "${message.command}" because the Prime Agent daemon is not connected.`,
-    ) || lowerDetail.includes("unknown command") || lowerDetail.includes("unsupported");
+  // picker or heartbeat list simply keeps its last known data. Treating it as
+  // a runtime failure put the whole conversation into an error state and
+  // raised "Prime Agent needs attention" over a cosmetic read.
+  //
+  // The timeout text quotes the daemon's own command name, which differs from
+  // the RPC name Orbit sent, so either spelling identifying an optional read
+  // is enough. Requiring them to match is what let heartbeat timeouts through.
+  const timedOutCommand = daemonResponseTimeoutCommand(detail);
+  if (timedOutCommand !== undefined) {
+    return isOptionalCommandName(message.command) || isOptionalCommandName(timedOutCommand);
+  }
+  if (!isOptionalCommandName(message.command)) return false;
+  const lowerDetail = detail.toLowerCase();
+  return detail.startsWith(
+    `Cannot send daemon command "${message.command}" because the Prime Agent daemon is not connected.`,
+  ) || lowerDetail.includes("unknown command") || lowerDetail.includes("unsupported");
 }
 
 export async function commitPlanRuntimeModeTransition(
