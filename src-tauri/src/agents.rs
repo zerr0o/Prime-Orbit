@@ -45,13 +45,24 @@ const SESSION_CONTROL_BRIDGE_SCRIPT: &str =
     include_str!("../assets/prime-agent-session-control-bridge.cjs");
 const RPC_REATTACH_BRIDGE_SCRIPT: &str =
     include_str!("../assets/prime-agent-rpc-reattach-bridge.cjs");
+const PLAN_RPC_LAUNCHER_SCRIPT: &str = include_str!("../assets/prime-orbit-plan-launcher.mjs");
 const MAX_QUEUED_MESSAGE_TEXT: usize = 128 * 1024;
 const PLAN_RUNTIME_TOOLS: &str =
     "prime_orbit_plan_inspect,prime_orbit_plan_question,prime_orbit_plan_submit";
 const PLAN_UI_TITLE_PREFIX: &str = "prime-orbit-plan-ui:v1:";
+const PLAN_INLINE_REVISION_PROTOCOL: &str = "inline-feedback-v1";
+const PLAN_REVIEW_RESPONSE_PREFIX: &str = "prime-orbit-plan-review-response:v1:";
+const MAX_PLAN_REVIEW_RESPONSE_TOKEN_CHARS: usize = 32_768;
+const MAX_PLAN_REVISION_FEEDBACK_CHARS: usize = 4_096;
 const MAX_PENDING_EXTENSION_UI_REQUESTS: usize = 32;
 const MAX_PENDING_EXTENSION_UI_REQUEST_BYTES: usize = 512 * 1024;
 const MAX_PENDING_EXTENSION_UI_STORE_BYTES: u64 = 16 * 1024 * 1024;
+const PLAN_RECOVERY_STDIN_LOCK_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_PLAN_RECOVERY_SESSION_BYTES: u64 = 32 * 1024 * 1024;
+// Keep Plan handoff attestation aligned with the canonical transcript loader:
+// any session Orbit can project must also be eligible for an attested handoff.
+const MAX_PLAN_HANDOFF_SESSION_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PLAN_HANDOFF_LINE_BYTES: usize = 8 * 1024 * 1024;
 const PENDING_EXTENSION_UI_STORE_VERSION: u8 = 1;
 const MAX_PUBLIC_AGENT_MESSAGE_ID_SUFFIX_CHARS: usize = 200;
 const MAX_PUBLIC_AGENT_MESSAGE_TEXT_CHARS: usize = 16_000;
@@ -143,6 +154,26 @@ struct PendingExtensionUiStore {
     requests: Vec<PendingExtensionUiRecord>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PlanInlineRevisionTitlePayload {
+    v: u8,
+    kind: String,
+    plan_id: String,
+    title: String,
+    revision_response: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PlanInlineRevisionResponsePayload {
+    v: u8,
+    kind: String,
+    plan_id: String,
+    decision: String,
+    feedback: String,
+}
+
 #[derive(Clone)]
 struct RunningAgent {
     info: RunningAgentInfo,
@@ -167,6 +198,13 @@ struct ManagedDaemonShutdownTarget {
     node: PathBuf,
     cli: PathBuf,
     socket: PathBuf,
+}
+
+#[derive(Clone)]
+struct ProcessLocalPlanRuntime {
+    node: PathBuf,
+    source_dir: PathBuf,
+    agent_index: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +276,26 @@ pub struct RunningAgentInfo {
     pub started_at: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum PlanDialogRecoveryStatus {
+    Replayed,
+    Absent,
+    Busy,
+    Conflict,
+    AbortSent,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PlanDialogRecoveryResult {
+    pub status: PlanDialogRecoveryStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<AgentLineEvent>,
+    pub pid: u32,
+    pub started_at: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestartAgentResult {
@@ -260,6 +318,8 @@ struct SpawnedRpcAgent {
 pub(crate) struct AgentLineEvent {
     conversation_id: String,
     line: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_mode: Option<AgentRuntimeMode>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -365,6 +425,12 @@ struct OwnedSessionInspectionResult {
     supported: bool,
     #[serde(default)]
     active_session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OwnedSessionStopResult {
+    status: String,
+    supported: bool,
 }
 
 #[derive(Serialize)]
@@ -518,6 +584,7 @@ fn emit_line(app: &AppHandle, event_name: &str, conversation_id: &str, line: Str
         AgentLineEvent {
             conversation_id: conversation_id.to_string(),
             line,
+            runtime_mode: None,
         },
     );
 }
@@ -581,6 +648,243 @@ fn is_plan_review_request(event: &Value) -> bool {
             .get("title")
             .and_then(Value::as_str)
             .is_some_and(|value| !value.is_empty() && value.chars().count() <= 512)
+}
+
+fn base64url_token_is_canonical(token: &str, decoded: &[u8]) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        && URL_SAFE_NO_PAD.encode(decoded) == token
+}
+
+fn trusted_inline_plan_review_id(event: &Value) -> Option<String> {
+    if event.get("type").and_then(Value::as_str) != Some("extension_ui_request")
+        || event.get("method").and_then(Value::as_str) != Some("select")
+    {
+        return None;
+    }
+    let title = event.get("title").and_then(Value::as_str)?;
+    let token = title
+        .split_once('\n')
+        .map(|(marker, _)| marker)
+        .and_then(|marker| marker.strip_prefix(PLAN_UI_TITLE_PREFIX))?;
+    if token.len() > 65_536 {
+        return None;
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(token).ok()?;
+    if bytes.len() > 49_152 || !base64url_token_is_canonical(token, &bytes) {
+        return None;
+    }
+    let payload: PlanInlineRevisionTitlePayload = serde_json::from_slice(&bytes).ok()?;
+    if payload.v != 1
+        || payload.kind != "review"
+        || payload.revision_response != PLAN_INLINE_REVISION_PROTOCOL
+        || payload.plan_id.is_empty()
+        || payload.plan_id.len() > 256
+        || payload.title.trim().is_empty()
+        || payload.title.chars().count() > 512
+    {
+        return None;
+    }
+    Some(payload.plan_id)
+}
+
+fn validate_inline_plan_revision_response(
+    value: &str,
+    expected_plan_id: &str,
+) -> Result<(), String> {
+    let token = value
+        .strip_prefix(PLAN_REVIEW_RESPONSE_PREFIX)
+        .ok_or_else(|| {
+            "La réponse de révision Plan ne correspond pas au protocole attendu.".to_string()
+        })?;
+    if token.len() > MAX_PLAN_REVIEW_RESPONSE_TOKEN_CHARS {
+        return Err("La réponse de révision Plan dépasse la taille autorisée.".to_string());
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| "La réponse de révision Plan est invalide.".to_string())?;
+    if bytes.len() > 24_576 || !base64url_token_is_canonical(token, &bytes) {
+        return Err("La réponse de révision Plan est invalide.".to_string());
+    }
+    let payload: PlanInlineRevisionResponsePayload = serde_json::from_slice(&bytes)
+        .map_err(|_| "La réponse de révision Plan est invalide.".to_string())?;
+    let feedback = payload.feedback.trim();
+    if payload.v != 1
+        || payload.kind != "review-decision"
+        || payload.decision != "revise"
+        || payload.plan_id != expected_plan_id
+        || feedback.is_empty()
+        || feedback.chars().count() > MAX_PLAN_REVISION_FEEDBACK_CHARS
+    {
+        return Err("La réponse de révision Plan ne correspond pas à cette requête.".to_string());
+    }
+    Ok(())
+}
+
+fn validate_extension_ui_response(
+    request: &PendingExtensionUiRecord,
+    payload: &Value,
+) -> Result<(), String> {
+    let event: Value = serde_json::from_str(&request.line)
+        .map_err(|_| "La requête UI Prime Agent en attente est invalide.".to_string())?;
+    if event.get("type").and_then(Value::as_str) != Some("extension_ui_request")
+        || event.get("id").and_then(Value::as_str) != Some(request.id.as_str())
+    {
+        return Err("La requête UI Prime Agent en attente est invalide.".to_string());
+    }
+    if event.get("method").and_then(Value::as_str) != Some("select") {
+        return Ok(());
+    }
+
+    match payload.get("cancelled") {
+        Some(Value::Bool(true)) if payload.get("value").is_none() => return Ok(()),
+        Some(Value::Bool(true)) => {
+            return Err("Une réponse UI annulée ne peut pas contenir de sélection.".to_string())
+        }
+        Some(Value::Bool(false)) | None => {}
+        Some(_) => return Err("Le statut d’annulation de la réponse UI est invalide.".to_string()),
+    }
+
+    let selected = payload
+        .get("value")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "La réponse UI Prime Agent ne contient aucune sélection valide.".to_string()
+        })?;
+    let options = event
+        .get("options")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "La requête de sélection Prime Agent ne contient aucune option valide.".to_string()
+        })?;
+    if options.iter().any(|option| !option.is_string()) {
+        return Err(
+            "La requête de sélection Prime Agent contient une option invalide.".to_string(),
+        );
+    }
+    if options
+        .iter()
+        .any(|option| option.as_str() == Some(selected))
+    {
+        return Ok(());
+    }
+
+    let plan_id = trusted_inline_plan_review_id(&event).ok_or_else(|| {
+        "La sélection ne correspond à aucune option de la requête UI Prime Agent.".to_string()
+    })?;
+    validate_inline_plan_revision_response(selected, &plan_id)
+}
+
+fn validated_pending_extension_ui_response_position(
+    pending: &[PendingExtensionUiRecord],
+    payload: &Value,
+) -> Result<usize, String> {
+    if payload.get("type").and_then(Value::as_str) != Some("extension_ui_response") {
+        return Err("Le payload n’est pas une réponse UI Prime Agent.".to_string());
+    }
+    let response_id = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && id.len() <= 256)
+        .ok_or_else(|| {
+            "La réponse UI Prime Agent ne contient aucun identifiant valide.".to_string()
+        })?;
+    let position = pending
+        .iter()
+        .position(|request| request.id == response_id)
+        .ok_or_else(|| {
+            "Cette requête UI Prime Agent est absente ou a déjà reçu une réponse.".to_string()
+        })?;
+    validate_extension_ui_response(&pending[position], payload)?;
+    Ok(position)
+}
+
+fn plan_ui_request_tool_call_id(record: &[u8]) -> Option<String> {
+    let event: Value = serde_json::from_slice(record).ok()?;
+    if event.get("type").and_then(Value::as_str) != Some("extension_ui_request") {
+        return None;
+    }
+    let title = event.get("title").and_then(Value::as_str)?;
+    let token = title
+        .split_once('\n')
+        .map(|(marker, _)| marker)
+        .and_then(|marker| marker.strip_prefix(PLAN_UI_TITLE_PREFIX))?;
+    if token.is_empty() || token.len() > 65_536 {
+        return None;
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(token).ok()?;
+    if bytes.len() > 49_152 {
+        return None;
+    }
+    let payload: Value = serde_json::from_slice(&bytes).ok()?;
+    if payload.get("v").and_then(Value::as_u64) != Some(1) {
+        return None;
+    }
+    let call_id = match payload.get("kind").and_then(Value::as_str) {
+        Some("question" | "custom") => payload.get("toolCallId"),
+        Some("review") => payload.get("planId"),
+        _ => None,
+    }
+    .and_then(Value::as_str)?;
+    (!call_id.is_empty() && call_id.len() <= 256).then(|| call_id.to_string())
+}
+
+fn completed_plan_ui_tool_call_id(record: &[u8]) -> Option<String> {
+    let event: Value = serde_json::from_slice(record).ok()?;
+    if event.get("type").and_then(Value::as_str) != Some("tool_execution_end")
+        || !matches!(
+            event.get("toolName").and_then(Value::as_str),
+            Some("prime_orbit_plan_question" | "prime_orbit_plan_submit")
+        )
+    {
+        return None;
+    }
+    let call_id = event.get("toolCallId").and_then(Value::as_str)?;
+    (!call_id.is_empty() && call_id.len() <= 256).then(|| call_id.to_string())
+}
+
+fn remove_completed_plan_ui_requests(
+    pending: &mut Vec<PendingExtensionUiRecord>,
+    record: &[u8],
+) -> bool {
+    let Some(completed_call_id) = completed_plan_ui_tool_call_id(record) else {
+        return false;
+    };
+    let previous_len = pending.len();
+    pending.retain(|request| {
+        plan_ui_request_tool_call_id(request.line.as_bytes()).as_deref()
+            != Some(completed_call_id.as_str())
+    });
+    pending.len() != previous_len
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingPlanRecoveryMatch<'a> {
+    Exact(&'a PendingExtensionUiRecord),
+    Conflict,
+    Absent,
+}
+
+fn pending_plan_recovery_match<'a>(
+    pending: &'a [PendingExtensionUiRecord],
+    expected_tool_call_id: &str,
+) -> PendingPlanRecoveryMatch<'a> {
+    if let Some(request) = pending.iter().find(|request| {
+        plan_ui_request_tool_call_id(request.line.as_bytes()).as_deref()
+            == Some(expected_tool_call_id)
+    }) {
+        return PendingPlanRecoveryMatch::Exact(request);
+    }
+    if pending.is_empty() {
+        PendingPlanRecoveryMatch::Absent
+    } else {
+        // A different live interactive request means the renderer's durable
+        // transcript projection is behind the exact native process. Never
+        // abort that newer request while recovering an older tool call.
+        PendingPlanRecoveryMatch::Conflict
+    }
 }
 
 #[cfg(test)]
@@ -717,53 +1021,12 @@ fn persist_pending_extension_ui_store(
     crate::storage::write_atomic(&path, &bytes)
 }
 
-fn load_pending_extension_ui_store(
-    app_data_dir: &Path,
-    conversation_id: &str,
-    session_path: &Path,
-    session_id: Option<&str>,
-) -> Vec<PendingExtensionUiRecord> {
-    let Ok(path) = pending_extension_ui_store_path(app_data_dir, conversation_id) else {
-        return Vec::new();
-    };
-    let Ok(metadata) = fs::symlink_metadata(&path) else {
-        return Vec::new();
-    };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > MAX_PENDING_EXTENSION_UI_STORE_BYTES
-    {
-        remove_pending_extension_ui_store(app_data_dir, conversation_id);
-        return Vec::new();
-    }
-    let store = fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<PendingExtensionUiStore>(&bytes).ok());
-    let Some(store) = store else {
-        remove_pending_extension_ui_store(app_data_dir, conversation_id);
-        return Vec::new();
-    };
-    let identity_matches = store.version == PENDING_EXTENSION_UI_STORE_VERSION
-        && store.conversation_id == conversation_id
-        && same_session_path(&store.session_path, session_path)
-        && match (store.session_id.as_deref(), session_id) {
-            (Some(stored), Some(expected)) => stored == expected,
-            _ => true,
-        };
-    if !identity_matches
-        || store.requests.len() > MAX_PENDING_EXTENSION_UI_REQUESTS
-        || store.requests.iter().any(|request| {
-            request.id.is_empty()
-                || request.id.len() > 256
-                || request.line.len() > MAX_PENDING_EXTENSION_UI_REQUEST_BYTES
-                || parsed_extension_ui_request(request.line.as_bytes())
-                    .is_none_or(|(id, awaits_response, _)| id != request.id || !awaits_response)
-        })
-    {
-        remove_pending_extension_ui_store(app_data_dir, conversation_id);
-        return Vec::new();
-    }
-    store.requests
+fn discard_pending_extension_ui_store_for_new_rpc(app_data_dir: &Path, conversation_id: &str) {
+    // An extension_ui_request id belongs to the exact RPC process that emitted
+    // it. Even an exact session reattach starts a new process whose stdin can
+    // never answer the old id, so only the in-memory RunningAgent cache may be
+    // replayed to a renderer that reconnects to that same live process.
+    remove_pending_extension_ui_store(app_data_dir, conversation_id);
 }
 
 fn sync_pending_extension_ui_store(
@@ -794,6 +1057,7 @@ fn sync_pending_extension_ui_store(
 struct ExtensionRequestRoute {
     owner: Option<String>,
     plan_attention_request_id: Option<String>,
+    runtime_mode: AgentRuntimeMode,
 }
 
 fn extension_request_target(
@@ -824,6 +1088,7 @@ fn extension_request_target(
             ExtensionRequestRoute {
                 owner: agent.interactive_owner.clone(),
                 plan_attention_request_id,
+                runtime_mode: agent.info.runtime_mode,
             },
             cached.then(|| {
                 (
@@ -853,9 +1118,11 @@ fn emit_runtime_line(
     line: String,
     target: Option<ExtensionRequestRoute>,
 ) {
+    let runtime_mode = target.as_ref().map(|route| route.runtime_mode);
     let event = AgentLineEvent {
         conversation_id: conversation_id.to_string(),
         line,
+        runtime_mode,
     };
     match target {
         Some(route) => {
@@ -1527,18 +1794,6 @@ enum DirectSessionOperationRuntimeEvent {
     },
 }
 
-fn terminal_clears_pending_extension_ui(record: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(record)
-        .ok()
-        .and_then(|event| {
-            event
-                .get("type")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .is_some_and(|event_type| matches!(event_type.as_str(), "agent_end" | "turn_error"))
-}
-
 fn direct_session_operation_runtime_event(
     record: &[u8],
 ) -> Option<DirectSessionOperationRuntimeEvent> {
@@ -1690,7 +1945,7 @@ fn apply_runtime_record(
     record: &[u8],
 ) {
     let busy = runtime_busy_state(record);
-    let clear_pending_extension_ui = terminal_clears_pending_extension_ui(record);
+    let completed_plan_ui_call_id = completed_plan_ui_tool_call_id(record);
     let direct_session_operation_event = direct_session_operation_runtime_event(record);
     let session_path = runtime_session_path(record).and_then(resolved_runtime_session_path);
     let session_id = runtime_session_id(record).filter(|id| {
@@ -1702,7 +1957,7 @@ fn apply_runtime_record(
     });
     let launch_options = runtime_launch_options(record);
     if busy.is_none()
-        && !clear_pending_extension_ui
+        && completed_plan_ui_call_id.is_none()
         && direct_session_operation_event.is_none()
         && session_path.is_none()
         && session_id.is_none()
@@ -1710,7 +1965,7 @@ fn apply_runtime_record(
     {
         return;
     }
-    let (release_candidate, cleared_pending_identity) = {
+    let (release_candidate, pending_snapshot) = {
         let mut map = agents.0.lock();
         let Some(agent) = map.get_mut(conversation_id) else {
             return;
@@ -1721,15 +1976,18 @@ fn apply_runtime_record(
         if let Some(busy) = busy {
             agent.busy = busy;
         }
-        let cleared_pending_identity = if clear_pending_extension_ui {
-            agent.pending_extension_ui_requests.clear();
-            Some((
-                agent.info.session_path.clone(),
-                agent.info.session_id.clone(),
-            ))
-        } else {
-            None
-        };
+        let pending_snapshot = completed_plan_ui_call_id
+            .as_ref()
+            .filter(|_| {
+                remove_completed_plan_ui_requests(&mut agent.pending_extension_ui_requests, record)
+            })
+            .map(|_| {
+                (
+                    agent.info.session_path.clone(),
+                    agent.info.session_id.clone(),
+                    agent.pending_extension_ui_requests.clone(),
+                )
+            });
         if let Some(event) = direct_session_operation_event {
             apply_direct_session_operation_runtime_event(&mut agent.operations, event);
         }
@@ -1750,15 +2008,15 @@ fn apply_runtime_record(
                 agent.info.thinking = Some(thinking);
             }
         }
-        (idle_release_candidate(agent), cleared_pending_identity)
+        (idle_release_candidate(agent), pending_snapshot)
     };
-    if let Some((session_path, session_id)) = cleared_pending_identity {
+    if let Some((session_path, session_id, requests)) = pending_snapshot {
         sync_pending_extension_ui_store(
             app,
             conversation_id,
             session_path.as_deref(),
             session_id.as_deref(),
-            &[],
+            &requests,
         );
     }
     if let Some(pid) = release_candidate {
@@ -2500,6 +2758,60 @@ fn managed_generation_daemon_socket(launch_spec: &LaunchSpec) -> Result<Option<P
     Ok(Some(socket))
 }
 
+fn process_local_plan_runtime(
+    launch_spec: &LaunchSpec,
+) -> Result<Option<ProcessLocalPlanRuntime>, String> {
+    let LaunchSpec::Source {
+        node, source_dir, ..
+    } = launch_spec
+    else {
+        return Ok(None);
+    };
+    let agent_index_candidate = source_dir.join("packages/coding-agent/dist/index.js");
+    if !agent_index_candidate.is_file() {
+        return Ok(None);
+    }
+    let source_dir = canonicalize(source_dir).map_err(|error| {
+        format!("Impossible d’attester la racine du runtime Prime Agent pour le mode Plan: {error}")
+    })?;
+    let attest = |candidate: PathBuf, label: &str| -> Result<PathBuf, String> {
+        let candidate = canonicalize(&candidate)
+            .map_err(|error| format!("{label} est introuvable: {error}"))?;
+        if !candidate.starts_with(&source_dir) || !candidate.is_file() {
+            return Err(format!(
+                "{label} ne correspond pas à un fichier du runtime Prime Agent attesté."
+            ));
+        }
+        Ok(candidate)
+    };
+    let agent_index = attest(agent_index_candidate, "L’entrée programmatique Prime Agent")?;
+    Ok(Some(ProcessLocalPlanRuntime {
+        node: node.clone(),
+        source_dir,
+        agent_index,
+    }))
+}
+
+fn rpc_daemon_socket_for_mode(
+    launch_spec: &LaunchSpec,
+    runtime_mode: AgentRuntimeMode,
+) -> Result<Option<PathBuf>, String> {
+    if runtime_mode == AgentRuntimeMode::Plan && process_local_plan_runtime(launch_spec)?.is_some()
+    {
+        // Prime Agent intentionally selects its in-process RPC implementation
+        // when a trusted extension factory is supplied programmatically. Plan
+        // uses that native path so blocking questions and reviews cannot be
+        // discarded by daemon snapshot/backpressure catch-up.
+        return Ok(None);
+    }
+    // Prime Agent v0.8 routes every CLI RPC runtime through a daemon. Omitting
+    // --daemon-socket does not select an in-process transport on its own: it
+    // silently attaches the RPC client to Prime Agent's global default daemon.
+    // Normal sessions therefore stay on Orbit's attested, generation-scoped
+    // endpoint. Executable-only runtimes retain Prime Agent's native fallback.
+    managed_generation_daemon_socket(launch_spec)
+}
+
 fn managed_daemon_shutdown_target(
     launch_spec: &LaunchSpec,
     daemon_socket: Option<&Path>,
@@ -2609,6 +2921,12 @@ fn spawn_rpc_agent(
         } else {
             (None, None)
         };
+    let process_local_plan_runtime =
+        if runtime_mode == AgentRuntimeMode::Plan && !reattach_owned_session {
+            process_local_plan_runtime(launch_spec)?
+        } else {
+            None
+        };
     let arguments = rpc_launch_arguments(
         session_path,
         provider.as_deref(),
@@ -2617,7 +2935,10 @@ fn spawn_rpc_agent(
         append_system_prompt.as_deref(),
         runtime_mode,
         plan_extension.as_deref(),
-        daemon_socket,
+        process_local_plan_runtime
+            .is_none()
+            .then_some(daemon_socket)
+            .flatten(),
     );
 
     let mut command = if reattach_owned_session {
@@ -2644,6 +2965,27 @@ fn spawn_rpc_agent(
         } else {
             command.env_remove("PRIME_ORBIT_SESSION_ID");
         }
+        command
+    } else if let Some(plan_runtime) = process_local_plan_runtime.as_ref() {
+        let mut wrapper_arguments = vec![
+            OsString::from("--input-type=module"),
+            OsString::from("-e"),
+            OsString::from(PLAN_RPC_LAUNCHER_SCRIPT),
+            OsString::from("prime-orbit-plan"),
+        ];
+        wrapper_arguments.extend(arguments);
+        let mut command = external_command(&plan_runtime.node, &wrapper_arguments);
+        configure_bridge_daemon_socket(&mut command, None);
+        command
+            .env("PRIME_ORBIT_AGENT_INDEX_PATH", &plan_runtime.agent_index)
+            .env_remove("PRIME_AGENT_INTERNAL_OWNED_WORKER")
+            .env_remove("PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND");
+        #[cfg(windows)]
+        crate::node_compat::configure_source_rpc(
+            app,
+            &mut command,
+            Some(&plan_runtime.source_dir),
+        )?;
         command
     } else {
         let mut command = launch_spec.command(&arguments);
@@ -2758,6 +3100,92 @@ fn inspect_owned_session_for_reattach(
                         })
                 })
         })
+}
+
+fn stop_owned_daemon_session_for_local_plan(
+    launch_spec: &LaunchSpec,
+    daemon_socket: Option<&Path>,
+    session_file: &Path,
+    session_id: Option<&str>,
+) -> Result<(), String> {
+    let LaunchSpec::Source { node, cli, .. } = launch_spec else {
+        return Err(
+            "Ce runtime Prime Agent ne permet pas de libérer une session daemon pour le mode Plan."
+                .to_string(),
+        );
+    };
+    let request = SessionControlBridgeRequest {
+        action: "stop_owned_session",
+        session_file: session_file.to_string_lossy().into_owned(),
+        session_id: session_id.map(str::to_string),
+    };
+    let request_json = serde_json::to_vec(&request)
+        .map_err(|error| format!("La requête d’arrêt Prime Agent est invalide: {error}"))?;
+    let arguments = [
+        OsString::from("-e"),
+        OsString::from(SESSION_CONTROL_BRIDGE_SCRIPT),
+    ];
+    let mut command = external_command(node, &arguments);
+    configure_bridge_daemon_socket(&mut command, daemon_socket);
+    command
+        .env("PRIME_ORBIT_CLI_PATH", cli)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Impossible de contacter le daemon Prime Agent: {error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "Le canal de contrôle Prime Agent est indisponible.".to_string())?
+        .write_all(&request_json)
+        .map_err(|error| format!("Impossible d’interroger le daemon Prime Agent: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("Le contrôle Prime Agent a échoué: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "Prime Agent n’a pas pu libérer la session avant le mode Plan.".to_string()
+        } else {
+            detail
+        });
+    }
+    let result: OwnedSessionStopResult = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "La réponse d’arrêt Prime Agent est invalide.".to_string())?;
+    if !result.supported {
+        return Err(
+            "Cette version de Prime Agent ne peut pas libérer la session pour le mode Plan."
+                .to_string(),
+        );
+    }
+    if !matches!(result.status.as_str(), "inactive" | "stopped") {
+        return Err("Prime Agent n’a pas confirmé la libération de la session.".to_string());
+    }
+    Ok(())
+}
+
+fn release_owned_daemon_session_for_local_plan(
+    launch_spec: &LaunchSpec,
+    session_file: &Path,
+    session_id: Option<&str>,
+) -> Result<(), String> {
+    let daemon_socket = managed_generation_daemon_socket(launch_spec)?;
+    if inspect_owned_session_for_reattach(
+        launch_spec,
+        daemon_socket.as_deref(),
+        session_file,
+        session_id,
+    ) {
+        stop_owned_daemon_session_for_local_plan(
+            launch_spec,
+            daemon_socket.as_deref(),
+            session_file,
+            session_id,
+        )?;
+    }
+    Ok(())
 }
 
 fn spawn_agent_io_threads(
@@ -2900,30 +3328,28 @@ fn start_agent_blocking(
             "Prime Agent est introuvable. Lancez l’installation rapide ou configurez son runtime{details}"
         )
     })?;
-    let daemon_socket = managed_generation_daemon_socket(&launch_spec)?;
-    let reattach_owned_session = session_path.as_deref().is_some_and(|session_file| {
-        inspect_owned_session_for_reattach(
-            &launch_spec,
-            daemon_socket.as_deref(),
-            session_file,
-            None,
-        )
-    });
+    let process_local_plan = runtime_mode == AgentRuntimeMode::Plan
+        && process_local_plan_runtime(&launch_spec)?.is_some();
+    let daemon_socket = rpc_daemon_socket_for_mode(&launch_spec, runtime_mode)?;
+    if process_local_plan {
+        if let Some(session_file) = session_path.as_deref() {
+            release_owned_daemon_session_for_local_plan(&launch_spec, session_file, None)?;
+        }
+    }
+    let reattach_owned_session = !process_local_plan
+        && session_path.as_deref().is_some_and(|session_file| {
+            inspect_owned_session_for_reattach(
+                &launch_spec,
+                daemon_socket.as_deref(),
+                session_file,
+                None,
+            )
+        });
     let app_data_dir = crate::storage::app_data_dir(&app).ok();
-    let restored_pending_extension_ui_requests = match (
-        reattach_owned_session,
-        app_data_dir.as_deref(),
-        session_path.as_deref(),
-    ) {
-        (true, Some(app_data_dir), Some(session_path)) => {
-            load_pending_extension_ui_store(app_data_dir, &conversation_id, session_path, None)
-        }
-        (false, Some(app_data_dir), _) => {
-            remove_pending_extension_ui_store(app_data_dir, &conversation_id);
-            Vec::new()
-        }
-        _ => Vec::new(),
-    };
+    if let Some(app_data_dir) = app_data_dir.as_deref() {
+        discard_pending_extension_ui_store_for_new_rpc(app_data_dir, &conversation_id);
+    }
+    let pending_extension_ui_requests = Vec::new();
 
     let mut map = agents.0.lock();
     ensure_update_installation_is_idle(&agents)?;
@@ -2965,7 +3391,7 @@ fn start_agent_blocking(
         RunningAgent {
             info: info.clone(),
             append_system_prompt,
-            pending_extension_ui_requests: restored_pending_extension_ui_requests,
+            pending_extension_ui_requests,
             _plan_extension_guard: spawned._plan_extension_guard.clone(),
             daemon_socket,
             launch_spec,
@@ -3148,19 +3574,10 @@ fn send_rpc_blocking(
             );
         }
         let pending_ui_position = if payload_type == Some("extension_ui_response") {
-            let response_id = extension_ui_response_id.as_deref().ok_or_else(|| {
-                "La réponse UI Prime Agent ne contient aucun identifiant valide.".to_string()
-            })?;
-            Some(
-                agent
-                    .pending_extension_ui_requests
-                    .iter()
-                    .position(|request| request.id == response_id)
-                    .ok_or_else(|| {
-                        "Cette requête UI Prime Agent est absente ou a déjà reçu une réponse."
-                            .to_string()
-                    })?,
-            )
+            Some(validated_pending_extension_ui_response_position(
+                &agent.pending_extension_ui_requests,
+                &payload,
+            )?)
         } else {
             if agent.owners.contains(&owner) {
                 agent.interactive_owner = Some(owner.clone());
@@ -3793,11 +4210,281 @@ struct RestartSnapshot {
     thinking: Option<String>,
     append_system_prompt: Option<String>,
     runtime_mode: AgentRuntimeMode,
-    daemon_socket: Option<PathBuf>,
     launch_spec: LaunchSpec,
     child: Arc<Mutex<Child>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     exit_emitted: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistedPlanHandoffDecision {
+    Apply,
+    Keep,
+}
+
+#[derive(Debug, Clone)]
+struct PlanHandoffRuntimeSubject {
+    handoff_id: String,
+    owner: String,
+    pid: u32,
+    started_at: u64,
+    session_path: PathBuf,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PlanHandoffAttestation {
+    subject: PlanHandoffRuntimeSubject,
+    _decision: PersistedPlanHandoffDecision,
+}
+
+impl PlanHandoffAttestation {
+    fn still_matches(
+        &self,
+        info: &RunningAgentInfo,
+        interactive_owner: Option<&str>,
+        owner: &str,
+        requested_runtime_mode: Option<AgentRuntimeMode>,
+        handoff_id: &str,
+    ) -> bool {
+        self.subject.handoff_id == handoff_id
+            && self.subject.owner == owner
+            && self.subject.pid == info.pid
+            && self.subject.started_at == info.started_at
+            && self.subject.session_id == info.session_id
+            && info.runtime_mode == AgentRuntimeMode::Plan
+            && requested_runtime_mode == Some(AgentRuntimeMode::Normal)
+            && interactive_owner == Some(owner)
+            && info
+                .session_path
+                .as_deref()
+                .is_some_and(|path| same_session_path(path, &self.subject.session_path))
+    }
+}
+
+/// Attests the only persisted Plan decisions that may authorize replacing an
+/// active Plan RPC client with a Normal one. The renderer cannot manufacture
+/// this authority: both the exact submit tool call and its unique successful
+/// tool result must already exist in Prime Agent's canonical session JSONL.
+fn persisted_plan_handoff_decision(
+    session_path: &Path,
+    handoff_id: &str,
+    runtime_started_at: u64,
+) -> Result<PersistedPlanHandoffDecision, String> {
+    // Open first, then compare the opened object with the path metadata. This
+    // keeps the parser attached to one file handle and prevents the ordinary
+    // check-then-open replacement race from redirecting the attestation.
+    let file = fs::File::open(session_path).map_err(|error| {
+        format!(
+            "Impossible d'ouvrir la session Plan {}: {error}",
+            session_path.display()
+        )
+    })?;
+    let opened_metadata = file.metadata().map_err(|error| {
+        format!(
+            "Impossible de verifier la session Plan ouverte {}: {error}",
+            session_path.display()
+        )
+    })?;
+    let path_metadata = fs::symlink_metadata(session_path).map_err(|error| {
+        format!(
+            "Impossible de verifier la session Plan {}: {error}",
+            session_path.display()
+        )
+    })?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.is_file()
+        || !opened_metadata.is_file()
+        || opened_metadata.len() != path_metadata.len()
+        || opened_metadata.modified().ok() != path_metadata.modified().ok()
+        || opened_metadata.len() > MAX_PLAN_HANDOFF_SESSION_BYTES
+    {
+        return Err("La session Plan de transition est invalide ou trop volumineuse.".to_string());
+    }
+    let mut matching_call_seen = false;
+    let mut decision = None;
+    // Read exactly the attested snapshot length. Concurrent appends belong to
+    // later runtime state and cannot silently expand this authorization scan.
+    for line in BufReader::new(file.take(opened_metadata.len())).lines() {
+        let line =
+            line.map_err(|error| format!("Impossible de relire la session Plan: {error}"))?;
+        if line.len() > MAX_PLAN_HANDOFF_LINE_BYTES {
+            return Err("Une entree de la session Plan depasse la limite autorisee.".to_string());
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(message) = entry.get("message") else {
+            continue;
+        };
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                let Some(content) = message.get("content").and_then(Value::as_array) else {
+                    continue;
+                };
+                for block in content {
+                    if block.get("type").and_then(Value::as_str) != Some("toolCall")
+                        || block.get("id").and_then(Value::as_str) != Some(handoff_id)
+                    {
+                        continue;
+                    }
+                    if block.get("name").and_then(Value::as_str) != Some("prime_orbit_plan_submit")
+                    {
+                        return Err(
+                            "L'identifiant de transition ne designe pas un appel Plan Submit."
+                                .to_string(),
+                        );
+                    }
+                    if matching_call_seen {
+                        return Err(
+                            "L'identifiant de transition Plan apparait plusieurs fois dans la session."
+                                .to_string(),
+                        );
+                    }
+                    if message
+                        .get("timestamp")
+                        .and_then(Value::as_u64)
+                        .is_none_or(|timestamp| timestamp < runtime_started_at)
+                    {
+                        return Err(
+                            "L'appel Plan atteste n'appartient pas au processus actif.".to_string()
+                        );
+                    }
+                    matching_call_seen = true;
+                }
+            }
+            Some("toolResult")
+                if message.get("toolCallId").and_then(Value::as_str) == Some(handoff_id) =>
+            {
+                if message.get("toolName").and_then(Value::as_str)
+                    != Some("prime_orbit_plan_submit")
+                {
+                    return Err(
+                        "Le resultat de transition ne correspond pas a Plan Submit.".to_string()
+                    );
+                }
+                if !matching_call_seen {
+                    return Err(
+                        "Le resultat Plan precede l'appel qu'il pretend terminer.".to_string()
+                    );
+                }
+                if message
+                    .get("timestamp")
+                    .and_then(Value::as_u64)
+                    .is_none_or(|timestamp| timestamp < runtime_started_at)
+                {
+                    return Err(
+                        "Le resultat Plan atteste n'appartient pas au processus actif.".to_string(),
+                    );
+                }
+                if decision.is_some() {
+                    return Err(
+                        "L'appel de transition Plan possede plusieurs resultats terminaux."
+                            .to_string(),
+                    );
+                }
+                if message.get("isError").and_then(Value::as_bool) != Some(false) {
+                    return Err(
+                        "La decision Plan attestee ne s'est pas terminee avec succes.".to_string(),
+                    );
+                }
+                let payload = message
+                    .get("details")
+                    .and_then(|details| details.get("payload"));
+                if payload
+                    .and_then(|value| value.get("kind"))
+                    .and_then(Value::as_str)
+                    != Some("decision")
+                {
+                    return Err(
+                        "Le resultat Plan ne contient aucune decision attestee.".to_string()
+                    );
+                }
+                decision = Some(
+                    match payload
+                        .and_then(|value| value.get("decision"))
+                        .and_then(Value::as_str)
+                    {
+                        Some("apply") => PersistedPlanHandoffDecision::Apply,
+                        Some("keep") => PersistedPlanHandoffDecision::Keep,
+                        _ => return Err(
+                            "Seules les decisions Plan apply ou keep autorisent cette transition."
+                                .to_string(),
+                        ),
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    if !matching_call_seen {
+        return Err("La session active ne contient pas l'appel Plan Submit demande.".to_string());
+    }
+    decision.ok_or_else(|| {
+        "La session active ne contient pas encore de decision Plan terminale.".to_string()
+    })
+}
+
+fn prepare_plan_handoff_attestation(
+    agents: &AgentsState,
+    owner: &str,
+    conversation_id: &str,
+    requested_runtime_mode: Option<AgentRuntimeMode>,
+    handoff_id: Option<&str>,
+) -> Result<Option<PlanHandoffAttestation>, String> {
+    let Some(handoff_id) = handoff_id else {
+        return Ok(None);
+    };
+    let subject = {
+        let map = agents.0.lock();
+        let agent = map
+            .get(conversation_id)
+            .ok_or_else(|| format!("Aucun Prime Agent actif pour {conversation_id}"))?;
+        if !agent.busy {
+            return Ok(None);
+        }
+        if !agent.owners.contains(owner) {
+            return Err(
+                "Cette fenêtre ne possède pas la conversation Prime Agent demandée.".to_string(),
+            );
+        }
+        if agent.interactive_owner.as_deref() != Some(owner) {
+            return Err(
+                "Seule la fenêtre interactive peut changer le mode de cette conversation."
+                    .to_string(),
+            );
+        }
+        if agent.info.runtime_mode != AgentRuntimeMode::Plan
+            || requested_runtime_mode != Some(AgentRuntimeMode::Normal)
+        {
+            return Err(
+                "Le mode de cette conversation ne peut changer que lorsque Prime Agent est au repos."
+                    .to_string(),
+            );
+        }
+        PlanHandoffRuntimeSubject {
+            handoff_id: handoff_id.to_string(),
+            owner: owner.to_string(),
+            pid: agent.info.pid,
+            started_at: agent.info.started_at,
+            session_path: agent
+                .info
+                .session_path
+                .as_deref()
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    "Prime Agent n'a pas publié le fichier de cette session Plan.".to_string()
+                })?,
+            session_id: agent.info.session_id.clone(),
+        }
+    };
+    let decision =
+        persisted_plan_handoff_decision(&subject.session_path, handoff_id, subject.started_at)?;
+    Ok(Some(PlanHandoffAttestation {
+        subject,
+        _decision: decision,
+    }))
 }
 
 fn restart_agent_blocking(
@@ -3806,9 +4493,23 @@ fn restart_agent_blocking(
     owner: String,
     conversation_id: String,
     requested_runtime_mode: Option<AgentRuntimeMode>,
+    plan_handoff_id: Option<String>,
 ) -> Result<RestartAgentResult, String> {
     ensure_update_installation_is_idle(&agents)?;
     let conversation_id = validated_identifier(conversation_id)?;
+    let plan_handoff_id = plan_handoff_id.map(validated_identifier).transpose()?;
+    if plan_handoff_id.is_some() && requested_runtime_mode != Some(AgentRuntimeMode::Normal) {
+        return Err(
+            "Une transition Plan attestee ne peut cibler que le runtime Normal.".to_string(),
+        );
+    }
+    let plan_handoff_attestation = prepare_plan_handoff_attestation(
+        &agents,
+        &owner,
+        &conversation_id,
+        requested_runtime_mode,
+        plan_handoff_id.as_deref(),
+    )?;
     let snapshot = {
         let mut map = agents.0.lock();
         let agent = map
@@ -3841,10 +4542,35 @@ fn restart_agent_blocking(
             );
         }
         if requested_runtime_mode.is_some() && agent.busy {
-            return Err(
+            let handoff_id = plan_handoff_id.as_deref().ok_or_else(|| {
                 "Le mode de cette conversation ne peut changer que lorsque Prime Agent est au repos."
-                    .to_string(),
-            );
+                    .to_string()
+            })?;
+            if agent.info.runtime_mode != AgentRuntimeMode::Plan
+                || requested_runtime_mode != Some(AgentRuntimeMode::Normal)
+            {
+                return Err(
+                    "Le mode de cette conversation ne peut changer que lorsque Prime Agent est au repos."
+                        .to_string(),
+                );
+            }
+            if !plan_handoff_attestation
+                .as_ref()
+                .is_some_and(|attestation| {
+                    attestation.still_matches(
+                        &agent.info,
+                        agent.interactive_owner.as_deref(),
+                        &owner,
+                        requested_runtime_mode,
+                        handoff_id,
+                    )
+                })
+            {
+                return Err(
+                    "L'état du runtime Plan a changé pendant l'attestation de sa transition."
+                        .to_string(),
+                );
+            }
         }
 
         // Keep every surviving window lease on the replacement. The window
@@ -3869,13 +4595,17 @@ fn restart_agent_blocking(
             thinking: agent.info.thinking.clone(),
             append_system_prompt: agent.append_system_prompt.clone(),
             runtime_mode: requested_runtime_mode.unwrap_or(agent.info.runtime_mode),
-            daemon_socket: agent.daemon_socket.clone(),
             launch_spec: agent.launch_spec.clone(),
             child: Arc::clone(&agent.child),
             stdin: Arc::clone(&agent.stdin),
             exit_emitted: Arc::clone(&agent.exit_emitted),
         }
     };
+
+    let replacement_daemon_socket =
+        rpc_daemon_socket_for_mode(&snapshot.launch_spec, snapshot.runtime_mode)?;
+    let replacement_is_process_local_plan = snapshot.runtime_mode == AgentRuntimeMode::Plan
+        && process_local_plan_runtime(&snapshot.launch_spec)?.is_some();
 
     if let Err(error) = stop_rpc_client_for_restart(
         &app,
@@ -3913,6 +4643,37 @@ fn restart_agent_blocking(
         return Err(format!(
             "Prime Agent n’a pas pu être relancé en toute sécurité; aucun remplacement n’a été lancé: {error}"
         ));
+    }
+
+    if replacement_is_process_local_plan {
+        if let Some(session_file) = snapshot.session_path.as_deref() {
+            if let Err(error) = release_owned_daemon_session_for_local_plan(
+                &snapshot.launch_spec,
+                session_file,
+                snapshot.session_id.as_deref(),
+            ) {
+                let mut map = agents.0.lock();
+                let slot_matches = map.get(&conversation_id).is_some_and(|agent| {
+                    restart_slot_matches(agent.info.pid, agent.restarting, snapshot.previous_pid)
+                });
+                if slot_matches {
+                    map.remove(&conversation_id);
+                }
+                drop(map);
+                let _ = app.emit(
+                    "prime-agent://exit",
+                    AgentExitEvent {
+                        conversation_id: conversation_id.clone(),
+                        code: None,
+                        success: false,
+                        error: Some(format!(
+                            "Le runtime daemon n’a pas pu libérer la session pour le mode Plan: {error}"
+                        )),
+                    },
+                );
+                return Err(error);
+            }
+        }
     }
 
     // Launch and slot replacement share one map critical section. This is the
@@ -3968,7 +4729,7 @@ fn restart_agent_blocking(
             snapshot.thinking.clone(),
             snapshot.append_system_prompt.clone(),
             snapshot.runtime_mode,
-            snapshot.daemon_socket.as_deref(),
+            replacement_daemon_socket.as_deref(),
             &snapshot.launch_spec,
             false,
         ) {
@@ -3996,7 +4757,7 @@ fn restart_agent_blocking(
                 append_system_prompt: snapshot.append_system_prompt,
                 pending_extension_ui_requests: Vec::new(),
                 _plan_extension_guard: spawned._plan_extension_guard.clone(),
-                daemon_socket: snapshot.daemon_socket,
+                daemon_socket: replacement_daemon_socket,
                 launch_spec: snapshot.launch_spec,
                 child: Arc::clone(&spawned.child),
                 stdin: Arc::clone(&spawned.stdin),
@@ -4196,8 +4957,111 @@ fn pending_extension_ui_requests_blocking(
         .map(|request| AgentLineEvent {
             conversation_id: conversation_id.clone(),
             line: request.line.clone(),
+            runtime_mode: Some(agent.info.runtime_mode),
         })
         .collect())
+}
+
+fn reconcile_plan_dialog_recovery_blocking(
+    agents: AgentsState,
+    owner: String,
+    conversation_id: String,
+    expected_pid: u32,
+    expected_started_at: u64,
+    expected_tool_call_id: String,
+    abort_request_id: Option<String>,
+) -> Result<PlanDialogRecoveryResult, String> {
+    let conversation_id = validated_identifier(conversation_id)?;
+    let expected_tool_call_id =
+        validated_option(Some(expected_tool_call_id), "toolCallId Plan", 256)?
+            .ok_or_else(|| "Le toolCallId Plan attendu est vide.".to_string())?;
+    let abort_request_id = validated_option(abort_request_id, "identifiant d’abort", 256)?;
+
+    // This lock is the linearization boundary shared with
+    // `extension_request_target`: an exact extension_ui_request is either
+    // already cached and replayed, or the abort bytes reach this exact
+    // process before a later request may enter the cache. There is no
+    // check-then-write gap in which the renderer can cancel a valid dialog.
+    let mut map = agents.0.lock();
+    let agent = map
+        .get_mut(&conversation_id)
+        .ok_or_else(|| format!("Aucun Prime Agent actif pour {conversation_id}"))?;
+    if !agent_identity_matches(agent, expected_pid, expected_started_at) {
+        return Err(
+            "La génération Prime Agent a changé pendant la récupération du dialogue Plan."
+                .to_string(),
+        );
+    }
+    if agent.info.runtime_mode != AgentRuntimeMode::Plan {
+        return Err("Le runtime Prime Agent actif n’est plus en mode Plan.".to_string());
+    }
+    if agent.restarting {
+        return Err("Prime Agent redémarre pendant la récupération du dialogue Plan.".to_string());
+    }
+    if !agent.owners.contains(&owner) || agent.interactive_owner.as_deref() != Some(&owner) {
+        return Err("Seule la fenêtre interactive peut récupérer ce dialogue Plan.".to_string());
+    }
+
+    let pid = agent.info.pid;
+    let started_at = agent.info.started_at;
+    let runtime_mode = agent.info.runtime_mode;
+    let result = |status, request| PlanDialogRecoveryResult {
+        status,
+        request,
+        pid,
+        started_at,
+    };
+    match pending_plan_recovery_match(&agent.pending_extension_ui_requests, &expected_tool_call_id)
+    {
+        PendingPlanRecoveryMatch::Exact(request) => {
+            return Ok(result(
+                PlanDialogRecoveryStatus::Replayed,
+                Some(AgentLineEvent {
+                    conversation_id: conversation_id.clone(),
+                    line: request.line.clone(),
+                    runtime_mode: Some(runtime_mode),
+                }),
+            ));
+        }
+        PendingPlanRecoveryMatch::Conflict => {
+            return Ok(result(PlanDialogRecoveryStatus::Conflict, None));
+        }
+        PendingPlanRecoveryMatch::Absent if abort_request_id.is_none() => {
+            return Ok(result(PlanDialogRecoveryStatus::Absent, None));
+        }
+        PendingPlanRecoveryMatch::Absent => {}
+    }
+
+    let abort_request_id = abort_request_id.expect("checked above");
+    let mut abort_bytes = serde_json::to_vec(&serde_json::json!({
+        "id": abort_request_id,
+        "type": "abort",
+    }))
+    .map_err(|error| format!("Impossible de préparer l’abort Plan: {error}"))?;
+    abort_bytes.push(b'\n');
+    begin_runtime_write(&mut agent.operations).map_err(|_| {
+        "Les ressources Prime Agent changent pendant la récupération du dialogue Plan.".to_string()
+    })?;
+    let mut stdin_guard = match agent.stdin.try_lock_for(PLAN_RECOVERY_STDIN_LOCK_TIMEOUT) {
+        Some(guard) => guard,
+        None => {
+            finish_runtime_write(&mut agent.operations);
+            return Ok(result(PlanDialogRecoveryStatus::Busy, None));
+        }
+    };
+    let write_result = match stdin_guard.as_mut() {
+        Some(stdin) => stdin
+            .write_all(&abort_bytes)
+            .and_then(|_| stdin.flush())
+            .map_err(|error| format!("Impossible d’interrompre l’ancien dialogue Plan: {error}")),
+        None => {
+            Err("Le canal RPC Plan s’est fermé pendant la récupération du dialogue.".to_string())
+        }
+    };
+    drop(stdin_guard);
+    finish_runtime_write(&mut agent.operations);
+    write_result?;
+    Ok(result(PlanDialogRecoveryStatus::AbortSent, None))
 }
 
 fn list_running_agents_blocking(agents: AgentsState) -> Result<Vec<RunningAgentInfo>, String> {
@@ -4404,11 +5268,19 @@ pub async fn restart_agent(
     agents: tauri::State<'_, AgentsState>,
     conversation_id: String,
     runtime_mode: Option<AgentRuntimeMode>,
+    plan_handoff_id: Option<String>,
 ) -> Result<RestartAgentResult, String> {
     let agents = agents.inner().clone();
     let owner = window.label().to_string();
     crate::run_blocking(move || {
-        restart_agent_blocking(app, agents, owner, conversation_id, runtime_mode)
+        restart_agent_blocking(
+            app,
+            agents,
+            owner,
+            conversation_id,
+            runtime_mode,
+            plan_handoff_id,
+        )
     })
     .await
 }
@@ -4418,10 +5290,12 @@ pub(crate) fn attest_plan_document_write(
     owner: &str,
     conversation_id: &str,
     request_id: &str,
+    plan_id: &str,
     project_path: &Path,
 ) -> Result<(), String> {
     let conversation_id = validated_identifier(conversation_id.to_string())?;
     let request_id = validated_identifier(request_id.to_string())?;
+    let plan_id = validated_identifier(plan_id.to_string())?;
     let map = agents.0.lock();
     let agent = map
         .get(&conversation_id)
@@ -4450,7 +5324,175 @@ pub(crate) fn attest_plan_document_write(
     if !is_plan_review_request(&event) {
         return Err("La demande native n’autorise pas l’écriture d’un document Plan.".to_string());
     }
+    if plan_ui_request_tool_call_id(pending.line.as_bytes()).as_deref() != Some(plan_id.as_str()) {
+        return Err("La demande native ne correspond pas au document Plan présenté.".to_string());
+    }
     Ok(())
+}
+
+pub(crate) struct RecoveredPlanDocument {
+    pub(crate) title: String,
+    pub(crate) markdown: String,
+}
+
+fn persisted_plan_submit(
+    session_path: &Path,
+    request_id: &str,
+) -> Result<Option<RecoveredPlanDocument>, String> {
+    let metadata = fs::symlink_metadata(session_path).map_err(|error| {
+        format!(
+            "Impossible de vérifier la session Plan {}: {error}",
+            session_path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_PLAN_RECOVERY_SESSION_BYTES
+    {
+        return Err(
+            "La session Plan de récupération est invalide ou trop volumineuse.".to_string(),
+        );
+    }
+    let file = fs::File::open(session_path).map_err(|error| {
+        format!(
+            "Impossible d’ouvrir la session Plan {}: {error}",
+            session_path.display()
+        )
+    })?;
+    let mut matched: Option<RecoveredPlanDocument> = None;
+    let mut resolved = false;
+    for line in BufReader::new(file).lines() {
+        let line =
+            line.map_err(|error| format!("Impossible de relire la session Plan: {error}"))?;
+        if line.len() > MAX_PENDING_EXTENSION_UI_REQUEST_BYTES {
+            return Err("Une entrée de la session Plan dépasse la limite autorisée.".to_string());
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(message) = entry.get("message") else {
+            continue;
+        };
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                let Some(content) = message.get("content").and_then(Value::as_array) else {
+                    continue;
+                };
+                for block in content {
+                    if block.get("type").and_then(Value::as_str) != Some("toolCall")
+                        || block.get("id").and_then(Value::as_str) != Some(request_id)
+                        || block.get("name").and_then(Value::as_str)
+                            != Some("prime_orbit_plan_submit")
+                    {
+                        continue;
+                    }
+                    if matched.is_some() {
+                        return Err(
+                            "L’identifiant de l’appel Plan apparaît plusieurs fois dans la session."
+                                .to_string(),
+                        );
+                    }
+                    let arguments = block.get("arguments").and_then(Value::as_object);
+                    let persisted_title = arguments
+                        .and_then(|value| value.get("title"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("Implementation plan")
+                        .to_string();
+                    let persisted_markdown = arguments
+                        .and_then(|value| value.get("document"))
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            "L’appel Plan attesté ne contient aucun document Markdown.".to_string()
+                        })?
+                        .to_string();
+                    matched = Some(RecoveredPlanDocument {
+                        title: persisted_title,
+                        markdown: persisted_markdown,
+                    });
+                }
+            }
+            Some("toolResult") => {
+                if message.get("toolCallId").and_then(Value::as_str) == Some(request_id) {
+                    // Prime Agent owns the call lifecycle. Once its canonical
+                    // transcript contains any toolResult for this id, the
+                    // original blocking request is terminal and cannot be
+                    // recreated or answered, including Request was aborted.
+                    resolved = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok((!resolved).then_some(matched).flatten())
+}
+
+pub(crate) fn attest_recovered_plan_document_write(
+    agents: &AgentsState,
+    owner: &str,
+    conversation_id: &str,
+    request_id: &str,
+    project_path: &Path,
+) -> Result<RecoveredPlanDocument, String> {
+    let conversation_id = validated_identifier(conversation_id.to_string())?;
+    let request_id = validated_identifier(request_id.to_string())?;
+    let session_path = {
+        let map = agents.0.lock();
+        let agent = map
+            .get(&conversation_id)
+            .ok_or_else(|| format!("Aucun Prime Agent actif pour {conversation_id}"))?;
+        if agent.info.runtime_mode != AgentRuntimeMode::Plan {
+            return Err("La récupération d’un plan exige le runtime Plan isolé.".to_string());
+        }
+        let active_project = validated_cwd(agent.info.cwd.clone())?;
+        let requested_project = validated_cwd(project_path.to_string_lossy().into_owned())?;
+        if active_project != requested_project {
+            return Err("Le document Plan ne cible pas le projet du runtime actif.".to_string());
+        }
+        if !agent.owners.contains(owner) || agent.interactive_owner.as_deref() != Some(owner) {
+            return Err(
+                "Seule la fenêtre interactive du runtime Plan peut récupérer ce document."
+                    .to_string(),
+            );
+        }
+        agent
+            .info
+            .session_path
+            .as_deref()
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                "Prime Agent n’a pas publié le fichier de cette session Plan.".to_string()
+            })?
+    };
+    persisted_plan_submit(&session_path, &request_id)?.ok_or_else(|| {
+        "Le document demandé ne correspond pas à un appel Plan non résolu de cette session."
+            .to_string()
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub(crate) async fn reconcile_plan_dialog_recovery(
+    window: tauri::WebviewWindow,
+    agents: tauri::State<'_, AgentsState>,
+    conversation_id: String,
+    expected_pid: u32,
+    expected_started_at: u64,
+    expected_tool_call_id: String,
+    abort_request_id: Option<String>,
+) -> Result<PlanDialogRecoveryResult, String> {
+    let agents = agents.inner().clone();
+    let owner = window.label().to_string();
+    crate::run_blocking(move || {
+        reconcile_plan_dialog_recovery_blocking(
+            agents,
+            owner,
+            conversation_id,
+            expected_pid,
+            expected_started_at,
+            expected_tool_call_id,
+            abort_request_id,
+        )
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -4610,38 +5652,363 @@ mod tests {
         apply_launch_option_update, begin_owned_resource_reload, begin_rpc_admission,
         begin_runtime_write, begin_update_installation, cache_pending_extension_ui_request,
         close_rpc_stdin, conflicting_session_conversation, direct_session_operation_runtime_event,
-        ensure_update_installation_is_idle, finish_resource_reload, finish_runtime_write,
-        is_extension_ui_request, is_plan_review_request, is_reload_acknowledgement_timeout,
-        lease_absence_attests_release, load_pending_extension_ui_store,
+        discard_pending_extension_ui_store_for_new_rpc, ensure_update_installation_is_idle,
+        finish_resource_reload, finish_runtime_write, is_extension_ui_request,
+        is_plan_review_request, is_reload_acknowledgement_timeout, lease_absence_attests_release,
         managed_daemon_shutdown_target, managed_generation_daemon_socket,
         mark_resource_reload_unknown, owner_may_send, parsed_extension_ui_request,
-        persist_pending_extension_ui_store, public_runtime_line, release_owner_lease_state,
-        requested_launch_option_update, restart_slot_matches, rpc_launch_arguments,
-        rpc_starts_busy_operation, runtime_busy_state, runtime_launch_options,
-        runtime_mode_matches_expected, runtime_session_id, runtime_session_path,
-        should_emit_resources_reloaded, terminal_clears_pending_extension_ui, terminate_rpc_client,
-        validate_queue_lane, validate_queue_mutation, validate_queue_resume_result,
-        validate_reload_result, wait_for_child_until, waiter_may_remove_slot, AgentOperations,
-        AgentResourcesReloadedEvent, AgentRuntimeMode, AgentsState, DirectSessionOperationKind,
+        pending_extension_ui_store_path, pending_plan_recovery_match,
+        persist_pending_extension_ui_store, persisted_plan_handoff_decision, persisted_plan_submit,
+        process_local_plan_runtime, public_runtime_line, release_owner_lease_state,
+        remove_completed_plan_ui_requests, requested_launch_option_update, restart_slot_matches,
+        rpc_daemon_socket_for_mode, rpc_launch_arguments, rpc_starts_busy_operation,
+        runtime_busy_state, runtime_launch_options, runtime_mode_matches_expected,
+        runtime_session_id, runtime_session_path, should_emit_resources_reloaded,
+        terminate_rpc_client, trusted_inline_plan_review_id, validate_queue_lane,
+        validate_queue_mutation, validate_queue_resume_result, validate_reload_result,
+        validated_pending_extension_ui_response_position, wait_for_child_until,
+        waiter_may_remove_slot, AgentLineEvent, AgentOperations, AgentResourcesReloadedEvent,
+        AgentRuntimeMode, AgentsState, DirectSessionOperationKind,
         DirectSessionOperationRuntimeEvent, LaunchOptionUpdate, LaunchSpec,
-        PendingExtensionUiRecord, QueuedMessageMutation, ReloadAgentResourcesResult,
-        ResourceReloadClaimError, ResourceReloadPhase, RestartAgentResult, ResumeAgentQueueResult,
-        RpcAdmissionError, RunningAgentInfo, INVALID_AGENT_MESSAGE_PLACEHOLDER,
-        MAX_EXIT_DIAGNOSTIC_BYTES, MAX_PENDING_EXTENSION_UI_REQUESTS,
-        MAX_PENDING_EXTENSION_UI_REQUEST_BYTES,
+        PendingExtensionUiRecord, PendingPlanRecoveryMatch, PersistedPlanHandoffDecision,
+        PlanDialogRecoveryStatus, PlanHandoffAttestation, PlanHandoffRuntimeSubject,
+        QueuedMessageMutation, ReloadAgentResourcesResult, ResourceReloadClaimError,
+        ResourceReloadPhase, RestartAgentResult, ResumeAgentQueueResult, RpcAdmissionError,
+        RunningAgentInfo, INVALID_AGENT_MESSAGE_PLACEHOLDER, MAX_EXIT_DIAGNOSTIC_BYTES,
+        MAX_PENDING_EXTENSION_UI_REQUESTS, MAX_PENDING_EXTENSION_UI_REQUEST_BYTES,
+        PLAN_INLINE_REVISION_PROTOCOL, PLAN_REVIEW_RESPONSE_PREFIX,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use parking_lot::Mutex;
     use serde_json::{json, Value};
     use std::{
         collections::HashSet,
-        io::{BufRead, BufReader},
+        fs,
+        io::{BufRead, BufReader, Write},
         path::{Path, PathBuf},
         process::{Command, Stdio},
         sync::{Arc, Barrier},
         thread,
         time::Duration,
     };
+
+    #[test]
+    fn recovered_plan_write_requires_the_exact_unresolved_submit_call() {
+        let temporary = tempfile::tempdir().unwrap();
+        let session = temporary.path().join("session.jsonl");
+        let title = "Recovered plan";
+        let markdown = "# Recovered plan\n\n## Verification\n- Run tests.";
+        let call = json!({
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "toolCall",
+                    "id": "call_recovery",
+                    "name": "prime_orbit_plan_submit",
+                    "arguments": { "title": title, "document": markdown }
+                }]
+            }
+        });
+        fs::write(&session, format!("{call}\n")).unwrap();
+
+        let recovered = persisted_plan_submit(&session, "call_recovery")
+            .unwrap()
+            .expect("unresolved Plan call");
+        assert_eq!(recovered.title, title);
+        assert_eq!(recovered.markdown, markdown);
+        assert!(persisted_plan_submit(&session, "other_call")
+            .unwrap()
+            .is_none());
+
+        let aborted = json!({
+            "type": "message",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "call_recovery",
+                "toolName": "prime_orbit_plan_submit",
+                "content": [{"type": "text", "text": "Request was aborted"}],
+                "isError": true
+            }
+        });
+        fs::write(&session, format!("{call}\n{aborted}\n")).unwrap();
+        assert!(persisted_plan_submit(&session, "call_recovery")
+            .unwrap()
+            .is_none());
+
+        let result = json!({
+            "type": "message",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "call_recovery",
+                "toolName": "prime_orbit_plan_submit",
+                "content": [{"type": "text", "text": "done"}]
+            }
+        });
+        fs::write(&session, format!("{call}\n{result}\n")).unwrap();
+        assert!(persisted_plan_submit(&session, "call_recovery")
+            .unwrap()
+            .is_none());
+    }
+
+    fn persisted_plan_call(call_id: &str, tool_name: &str) -> Value {
+        json!({
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "timestamp": 101,
+                "content": [{
+                    "type": "toolCall",
+                    "id": call_id,
+                    "name": tool_name,
+                    "arguments": {
+                        "title": "Attested Plan",
+                        "document": "# Attested Plan"
+                    }
+                }]
+            }
+        })
+    }
+
+    fn persisted_plan_result(
+        call_id: &str,
+        tool_name: &str,
+        decision: &str,
+        is_error: bool,
+    ) -> Value {
+        json!({
+            "type": "message",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": call_id,
+                "toolName": tool_name,
+                "content": [{"type": "text", "text": format!("User decision: {decision}.")}],
+                "details": {
+                    "payload": {
+                        "kind": "decision",
+                        "v": 1,
+                        "decision": decision,
+                        "title": "Attested Plan"
+                    }
+                },
+                "isError": is_error,
+                "timestamp": 102
+            }
+        })
+    }
+
+    fn write_plan_handoff_session(path: &Path, entries: &[Value]) {
+        let contents = entries
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, format!("{contents}\n")).unwrap();
+    }
+
+    #[test]
+    fn busy_plan_handoff_accepts_only_exact_successful_apply_or_keep_results() {
+        let temporary = tempfile::tempdir().unwrap();
+        let session = temporary.path().join("session.jsonl");
+        for (decision, expected) in [
+            ("apply", PersistedPlanHandoffDecision::Apply),
+            ("keep", PersistedPlanHandoffDecision::Keep),
+        ] {
+            write_plan_handoff_session(
+                &session,
+                &[
+                    persisted_plan_call("call_handoff", "prime_orbit_plan_submit"),
+                    persisted_plan_result(
+                        "call_handoff",
+                        "prime_orbit_plan_submit",
+                        decision,
+                        false,
+                    ),
+                ],
+            );
+            assert_eq!(
+                persisted_plan_handoff_decision(&session, "call_handoff", 100).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn busy_plan_handoff_rejects_nonterminal_or_unauthorized_plan_decisions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let session = temporary.path().join("session.jsonl");
+        let call = persisted_plan_call("call_handoff", "prime_orbit_plan_submit");
+
+        for (decision, is_error) in [("revise", false), ("cancelled", false), ("apply", true)] {
+            write_plan_handoff_session(
+                &session,
+                &[
+                    call.clone(),
+                    persisted_plan_result(
+                        "call_handoff",
+                        "prime_orbit_plan_submit",
+                        decision,
+                        is_error,
+                    ),
+                ],
+            );
+            assert!(persisted_plan_handoff_decision(&session, "call_handoff", 100).is_err());
+        }
+
+        write_plan_handoff_session(&session, &[call]);
+        assert!(persisted_plan_handoff_decision(&session, "call_handoff", 100).is_err());
+    }
+
+    #[test]
+    fn busy_plan_handoff_rejects_forged_mismatched_and_duplicate_records() {
+        let temporary = tempfile::tempdir().unwrap();
+        let session = temporary.path().join("session.jsonl");
+        let valid_call = persisted_plan_call("call_handoff", "prime_orbit_plan_submit");
+        let valid_result =
+            persisted_plan_result("call_handoff", "prime_orbit_plan_submit", "apply", false);
+
+        write_plan_handoff_session(
+            &session,
+            &[
+                persisted_plan_call("call_handoff", "prime_orbit_plan_question"),
+                valid_result.clone(),
+            ],
+        );
+        assert!(persisted_plan_handoff_decision(&session, "call_handoff", 100).is_err());
+
+        write_plan_handoff_session(
+            &session,
+            &[
+                valid_call.clone(),
+                persisted_plan_result("other_call", "prime_orbit_plan_submit", "apply", false),
+            ],
+        );
+        assert!(persisted_plan_handoff_decision(&session, "call_handoff", 100).is_err());
+
+        write_plan_handoff_session(&session, &[valid_call, valid_result.clone(), valid_result]);
+        assert!(persisted_plan_handoff_decision(&session, "call_handoff", 100).is_err());
+
+        write_plan_handoff_session(
+            &session,
+            &[
+                persisted_plan_call("call_handoff", "prime_orbit_plan_submit"),
+                persisted_plan_result("call_handoff", "prime_orbit_plan_submit", "apply", false),
+            ],
+        );
+        assert!(
+            persisted_plan_handoff_decision(&session, "call_handoff", 103).is_err(),
+            "a decision from an older RPC process must not authorize the current Plan runtime"
+        );
+    }
+
+    #[test]
+    fn busy_plan_handoff_supports_every_session_size_the_history_loader_accepts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let session = temporary.path().join("large-session.jsonl");
+        let mut file = fs::File::create(&session).unwrap();
+        writeln!(
+            file,
+            "{}",
+            persisted_plan_call("call_handoff", "prime_orbit_plan_submit")
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            persisted_plan_result("call_handoff", "prime_orbit_plan_submit", "keep", false,)
+        )
+        .unwrap();
+        // Five individually bounded ignored records put the transcript above
+        // the previous 32 MiB handoff cap while keeping it below the canonical
+        // history loader's 64 MiB limit.
+        let filler = vec![b' '; 7 * 1024 * 1024];
+        for _ in 0..5 {
+            file.write_all(&filler).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        file.flush().unwrap();
+        drop(file);
+
+        assert!(fs::metadata(&session).unwrap().len() > 32 * 1024 * 1024);
+        assert_eq!(
+            persisted_plan_handoff_decision(&session, "call_handoff", 100).unwrap(),
+            PersistedPlanHandoffDecision::Keep,
+        );
+    }
+
+    #[test]
+    fn busy_plan_handoff_attestation_is_bound_to_the_exact_runtime_generation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let session = temporary.path().join("session.jsonl");
+        let session_text = session.to_string_lossy().into_owned();
+        let mut active = info("conversation", Some(&session_text));
+        active.pid = 42;
+        active.started_at = 100;
+        active.session_id = Some("session-id".to_string());
+        active.runtime_mode = AgentRuntimeMode::Plan;
+        let attestation = PlanHandoffAttestation {
+            subject: PlanHandoffRuntimeSubject {
+                handoff_id: "call_handoff".to_string(),
+                owner: "main".to_string(),
+                pid: 42,
+                started_at: 100,
+                session_path: session,
+                session_id: Some("session-id".to_string()),
+            },
+            _decision: PersistedPlanHandoffDecision::Apply,
+        };
+
+        assert!(attestation.still_matches(
+            &active,
+            Some("main"),
+            "main",
+            Some(AgentRuntimeMode::Normal),
+            "call_handoff",
+        ));
+        for changed in [
+            RunningAgentInfo {
+                pid: 43,
+                ..active.clone()
+            },
+            RunningAgentInfo {
+                started_at: 101,
+                ..active.clone()
+            },
+            RunningAgentInfo {
+                session_id: Some("other-session".to_string()),
+                ..active.clone()
+            },
+            RunningAgentInfo {
+                session_path: Some(
+                    temporary
+                        .path()
+                        .join("other.jsonl")
+                        .to_string_lossy()
+                        .into(),
+                ),
+                ..active.clone()
+            },
+            RunningAgentInfo {
+                runtime_mode: AgentRuntimeMode::Normal,
+                ..active.clone()
+            },
+        ] {
+            assert!(!attestation.still_matches(
+                &changed,
+                Some("main"),
+                "main",
+                Some(AgentRuntimeMode::Normal),
+                "call_handoff",
+            ));
+        }
+        assert!(!attestation.still_matches(
+            &active,
+            Some("other-window"),
+            "main",
+            Some(AgentRuntimeMode::Normal),
+            "call_handoff",
+        ));
+    }
 
     fn info(conversation_id: &str, session_path: Option<&str>) -> RunningAgentInfo {
         RunningAgentInfo {
@@ -4730,7 +6097,300 @@ mod tests {
     }
 
     #[test]
-    fn pending_extension_dialogs_are_bounded_replaced_and_terminally_cleared() {
+    fn interactive_events_attest_the_native_runtime_mode_to_the_renderer() {
+        let event = serde_json::to_value(AgentLineEvent {
+            conversation_id: "conversation-1".to_string(),
+            line: r#"{"type":"extension_ui_request","id":"plan-1"}"#.to_string(),
+            runtime_mode: Some(AgentRuntimeMode::Plan),
+        })
+        .expect("serialize native event");
+        assert_eq!(event.get("runtimeMode"), Some(&json!("plan")));
+    }
+
+    #[test]
+    fn plan_recovery_replays_only_the_exact_durable_call_and_never_aborts_a_conflict() {
+        let request = |id: &str, tool_call_id: &str| {
+            let token = URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&json!({
+                    "v": 1,
+                    "kind": "review",
+                    "planId": tool_call_id,
+                    "title": "Implementation plan",
+                }))
+                .expect("Plan marker"),
+            );
+            PendingExtensionUiRecord {
+                id: id.to_string(),
+                line: json!({
+                    "type": "extension_ui_request",
+                    "id": id,
+                    "method": "select",
+                    "title": format!("prime-orbit-plan-ui:v1:{token}\nPlan ready"),
+                    "options": ["Apply", "Keep", "Revise"],
+                })
+                .to_string(),
+            }
+        };
+        let current = request("request-current", "call-current");
+        assert!(matches!(
+            pending_plan_recovery_match(std::slice::from_ref(&current), "call-current"),
+            PendingPlanRecoveryMatch::Exact(record) if record.id == "request-current"
+        ));
+        assert_eq!(
+            pending_plan_recovery_match(std::slice::from_ref(&current), "call-stale"),
+            PendingPlanRecoveryMatch::Conflict,
+            "a newer live dialog must block recovery of a stale transcript call",
+        );
+        assert_eq!(
+            pending_plan_recovery_match(&[], "call-current"),
+            PendingPlanRecoveryMatch::Absent,
+        );
+    }
+
+    #[test]
+    fn inline_plan_revision_response_requires_the_exact_capability_and_plan_call() {
+        let plan_id = "plan-call-1";
+        let title_token = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "v": 1,
+                "kind": "review",
+                "planId": plan_id,
+                "title": "Implementation plan",
+                "revisionResponse": PLAN_INLINE_REVISION_PROTOCOL,
+            }))
+            .unwrap(),
+        );
+        let request = PendingExtensionUiRecord {
+            id: "request-1".to_string(),
+            line: json!({
+                "type": "extension_ui_request",
+                "id": "request-1",
+                "method": "select",
+                "title": format!("prime-orbit-plan-ui:v1:{title_token}\nPlan ready"),
+                "options": ["Apply", "Keep", "Revise"],
+            })
+            .to_string(),
+        };
+        let pending = vec![request.clone()];
+        let event: Value = serde_json::from_str(&request.line).unwrap();
+        assert_eq!(
+            trusted_inline_plan_review_id(&event).as_deref(),
+            Some(plan_id)
+        );
+
+        let exact_option = json!({
+            "type": "extension_ui_response",
+            "id": "request-1",
+            "value": "Apply",
+        });
+        assert_eq!(
+            validated_pending_extension_ui_response_position(&pending, &exact_option).unwrap(),
+            0
+        );
+        let cancelled = json!({
+            "type": "extension_ui_response",
+            "id": "request-1",
+            "cancelled": true,
+        });
+        assert_eq!(
+            validated_pending_extension_ui_response_position(&pending, &cancelled).unwrap(),
+            0
+        );
+
+        let revision_token = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "v": 1,
+                "kind": "review-decision",
+                "planId": plan_id,
+                "decision": "revise",
+                "feedback": "Split the rollout into two phases.",
+            }))
+            .unwrap(),
+        );
+        let inline_revision = json!({
+            "type": "extension_ui_response",
+            "id": "request-1",
+            "value": format!("{PLAN_REVIEW_RESPONSE_PREFIX}{revision_token}"),
+        });
+        assert_eq!(
+            validated_pending_extension_ui_response_position(&pending, &inline_revision).unwrap(),
+            0
+        );
+
+        let mismatched_token = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "v": 1,
+                "kind": "review-decision",
+                "planId": "another-plan-call",
+                "decision": "revise",
+                "feedback": "Change it.",
+            }))
+            .unwrap(),
+        );
+        let mismatch = json!({
+            "type": "extension_ui_response",
+            "id": "request-1",
+            "value": format!("{PLAN_REVIEW_RESPONSE_PREFIX}{mismatched_token}"),
+        });
+        assert!(validated_pending_extension_ui_response_position(&pending, &mismatch).is_err());
+        assert_eq!(
+            pending,
+            vec![request],
+            "a rejected answer must not consume the pending UUID"
+        );
+    }
+
+    #[test]
+    fn extension_select_rejects_foreign_or_malformed_inline_revision_envelopes() {
+        let generic = PendingExtensionUiRecord {
+            id: "generic-1".to_string(),
+            line: json!({
+                "type": "extension_ui_request",
+                "id": "generic-1",
+                "method": "select",
+                "title": "Generic selector",
+                "options": ["A", "B"],
+            })
+            .to_string(),
+        };
+        let off_option = json!({
+            "type": "extension_ui_response",
+            "id": "generic-1",
+            "value": "C",
+        });
+        assert!(validated_pending_extension_ui_response_position(
+            std::slice::from_ref(&generic),
+            &off_option,
+        )
+        .is_err());
+
+        let make_plan_request = |revision_response: Option<&str>, extra_title_field: bool| {
+            let mut title_payload = json!({
+                "v": 1,
+                "kind": "review",
+                "planId": "plan-call-1",
+                "title": "Implementation plan",
+            });
+            if let Some(value) = revision_response {
+                title_payload["revisionResponse"] = json!(value);
+            }
+            if extra_title_field {
+                title_payload["unexpected"] = json!(true);
+            }
+            let token = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&title_payload).unwrap());
+            PendingExtensionUiRecord {
+                id: "plan-1".to_string(),
+                line: json!({
+                    "type": "extension_ui_request",
+                    "id": "plan-1",
+                    "method": "select",
+                    "title": format!("prime-orbit-plan-ui:v1:{token}\nPlan ready"),
+                    "options": ["Apply", "Keep", "Revise"],
+                })
+                .to_string(),
+            }
+        };
+        let make_response = |body: Value| {
+            let token = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&body).unwrap());
+            json!({
+                "type": "extension_ui_response",
+                "id": "plan-1",
+                "value": format!("{PLAN_REVIEW_RESPONSE_PREFIX}{token}"),
+            })
+        };
+        let valid_body = json!({
+            "v": 1,
+            "kind": "review-decision",
+            "planId": "plan-call-1",
+            "decision": "revise",
+            "feedback": "Make the verification explicit.",
+        });
+
+        for request in [
+            make_plan_request(None, false),
+            make_plan_request(Some("foreign-protocol"), false),
+            make_plan_request(Some(PLAN_INLINE_REVISION_PROTOCOL), true),
+        ] {
+            let pending = vec![request.clone()];
+            assert!(validated_pending_extension_ui_response_position(
+                &pending,
+                &make_response(valid_body.clone()),
+            )
+            .is_err());
+            assert_eq!(pending, vec![request]);
+        }
+
+        let request = make_plan_request(Some(PLAN_INLINE_REVISION_PROTOCOL), false);
+        let invalid_bodies = [
+            json!({
+                "v": 1,
+                "kind": "review-decision",
+                "planId": "plan-call-1",
+                "decision": "revise",
+                "feedback": "",
+            }),
+            json!({
+                "v": 1,
+                "kind": "review-decision",
+                "planId": "plan-call-1",
+                "decision": "apply",
+                "feedback": "Change it.",
+            }),
+            json!({
+                "v": 1,
+                "kind": "review-decision",
+                "planId": "plan-call-1",
+                "decision": "revise",
+                "feedback": "Change it.",
+                "unexpected": true,
+            }),
+            json!({
+                "v": 1,
+                "kind": "review-decision",
+                "planId": "plan-call-1",
+                "decision": "revise",
+                "feedback": "x".repeat(4_097),
+            }),
+        ];
+        for body in invalid_bodies {
+            let pending = vec![request.clone()];
+            assert!(validated_pending_extension_ui_response_position(
+                &pending,
+                &make_response(body),
+            )
+            .is_err());
+            assert_eq!(pending, vec![request.clone()]);
+        }
+
+        for value in [
+            format!("{PLAN_REVIEW_RESPONSE_PREFIX}not+base64"),
+            format!("{PLAN_REVIEW_RESPONSE_PREFIX}{}", "A".repeat(32_769)),
+        ] {
+            let pending = vec![request.clone()];
+            let response = json!({
+                "type": "extension_ui_response",
+                "id": "plan-1",
+                "value": value,
+            });
+            assert!(validated_pending_extension_ui_response_position(&pending, &response).is_err());
+            assert_eq!(pending, vec![request.clone()]);
+        }
+    }
+
+    #[test]
+    fn plan_recovery_status_uses_the_frontend_wire_names() {
+        assert_eq!(
+            serde_json::to_value(PlanDialogRecoveryStatus::Replayed).unwrap(),
+            json!("replayed"),
+        );
+        assert_eq!(
+            serde_json::to_value(PlanDialogRecoveryStatus::AbortSent).unwrap(),
+            json!("abortSent"),
+        );
+    }
+
+    #[test]
+    fn pending_extension_dialogs_are_bounded_replaced_and_exactly_completed() {
         let select = br#"{"type":"extension_ui_request","id":"request-1","method":"select"}"#;
         assert_eq!(
             parsed_extension_ui_request(select),
@@ -4750,6 +6410,30 @@ mod tests {
         assert!(is_plan_review_request(
             &serde_json::from_slice::<Value>(plan).unwrap()
         ));
+
+        let mut live_plan_requests = vec![PendingExtensionUiRecord {
+            id: "plan-1".to_string(),
+            line: String::from_utf8(plan.to_vec()).unwrap(),
+        }];
+        assert!(!remove_completed_plan_ui_requests(
+            &mut live_plan_requests,
+            br#"{"type":"agent_end"}"#,
+        ));
+        assert!(!remove_completed_plan_ui_requests(
+            &mut live_plan_requests,
+            br#"{"type":"turn_error","error":"stale terminal"}"#,
+        ));
+        assert_eq!(live_plan_requests.len(), 1);
+        assert!(!remove_completed_plan_ui_requests(
+            &mut live_plan_requests,
+            br#"{"type":"tool_execution_end","toolCallId":"other-tool","toolName":"prime_orbit_plan_submit","isError":false}"#,
+        ));
+        assert_eq!(live_plan_requests.len(), 1);
+        assert!(remove_completed_plan_ui_requests(
+            &mut live_plan_requests,
+            br#"{"type":"tool_execution_end","toolCallId":"tool-1","toolName":"prime_orbit_plan_submit","isError":false}"#,
+        ));
+        assert!(live_plan_requests.is_empty());
 
         let mut pending = Vec::new();
         cache_pending_extension_ui_request(
@@ -4782,19 +6466,10 @@ mod tests {
             pending.last().map(|request| request.id.as_str()),
             Some("request-32")
         );
-        assert!(terminal_clears_pending_extension_ui(
-            br#"{"type":"agent_end"}"#
-        ));
-        assert!(terminal_clears_pending_extension_ui(
-            br#"{"type":"turn_error"}"#
-        ));
-        assert!(!terminal_clears_pending_extension_ui(
-            br#"{"type":"message_end"}"#
-        ));
     }
 
     #[test]
-    fn pending_extension_dialogs_survive_only_an_exact_session_reattach() {
+    fn persisted_extension_dialogs_are_discarded_before_a_new_rpc_process() {
         let temporary = tempfile::tempdir().unwrap();
         let app_data_dir = dunce::canonicalize(temporary.path()).unwrap();
         let session_path = temporary.path().join("session.jsonl");
@@ -4812,23 +6487,11 @@ mod tests {
             &requests,
         )
         .unwrap();
-        assert_eq!(
-            load_pending_extension_ui_store(
-                &app_data_dir,
-                "conversation-1",
-                &session_path,
-                Some("session-1"),
-            ),
-            requests
-        );
+        let store_path = pending_extension_ui_store_path(&app_data_dir, "conversation-1").unwrap();
+        assert!(store_path.is_file());
 
-        assert!(load_pending_extension_ui_store(
-            &app_data_dir,
-            "conversation-1",
-            &session_path,
-            Some("another-session"),
-        )
-        .is_empty());
+        discard_pending_extension_ui_store_for_new_rpc(&app_data_dir, "conversation-1");
+        assert!(!store_path.exists());
     }
 
     #[test]
@@ -5858,6 +7521,9 @@ mod tests {
     #[test]
     fn plan_runtime_launch_isolated_to_the_embedded_tools_and_extension() {
         let extension = Path::new(r"C:\Orbit Runtime\prime-orbit-plan-mode.ts");
+        let daemon_socket = Path::new(
+            r"\\.\pipe\prime-orbit-daemon-prime-agent-v0.8.0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
         let arguments = rpc_launch_arguments(
             None,
             None,
@@ -5866,7 +7532,7 @@ mod tests {
             Some("A normal-runtime prompt must be ignored."),
             AgentRuntimeMode::Plan,
             Some(extension),
-            None,
+            Some(daemon_socket),
         )
         .into_iter()
         .map(|value| value.to_string_lossy().into_owned())
@@ -5885,9 +7551,89 @@ mod tests {
                 "prime_orbit_plan_inspect,prime_orbit_plan_question,prime_orbit_plan_submit",
                 "--extension",
                 r"C:\Orbit Runtime\prime-orbit-plan-mode.ts",
+                "--daemon-socket",
+                r"\\.\pipe\prime-orbit-daemon-prime-agent-v0.8.0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ]
         );
         assert!(!arguments.iter().any(|argument| argument == "ipython"));
+    }
+
+    #[test]
+    fn plan_runtime_falls_back_to_the_private_daemon_without_programmatic_entries() {
+        let generation = "prime-agent-v0.7.4-4a6f213a1ed44889a0f0b40ea4774f3d";
+        let launch = source_launch_spec(generation, true);
+        let normal_socket = rpc_daemon_socket_for_mode(&launch, AgentRuntimeMode::Normal)
+            .expect("normal runtime socket")
+            .expect("managed normal runtime must use its generation daemon");
+        assert!(normal_socket.to_string_lossy().contains(generation));
+        let plan_socket = rpc_daemon_socket_for_mode(&launch, AgentRuntimeMode::Plan)
+            .expect("Plan runtime socket")
+            .expect("managed Plan runtime must use Orbit's generation daemon");
+        assert_eq!(plan_socket, normal_socket);
+        assert_ne!(plan_socket, PathBuf::from(r"\\.\pipe\prime-agent-daemon"));
+    }
+
+    #[test]
+    fn plan_runtime_uses_the_native_process_local_extension_factory_when_available() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_dir = temporary
+            .path()
+            .join("prime-agent-v0.8.0-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let agent_index = source_dir.join("packages/coding-agent/dist/index.js");
+        fs::create_dir_all(agent_index.parent().unwrap()).unwrap();
+        fs::write(&agent_index, "export async function main() {}\n").unwrap();
+        let launch = LaunchSpec::Source {
+            node: PathBuf::from("node"),
+            cli: source_dir.join("packages/coding-agent/dist/bundle/cli.js"),
+            source_dir: source_dir.clone(),
+            managed: true,
+        };
+
+        let runtime = process_local_plan_runtime(&launch)
+            .expect("attested process-local runtime")
+            .expect("programmatic Prime Agent entries");
+        assert_eq!(
+            runtime.source_dir,
+            dunce::canonicalize(&source_dir).unwrap()
+        );
+        assert_eq!(
+            runtime.agent_index,
+            dunce::canonicalize(&agent_index).unwrap()
+        );
+        assert_eq!(
+            rpc_daemon_socket_for_mode(&launch, AgentRuntimeMode::Plan).unwrap(),
+            None,
+            "a process-local extension factory must bypass the daemon transport",
+        );
+        assert!(
+            rpc_daemon_socket_for_mode(&launch, AgentRuntimeMode::Normal)
+                .unwrap()
+                .is_some(),
+            "normal sessions must retain the managed generation daemon",
+        );
+
+        let extension = source_dir.join("prime-orbit-plan-mode.ts");
+        let arguments = rpc_launch_arguments(
+            None,
+            None,
+            None,
+            None,
+            None,
+            AgentRuntimeMode::Plan,
+            Some(&extension),
+            rpc_daemon_socket_for_mode(&launch, AgentRuntimeMode::Plan)
+                .unwrap()
+                .as_deref(),
+        )
+        .into_iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+        assert!(arguments
+            .windows(2)
+            .any(|pair| { pair[0] == "--extension" && pair[1] == extension.to_string_lossy() }));
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument == "--daemon-socket"));
     }
 
     fn source_launch_spec(name: &str, managed: bool) -> LaunchSpec {

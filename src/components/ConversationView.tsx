@@ -82,9 +82,13 @@ import {
 import {
   EMPTY_PLAN_MODE,
   decodePlanUiRequestTitle,
+  encodePlanInlineRevisionResponse,
+  PLAN_INLINE_REVISION_PROTOCOL,
   normalizePlanDocument,
   recoverablePlanDialogKind,
   resolvePlanState,
+  type PlanDocument,
+  type PlanReviewDecision,
   unresolvedPlanDialogSummary,
 } from "../lib/plan-mode";
 import { useDismissableLayer } from "../hooks/useDismissableLayer";
@@ -147,6 +151,7 @@ interface ConversationViewProps {
   changes: GitChange[];
   resourceReloadSupported: boolean;
   planRequest?: PendingExtensionUiRequest;
+  isPlanRequestReplayPending?: boolean;
   onPlanMode: (mode: "normal" | "plan") => Promise<void>;
   onRetryPlanFinalization: (conversationId: string) => Promise<void>;
   onRecoverPlanDialogs: () => Promise<void>;
@@ -369,7 +374,7 @@ export function continueComposerMarkdownList(
 }
 
 export function ConversationView(props: ConversationViewProps) {
-  const { project, conversation, models, favoriteModels, commands, stats, sessionState, goalMutation, isCompacting: runtimeCompacting = false, isRefining = false, refinements, harnessEntries, schedules = [], heartbeat, heartbeats = [], subagents = [], observedSubagent, inspectorOpen, changes, resourceReloadSupported, planRequest, onPlanMode, onRetryPlanFinalization, onRecoverPlanDialogs, onAnswerPlanRequest, onToggleInspector, onDraftChange, onSend, onRetryMessage, onAbort, onModel, onToggleFavoriteModel, onThinking, onRunCommand, onObserveSubagent, onForkMessage, onCloneSession, onNewWindow, onOpenTerminal } = props;
+  const { project, conversation, models, favoriteModels, commands, stats, sessionState, goalMutation, isCompacting: runtimeCompacting = false, isRefining = false, refinements, harnessEntries, schedules = [], heartbeat, heartbeats = [], subagents = [], observedSubagent, inspectorOpen, changes, resourceReloadSupported, planRequest, isPlanRequestReplayPending = false, onPlanMode, onRetryPlanFinalization, onRecoverPlanDialogs, onAnswerPlanRequest, onToggleInspector, onDraftChange, onSend, onRetryMessage, onAbort, onModel, onToggleFavoriteModel, onThinking, onRunCommand, onObserveSubagent, onForkMessage, onCloneSession, onNewWindow, onOpenTerminal } = props;
   const { language } = useI18n();
   const isCompacting = runtimeCompacting || Boolean(sessionState?.isCompacting);
   const isRunning = !isCompacting && isConversationTurnActive(conversation.status);
@@ -387,10 +392,15 @@ export function ConversationView(props: ConversationViewProps) {
   const [planRecoveryError, setPlanRecoveryError] = useState<string>();
   const unresolvedPlanDialogs = unresolvedPlanDialogSummary(conversation);
   const recoverablePlanDialog = recoverablePlanDialogKind(conversation);
-  const expectsPlanDialog = !planRequest
-    && (isRunning || conversation.status === "starting")
-    && Boolean(recoverablePlanDialog)
-    && (conversationPlan.phase === "planning" || conversationPlan.phase === "question" || conversationPlan.phase === "review");
+  const expectsPlanDialog = shouldShowMissingPlanDialog({
+    hasLiveRequest: Boolean(planRequest),
+    hasUnresolvedTranscript: unresolvedPlanDialogs.total > 0,
+    status: conversation.status,
+    recoverableKind: recoverablePlanDialog,
+    phase: conversationPlan.phase,
+    isCompacting,
+    nativeProbePending: isPlanRequestReplayPending,
+  });
   // Draft persistence updates the parent conversation object while the user is
   // typing. Stable event bridges let the transcript ignore those updates
   // without retaining callbacks that captured an older conversation.
@@ -480,7 +490,7 @@ export function ConversationView(props: ConversationViewProps) {
         {showActiveRun ? <ActiveRunBar conversation={conversation} onAbort={onAbort} onActivity={() => { setInspectorTab("activity"); if (!inspectorOpen) onToggleInspector(); }} /> : null}
         {isCompacting ? <CompactionStatusBar /> : null}
         {isRefining ? <RefinementStatusBar /> : null}
-        {planRequest ? (
+        {shouldShowLivePlanRequest(planRequest, conversation.pendingPlanAction) ? (
           <PlanInteractionCard
             key={planRequest.requestKey}
             request={planRequest}
@@ -740,11 +750,18 @@ const Transcript = memo(function Transcript({ conversation, project, onSuggestio
   const visibleConversationId = useRef(conversation.id);
   const [atBottom, setAtBottom] = useState(true);
   const [linkError, setLinkError] = useState<string>();
+  const [stateRefreshBusy, setStateRefreshBusy] = useState(false);
   const messages = useMemo(
-    () => conversation.messages.filter((message) => !message.queueDelivery),
+    () => conversation.messages.filter((message) => !message.queueDelivery && !message.internal),
     [conversation.messages],
   );
   const entries = useMemo(() => buildTranscriptEntries(messages), [messages]);
+  const retrySourceMessageId = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index]?.role === "assistant") return messages[index].id;
+    }
+    return undefined;
+  }, [messages]);
   const isHistoryLoading = messages.length === 0 && conversation.status === "starting";
 
   useLayoutEffect(() => {
@@ -757,6 +774,7 @@ const Transcript = memo(function Transcript({ conversation, project, onSuggestio
     if (changed) {
       setAtBottom(true);
       setLinkError(undefined);
+      setStateRefreshBusy(false);
     }
   }, [conversation.id]);
 
@@ -807,6 +825,18 @@ const Transcript = memo(function Transcript({ conversation, project, onSuggestio
     }
   }, [language, project.path]);
 
+  const refreshRuntimeState = useCallback(async () => {
+    if (stateRefreshBusy) return;
+    setStateRefreshBusy(true);
+    try {
+      await onRunCommand("get_state");
+    } catch {
+      // The runtime projects the native diagnostic onto the conversation.
+    } finally {
+      setStateRefreshBusy(false);
+    }
+  }, [onRunCommand, stateRefreshBusy]);
+
   return (
     <div className="transcript-viewport" ref={viewport} onScroll={handleScroll}>
       {isHistoryLoading ? (
@@ -823,7 +853,7 @@ const Transcript = memo(function Transcript({ conversation, project, onSuggestio
             : <AssistantTurn key={entry.id} messages={entry.messages} onOpenLink={openTranscriptLink} onRetryMessage={onRetryMessage} onForkMessage={onForkMessage} />)}
           {linkError ? <div className="transcript-link-error" role="alert"><CircleAlert size={15} /><span>{linkError}</span><IconButton label={bi(language, "Fermer l’erreur", "Dismiss error")} onClick={() => setLinkError(undefined)}><X size={14} /></IconButton></div> : null}
           {conversation.lastError ? (
-            <div className="inline-error"><Info size={17} /><div><strong>{bi(language, "Prime Agent a besoin d’attention", "Prime Agent needs attention")}</strong><p>{conversation.lastError}</p></div><Button variant="ghost" onClick={() => void onRunCommand("get_state")}>{bi(language, "Réessayer", "Retry")}</Button></div>
+            <div className="inline-error"><Info size={17} /><div><strong>{bi(language, "Prime Agent a besoin d’attention", "Prime Agent needs attention")}</strong><p>{conversation.lastError}</p></div>{retrySourceMessageId ? <Button variant="ghost" onClick={() => void onRetryMessage(retrySourceMessageId)}>{bi(language, "Réutiliser la demande", "Reuse request")}</Button> : null}<Button variant="ghost" loading={stateRefreshBusy} onClick={() => void refreshRuntimeState()}>{bi(language, "Actualiser l’état", "Refresh state")}</Button></div>
           ) : null}
         </div>
       )}
@@ -888,8 +918,21 @@ export function ReadOnlyTranscript({ messages, sessionId }: { messages: ChatMess
 
 function ConversationLoadError({ conversation, onRetry }: { conversation: Conversation; onRetry: () => Promise<void> }) {
   const { language } = useI18n();
+  const [busy, setBusy] = useState(false);
   const titleId = `conversation-load-error-title-${conversation.id}`;
   const detailId = `conversation-load-error-detail-${conversation.id}`;
+
+  const retry = useCallback(async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await onRetry();
+    } catch {
+      // The runtime keeps the native load error visible on the conversation.
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, onRetry]);
 
   return (
     <section className="conversation-load-error" role="alert" aria-live="assertive" aria-atomic="true" aria-labelledby={titleId} aria-describedby={detailId}>
@@ -900,7 +943,7 @@ function ConversationLoadError({ conversation, onRetry }: { conversation: Conver
           <h2 id={titleId}>{bi(language, "Impossible de charger cette conversation", "Unable to load this conversation")}</h2>
           <p>{bi(language, "Prime Agent n’a pas pu restaurer l’historique. Vous pouvez relancer le chargement sans créer une nouvelle conversation.", "Prime Agent could not restore the history. You can retry loading without creating a new conversation.")}</p>
           <p className="conversation-load-error-detail" id={detailId}>{conversation.lastError}</p>
-          <Button variant="secondary" onClick={() => { void onRetry().catch(() => undefined); }}><RefreshCw size={14} />{bi(language, "Relancer le chargement", "Retry loading")}</Button>
+          <Button variant="secondary" loading={busy} onClick={() => void retry()}>{busy ? null : <RefreshCw size={14} />}{bi(language, "Relancer le chargement", "Retry loading")}</Button>
         </div>
       </div>
     </section>
@@ -983,6 +1026,19 @@ const ConversationMarkdown = memo(function ConversationMarkdown({ content, onOpe
   }}>{content}</ReactMarkdown>;
 });
 
+/**
+ * A Plan decision is written to the native request before its durable tool
+ * result reaches JSONL. During that short acknowledgement window the Plan
+ * state has already moved on from `review`, but the still-owned request card
+ * must keep rendering the exact document the user decided on.
+ */
+export function planReviewDisplayDocument(
+  current: PlanDocument | undefined,
+  retained: PlanDocument | undefined,
+): PlanDocument | undefined {
+  return current ?? retained;
+}
+
 function PlanInteractionCard({
   request,
   conversation,
@@ -1001,14 +1057,25 @@ function PlanInteractionCard({
   const [selected, setSelected] = useState<string>();
   const [customAnswer, setCustomAnswer] = useState(request.prefill ?? "");
   const [busy, setBusy] = useState(false);
+  const [busyDecision, setBusyDecision] = useState<PlanReviewDecision>();
+  const [revisionEditorOpen, setRevisionEditorOpen] = useState(false);
+  const [revisionFeedback, setRevisionFeedback] = useState("");
+  const [retainedPlanDocument, setRetainedPlanDocument] = useState<PlanDocument | undefined>(planState.document);
   const [error, setError] = useState<string>();
 
   useEffect(() => {
     setSelected(undefined);
     setCustomAnswer(request.prefill ?? "");
     setBusy(false);
+    setBusyDecision(undefined);
+    setRevisionEditorOpen(false);
+    setRevisionFeedback("");
     setError(undefined);
   }, [request.id, request.prefill]);
+
+  useEffect(() => {
+    if (planState.document) setRetainedPlanDocument(planState.document);
+  }, [planState.document]);
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
@@ -1045,30 +1112,67 @@ function PlanInteractionCard({
     );
   }
 
-  const answer = async (response: Record<string, unknown>) => {
+  const answer = async (response: Record<string, unknown>, decision?: PlanReviewDecision) => {
     if (busy) return;
     setBusy(true);
+    setBusyDecision(decision);
     setError(undefined);
     try {
       await onAnswer(request, response);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
       setBusy(false);
+      setBusyDecision(undefined);
     }
   };
 
   if (decoded.payload.kind === "review") {
-    const document = planState.document;
+    const planId = decoded.payload.planId;
+    const document = planReviewDisplayDocument(planState.document, retainedPlanDocument);
     const choices = request.options ?? [];
+    const supportsInlineRevision = decoded.payload.revisionResponse === PLAN_INLINE_REVISION_PROTOCOL;
+    const canSubmitRevision = revisionFeedback.trim().length > 0;
     const decide = (index: number) => {
       const value = choices[index];
-      if (value) void answer({ value });
+      if (!value) return;
+      const decision = (["apply", "keep", "revise"] as const)[index];
+      if (!decision) return;
+      void answer({ value }, decision);
     };
+    const revise = () => {
+      if (!supportsInlineRevision) {
+        decide(2);
+        return;
+      }
+      setError(undefined);
+      setRevisionEditorOpen(true);
+    };
+    const submitRevision = () => {
+      const value = encodePlanInlineRevisionResponse(planId, revisionFeedback);
+      if (!value) {
+        setError(bi(
+          language,
+          "Décrivez précisément la modification demandée (4 096 caractères maximum).",
+          "Describe the requested change precisely (4,096 characters maximum).",
+        ));
+        return;
+      }
+      void answer({ value }, "revise");
+    };
+    const progress = busyDecision === "revise"
+      ? bi(language, "Envoi de la demande de révision…", "Sending the revision request…")
+      : busyDecision === "keep"
+        ? bi(language, "Enregistrement du plan…", "Saving the plan…")
+        : busyDecision === "apply"
+          ? bi(language, "Application du plan…", "Applying the plan…")
+          : revisionEditorOpen
+            ? bi(language, "Décrivez les modifications à apporter au plan.", "Describe the changes to make to the plan.")
+            : bi(language, "Le plan est prêt. Vérifiez-le avant de choisir la suite.", "The plan is ready. Review it before choosing what happens next.");
     return (
       <section ref={cardRef} className="plan-interaction plan-review" role="region" aria-label={decoded.payload.title} aria-busy={busy} tabIndex={-1}>
         <header className="plan-interaction-header">
           <span className="plan-interaction-icon" aria-hidden="true"><FileText size={18} /></span>
-          <div><strong>{decoded.payload.title}</strong><p>{bi(language, "Le plan est prêt. Vérifiez-le avant de choisir la suite.", "The plan is ready. Review it before choosing what happens next.")}</p></div>
+          <div><strong>{decoded.payload.title}</strong><p aria-live="polite">{progress}</p></div>
           <Badge tone="accent">{bi(language, "Plan", "Plan")}</Badge>
         </header>
         {document ? (
@@ -1078,15 +1182,38 @@ function PlanInteractionCard({
         ) : (
           <p className="plan-interaction-error" role="alert"><CircleAlert size={14} />{bi(language, "Le document est en cours de synchronisation. Réessayez dans un instant.", "The document is still syncing. Try again in a moment.")}</p>
         )}
+        {revisionEditorOpen ? (
+          <label className="plan-custom-answer">
+            <span>{bi(language, "Modifications demandées", "Requested changes")}</span>
+            <textarea
+              autoFocus
+              value={revisionFeedback}
+              maxLength={4_096}
+              rows={4}
+              disabled={busy}
+              onChange={(event) => setRevisionFeedback(event.target.value)}
+              placeholder={bi(language, "Expliquez ce qui doit être corrigé ou approfondi…", "Explain what should be corrected or expanded…")}
+            />
+          </label>
+        ) : null}
         <footer className="plan-review-actions">
           <div className="plan-review-copy">
             <ShieldCheck size={15} />
             <span>{bi(language, "Conserver ou Appliquer enregistre atomiquement dans .prime/plans. Aucun code n’a encore été modifié.", "Keep or Apply saves atomically to .prime/plans. No code has been changed yet.")}</span>
           </div>
           <div>
-            <Button variant="ghost" disabled={busy || !document || !choices[2]} onClick={() => decide(2)}>{bi(language, "Réviser", "Revise")}</Button>
-            <Button variant="secondary" disabled={busy || !document || !choices[1]} onClick={() => decide(1)}>{bi(language, "Conserver", "Keep")}</Button>
-            <Button variant="primary" loading={busy} disabled={!document || !choices[0]} onClick={() => decide(0)}><Play size={14} />{bi(language, "Appliquer le plan", "Apply plan")}</Button>
+            {revisionEditorOpen ? (
+              <>
+                <Button variant="ghost" disabled={busy} onClick={() => { setRevisionEditorOpen(false); setError(undefined); }}>{bi(language, "Retour", "Back")}</Button>
+                <Button variant="primary" loading={busyDecision === "revise"} disabled={busy || !document || !canSubmitRevision} onClick={submitRevision}>{bi(language, "Envoyer la révision", "Send revision")}</Button>
+              </>
+            ) : (
+              <>
+                <Button variant="ghost" loading={busyDecision === "revise"} disabled={busy || !document || !choices[2]} onClick={revise}>{bi(language, "Réviser", "Revise")}</Button>
+                <Button variant="secondary" loading={busyDecision === "keep"} disabled={busy || !document || !choices[1]} onClick={() => decide(1)}>{bi(language, "Conserver", "Keep")}</Button>
+                <Button variant="primary" loading={busyDecision === "apply"} disabled={busy || !document || !choices[0]} onClick={() => decide(0)}><Play size={14} />{bi(language, "Appliquer le plan", "Apply plan")}</Button>
+              </>
+            )}
           </div>
         </footer>
         {error ? <p className="plan-interaction-error" role="alert"><CircleAlert size={14} />{error}</p> : null}
@@ -1167,6 +1294,39 @@ export function agentMessageRelationshipLabel(
  * presented to the composer as active work. */
 export function isConversationTurnActive(status: Conversation["status"]): boolean {
   return status === "streaming" || status === "tool" || status === "queued";
+}
+
+/** A live, native-owned Plan UUID is the only actionable dialog authority.
+ * A persisted handoff is recovery metadata and must never hide a newer native
+ * question or review after HMR, reconnect, or a delayed runtime transition. */
+export function shouldShowLivePlanRequest(
+  request: PendingExtensionUiRequest | undefined,
+  _pendingPlanAction: Conversation["pendingPlanAction"],
+): request is PendingExtensionUiRequest {
+  return Boolean(request);
+}
+
+export function shouldShowMissingPlanDialog(input: {
+  hasLiveRequest: boolean;
+  hasUnresolvedTranscript?: boolean;
+  status: Conversation["status"];
+  recoverableKind?: "question" | "review";
+  phase: "idle" | "planning" | "question" | "review";
+  isCompacting?: boolean;
+  nativeProbePending?: boolean;
+}): boolean {
+  const active = !input.isCompacting
+    && (input.status === "starting" || isConversationTurnActive(input.status));
+  if (input.nativeProbePending) return false;
+  // `planning` only describes Orbit's last accepted local transition. Prime
+  // Agent may already have persisted the next blocking question/review while
+  // the matching native request was lost. The replay probe owns the grace
+  // period; afterwards the exact unresolved transcript call is recoverable.
+  return !input.hasLiveRequest
+    && !input.isCompacting
+    && Boolean(input.recoverableKind)
+    && (Boolean(input.hasUnresolvedTranscript)
+      || (active && (input.phase === "question" || input.phase === "review")));
 }
 
 export function unresolvedPlanQuestionCount(conversation: Pick<Conversation, "messages">): number {

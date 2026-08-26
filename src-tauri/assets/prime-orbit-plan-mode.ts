@@ -48,6 +48,9 @@ export const PLAN_PAYLOAD_VERSION = 1 as const;
 
 /** Prefix of the HTML-comment marker carrying encoded payloads. */
 export const PLAN_PAYLOAD_MARKER_PREFIX = "prime-orbit-plan:v1:";
+export const PLAN_INLINE_REVISION_PROTOCOL = "inline-feedback-v1";
+export const PLAN_REVIEW_RESPONSE_PREFIX = "prime-orbit-plan-review-response:v1:";
+export const PLAN_REVIEW_RESPONSE_TOKEN_MAX_CHARS = 32_768;
 
 /** Machine-readable events emitted into tool results for Orbit to parse. */
 export type PlanQuestionPayload = {
@@ -178,6 +181,7 @@ export interface PlanUiReviewData {
 	kind: "review";
 	planId: string;
 	title: string;
+	revisionResponse?: typeof PLAN_INLINE_REVISION_PROTOCOL;
 }
 
 export type PlanUiData = PlanUiQuestionData | PlanUiCustomData | PlanUiReviewData;
@@ -216,6 +220,9 @@ export function encodePlanUiTitle(data: PlanUiData, humanTitle: string): string 
 			kind: "review",
 			planId: clipText(data.planId, PLAN_UI_LIMITS.idChars),
 			title: clipText(data.title, PLAN_UI_LIMITS.reviewTitleChars),
+			...(data.revisionResponse === PLAN_INLINE_REVISION_PROTOCOL
+				? { revisionResponse: PLAN_INLINE_REVISION_PROTOCOL }
+				: {}),
 		};
 	}
 	const json = JSON.stringify({ ...wire, v: PLAN_PAYLOAD_VERSION });
@@ -278,6 +285,7 @@ function validatePlanUiParsed(parsed: Record<string, unknown>): PlanUiPayload | 
 			|| typeof parsed.title !== "string"
 			|| parsed.title.length === 0
 			|| parsed.title.length > PLAN_UI_LIMITS.reviewTitleChars
+			|| (parsed.revisionResponse !== undefined && parsed.revisionResponse !== PLAN_INLINE_REVISION_PROTOCOL)
 		) {
 			return null;
 		}
@@ -389,6 +397,55 @@ export function normalizeDecision(selected: string | undefined): PlanDecisionPay
 	if (selected === undefined) return "cancelled";
 	const choice = DECISION_CHOICES.find((candidate) => candidate.label === selected);
 	return choice ? choice.decision : "unknown";
+}
+
+export interface PlanInlineRevisionResponse {
+	v: typeof PLAN_PAYLOAD_VERSION;
+	kind: "review-decision";
+	planId: string;
+	decision: "revise";
+	feedback: string;
+}
+
+/** Decodes only Prime Orbit's capability-negotiated single-request Revise
+ * response. The durable Plan tool call id is part of the signed-by-context
+ * envelope and must match the exact submit currently executing. */
+export function decodePlanInlineRevisionResponse(
+	selected: string | undefined,
+	expectedPlanId: string,
+): PlanInlineRevisionResponse | undefined {
+	if (typeof selected !== "string" || !selected.startsWith(PLAN_REVIEW_RESPONSE_PREFIX)) return undefined;
+	const token = selected.slice(PLAN_REVIEW_RESPONSE_PREFIX.length);
+	if (
+		token.length < 1
+		|| token.length > PLAN_REVIEW_RESPONSE_TOKEN_MAX_CHARS
+		|| !/^[A-Za-z0-9_-]+$/.test(token)
+	) return undefined;
+	try {
+		const bytes = Buffer.from(token, "base64url");
+		if (bytes.length > 24_576) return undefined;
+		const parsed: unknown = JSON.parse(bytes.toString("utf8"));
+		if (
+			!isRecord(parsed)
+			|| Object.keys(parsed).length !== 5
+			|| parsed.v !== PLAN_PAYLOAD_VERSION
+			|| parsed.kind !== "review-decision"
+			|| parsed.decision !== "revise"
+			|| parsed.planId !== expectedPlanId
+			|| typeof parsed.feedback !== "string"
+		) return undefined;
+		const feedback = parsed.feedback.trim();
+		if (feedback.length < 1 || feedback.length > MAX_PLAN_CUSTOM_ANSWER_CHARS) return undefined;
+		return {
+			v: PLAN_PAYLOAD_VERSION,
+			kind: "review-decision",
+			planId: expectedPlanId,
+			decision: "revise",
+			feedback,
+		};
+	} catch {
+		return undefined;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,17 +1173,23 @@ export default function primeOrbitPlanMode(pi: ExtensionAPI): void {
 
 			const title = (params.title ?? "").trim() || "Implementation plan";
 			const reviewTitle = encodePlanUiTitle(
-				{ kind: "review", planId: toolCallId, title },
+				{
+					kind: "review",
+					planId: toolCallId,
+					title,
+					revisionResponse: PLAN_INLINE_REVISION_PROTOCOL,
+				},
 				`Plan ready: ${title}. What next?`,
 			);
 			const decisionLabels = composeDecisionLabels();
 			const selected = await ctx.ui.select(reviewTitle, decisionLabels, { signal });
-			if (selected !== undefined && !decisionLabels.includes(selected)) {
+			const inlineRevision = decodePlanInlineRevisionResponse(selected, toolCallId);
+			if (selected !== undefined && !decisionLabels.includes(selected) && !inlineRevision) {
 				throw new Error("review dialog returned a value outside its allowed choices");
 			}
-			let decision = normalizeDecision(selected);
-			let feedback: string | undefined;
-			if (decision === "revise") {
+			let decision = inlineRevision ? "revise" as const : normalizeDecision(selected);
+			let feedback: string | undefined = inlineRevision?.feedback;
+			if (decision === "revise" && !feedback) {
 				const prompt = "What should change in this plan?";
 				const feedbackTitle = encodePlanUiTitle(
 					{ kind: "custom", toolCallId, prompt },

@@ -7,7 +7,7 @@
 //! completed document to Orbit.
 
 use crate::{
-    agents::{attest_plan_document_write, AgentsState},
+    agents::{attest_plan_document_write, attest_recovered_plan_document_write, AgentsState},
     storage::{app_data_dir, write_atomic, write_atomic_new, AtomicCreateResult},
 };
 use parking_lot::Mutex;
@@ -38,6 +38,8 @@ pub(crate) struct WritePlanDocumentInput {
     plan_id: String,
     title: String,
     markdown: String,
+    #[serde(default)]
+    recovered_from_transcript: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -307,19 +309,41 @@ pub(crate) async fn write_plan_document(
     state: tauri::State<'_, PlanDocumentState>,
     input: WritePlanDocumentInput,
 ) -> Result<WritePlanDocumentResult, String> {
-    attest_plan_document_write(
-        agents.inner(),
-        window.label(),
-        &input.conversation_id,
-        &input.request_id,
-        Path::new(&input.project_path),
-    )?;
+    let recovered = if input.recovered_from_transcript {
+        if input.plan_id != input.request_id {
+            return Err(
+                "L’identifiant du plan récupéré ne correspond pas à l’appel Prime Agent."
+                    .to_string(),
+            );
+        }
+        Some(attest_recovered_plan_document_write(
+            agents.inner(),
+            window.label(),
+            &input.conversation_id,
+            &input.request_id,
+            Path::new(&input.project_path),
+        )?)
+    } else {
+        attest_plan_document_write(
+            agents.inner(),
+            window.label(),
+            &input.conversation_id,
+            &input.request_id,
+            &input.plan_id,
+            Path::new(&input.project_path),
+        )?;
+        None
+    };
     let _guard = state.0.lock();
+    let (title, markdown) = recovered
+        .as_ref()
+        .map(|document| (document.title.as_str(), document.markdown.as_str()))
+        .unwrap_or((input.title.as_str(), input.markdown.as_str()));
     write_plan_document_in(
         Path::new(&input.project_path),
         &input.plan_id,
-        &input.title,
-        &input.markdown,
+        title,
+        markdown,
     )
 }
 

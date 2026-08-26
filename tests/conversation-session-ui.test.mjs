@@ -33,8 +33,11 @@ const {
   harnessConfirmationPhrase,
   isConversationMaintenanceBlocked,
   isConversationTurnActive,
+  shouldShowLivePlanRequest,
+  shouldShowMissingPlanDialog,
   unresolvedPlanQuestionCount,
   planModeTransitionError,
+  planReviewDisplayDocument,
   isGoalPanelBusy,
   isRefineControlBusy,
   normalizeLegacyActivity,
@@ -110,6 +113,90 @@ test("connection startup is not presented to the composer as an active turn", ()
   assert.equal(isConversationTurnActive("streaming"), true);
   assert.equal(isConversationTurnActive("tool"), true);
   assert.equal(isConversationTurnActive("queued"), true);
+});
+
+test("does not mislabel an answered Plan question as needing reconnection", () => {
+  assert.equal(shouldShowMissingPlanDialog({
+    hasLiveRequest: false,
+    hasUnresolvedTranscript: true,
+    status: "tool",
+    recoverableKind: "review",
+    phase: "planning",
+    nativeProbePending: true,
+  }), false, "the native replay grace period owns the question-to-review transition");
+  assert.equal(shouldShowMissingPlanDialog({
+    hasLiveRequest: false,
+    hasUnresolvedTranscript: true,
+    status: "tool",
+    recoverableKind: "review",
+    phase: "planning",
+    nativeProbePending: false,
+  }), true, "an exact canonical review remains recoverable after the native probe is exhausted");
+  assert.equal(shouldShowMissingPlanDialog({
+    hasLiveRequest: false,
+    hasUnresolvedTranscript: false,
+    status: "tool",
+    recoverableKind: "question",
+    phase: "question",
+  }), true, "a genuinely lost blocking form remains recoverable");
+  assert.equal(shouldShowMissingPlanDialog({
+    hasLiveRequest: true,
+    hasUnresolvedTranscript: true,
+    status: "tool",
+    recoverableKind: "question",
+    phase: "question",
+  }), false, "the live native form takes precedence over recovery");
+  assert.equal(shouldShowMissingPlanDialog({
+    hasLiveRequest: false,
+    hasUnresolvedTranscript: true,
+    status: "tool",
+    recoverableKind: "review",
+    phase: "review",
+    nativeProbePending: true,
+  }), false, "a bounded native replay probe must finish before recovery is offered");
+});
+
+test("a live native Plan request is never hidden by stale finalization metadata", () => {
+  const request = {
+    id: "native-question",
+    requestKey: "conversation:native-question",
+    conversationId: "conversation",
+    type: "extension_ui_request",
+    method: "select",
+  };
+  assert.equal(shouldShowLivePlanRequest(request, undefined), true);
+  assert.equal(shouldShowLivePlanRequest(request, {
+    decision: "apply",
+    document: { name: "old-plan", markdown: "# Old", round: 1 },
+    relativePath: ".prime/plans/old-plan.md",
+    handoffId: "old-plan-id",
+    stage: "decisionRecorded",
+  }), true);
+  assert.equal(shouldShowLivePlanRequest(undefined, undefined), false);
+});
+
+test("keeps the reviewed Plan document visible while its native decision is being acknowledged", () => {
+  const reviewed = {
+    name: "reviewed-plan",
+    markdown: "# Reviewed plan",
+    round: 2,
+  };
+  const newer = {
+    name: "revised-plan",
+    markdown: "# Revised plan",
+    round: 3,
+  };
+
+  assert.equal(
+    planReviewDisplayDocument(undefined, reviewed),
+    reviewed,
+    "the review-to-planning transition must not replace the document with a false syncing error",
+  );
+  assert.equal(
+    planReviewDisplayDocument(newer, reviewed),
+    newer,
+    "a newly synchronized document remains authoritative",
+  );
 });
 
 test("maintenance stays unavailable while connecting or while a real turn is active", () => {

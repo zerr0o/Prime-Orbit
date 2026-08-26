@@ -18,6 +18,7 @@ const {
   selectSession,
   selectOwnedClientDescriptor,
   shutdownPrimeAgentDaemon,
+  stopOwnedSession,
   validOwnedClientDescriptor,
   validOwnedRequestIdSeed,
   validRequest,
@@ -150,6 +151,7 @@ test("accepts only the bounded native reload action", () => {
   assert.equal(validRequest({ action: "shutdown" }), true);
   assert.equal(validRequest({ action: "shutdown", sessionFile: request.sessionFile }), false);
   assert.equal(validRequest({ ...request, action: "inspect_owned_session" }), true);
+  assert.equal(validRequest({ ...request, action: "stop_owned_session" }), true);
   assert.equal(validRequest({ ...request, action: "prompt" }), false);
   assert.equal(validRequest({ ...request, sessionFile: "" }), false);
   assert.equal(validRequest({ ...request, sessionId: "x".repeat(513) }), false);
@@ -174,6 +176,60 @@ test("detects an exact active owned session without mutating it", async () => {
   assert.deepEqual(commands, [{ type: "list", all: true, includeClientOwned: true }]);
   assert.deepEqual(
     await inspectOwnedSession(client, { ...request, action: "inspect_owned_session" }, hello, undefined),
+    { status: "inactive", supported: true },
+  );
+});
+
+test("stops only the exact client-owned session before process-local Plan resumes it", async () => {
+  const calls = [];
+  let listed = 0;
+  const client = {
+    async request(command, timeoutMs) {
+      calls.push({ command, timeoutMs });
+      if (command.type === "list") {
+        listed += 1;
+        return {
+          success: true,
+          data: {
+            sessions: listed === 1
+              ? [{ ...request, activeSessionId: "owned-active" }]
+              : [],
+          },
+        };
+      }
+      if (command.type === "kill") return { success: true };
+      throw new Error(`unexpected command ${command.type}`);
+    },
+  };
+
+  assert.deepEqual(
+    await stopOwnedSession(
+      client,
+      { ...request, action: "stop_owned_session" },
+      hello,
+      ownedDescriptor,
+      Date.now,
+      async () => undefined,
+    ),
+    { status: "stopped", supported: true },
+  );
+  assert.deepEqual(calls.map(({ command }) => command), [
+    { type: "list", all: true, includeClientOwned: true },
+    { type: "kill", activeSessionId: "owned-active" },
+    { type: "list", all: true, includeClientOwned: true },
+  ]);
+  assert.equal(calls[1].timeoutMs, 10_000);
+});
+
+test("does not send a kill without an exact owned worker descriptor", async () => {
+  const client = { async request() { throw new Error("must not list or kill"); } };
+  assert.deepEqual(
+    await stopOwnedSession(
+      client,
+      { ...request, action: "stop_owned_session" },
+      hello,
+      undefined,
+    ),
     { status: "inactive", supported: true },
   );
 });

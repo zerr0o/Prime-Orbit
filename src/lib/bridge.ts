@@ -24,6 +24,7 @@ import type {
   SavePrimeAgentDefaultsInput,
   SavePrimeAgentDefaultsResult,
   SessionHistoryResult,
+  SessionHistoryStamp,
   ThinkingLevel,
 } from "../types";
 import { defaultAppState, demoAppState, demoDetection } from "./demo";
@@ -126,6 +127,10 @@ export interface RestartAgentResult {
   previousPid: number;
   agent: RunningAgentInfo;
 }
+
+export type PlanDialogRecoveryResult =
+  | { status: "replayed"; request: NativeEventPayload; pid: number; startedAt: number }
+  | { status: "absent" | "busy" | "conflict" | "abortSent"; pid: number; startedAt: number };
 
 export type ReloadAgentResourcesResult =
   | { status: "reloaded"; supported: true }
@@ -312,6 +317,27 @@ export async function listPendingExtensionUiRequests(conversationId: string): Pr
   return invoke<NativeEventPayload[]>("list_pending_extension_ui_requests", { conversationId });
 }
 
+/**
+ * Replays one exact native Plan dialog or, when `abortRequestId` is supplied,
+ * writes abort to the same process generation without a check-then-write gap.
+ */
+export async function reconcilePlanDialogRecovery(input: {
+  conversationId: string;
+  expectedPid: number;
+  expectedStartedAt: number;
+  expectedToolCallId: string;
+  abortRequestId?: string;
+}): Promise<PlanDialogRecoveryResult> {
+  if (!isNative()) {
+    return {
+      status: "absent",
+      pid: input.expectedPid,
+      startedAt: input.expectedStartedAt,
+    };
+  }
+  return invoke<PlanDialogRecoveryResult>("reconcile_plan_dialog_recovery", input);
+}
+
 export type QueueMutationStatus = "applied" | "rejected" | "invalid" | "unsupported" | "inactive";
 export type QueueMutation =
   | { type: "delete" }
@@ -350,9 +376,10 @@ export async function stopAgent(conversationId: string): Promise<void> {
 export async function restartAgent(
   conversationId: string,
   runtimeMode?: AgentRuntimeMode,
+  planHandoffId?: string,
 ): Promise<RestartAgentResult | undefined> {
   if (!isNative()) return undefined;
-  return invoke<RestartAgentResult>("restart_agent", { conversationId, runtimeMode });
+  return invoke<RestartAgentResult>("restart_agent", { conversationId, runtimeMode, planHandoffId });
 }
 
 /**
@@ -396,8 +423,21 @@ export async function loadSessionHistory(
   expectedSessionId: string | undefined,
   projectPath: string,
 ): Promise<SessionHistoryResult> {
-  if (!isNative()) return { messages: [], refinements: [], harnessEntries: [], readOnly: true, truncated: false };
+  if (!isNative()) return { revision: "preview", messages: [], refinements: [], harnessEntries: [], readOnly: true, truncated: false };
   return invoke<SessionHistoryResult>("load_session_history", {
+    sessionPath,
+    expectedSessionId: expectedSessionId ?? null,
+    projectPath,
+  });
+}
+
+export async function getSessionHistoryStamp(
+  sessionPath: string,
+  expectedSessionId: string | undefined,
+  projectPath: string,
+): Promise<SessionHistoryStamp> {
+  if (!isNative()) return { revision: "preview" };
+  return invoke<SessionHistoryStamp>("get_session_history_stamp", {
     sessionPath,
     expectedSessionId: expectedSessionId ?? null,
     projectPath,
@@ -410,7 +450,7 @@ export async function loadCatalogSessionHistory(
   catalogKey: string,
   expectedSessionId: string,
 ): Promise<SessionHistoryResult> {
-  if (!isNative()) return { messages: [], refinements: [], harnessEntries: [], readOnly: true, truncated: false };
+  if (!isNative()) return { revision: "preview", messages: [], refinements: [], harnessEntries: [], readOnly: true, truncated: false };
   return invoke<SessionHistoryResult>("load_catalog_session_history", {
     catalogKey,
     expectedSessionId,
@@ -824,6 +864,9 @@ export interface WritePlanDocumentRequest {
   planId: string;
   title: string;
   markdown: string;
+  /** Requests the stricter session-file attestation used when the transient
+   * extension UI request did not survive a client reconnection. */
+  recoveredFromTranscript?: boolean;
 }
 
 export interface WritePlanDocumentResult {

@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { build } from "esbuild";
 
@@ -22,6 +26,8 @@ const {
   EMPTY_PLAN_MODE,
   PLAN_MODE_DIRECTORY,
   PLAN_PAYLOAD_VERSION,
+  PLAN_INLINE_REVISION_PROTOCOL,
+  PLAN_REVIEW_RESPONSE_PREFIX,
   PLAN_DOCUMENT_MAX_CHARS,
   PLAN_OPTIONS_MAX_COUNT,
   PLAN_REVISION_MAX,
@@ -32,7 +38,11 @@ const {
   TOOL_INPUT_BOUNDS,
   encodePlanUiRequestTitle,
   decodePlanUiRequestTitle,
+  encodePlanInlineRevisionResponse,
+  decodePlanInlineRevisionResponse,
   planUiRequestKind,
+  planUiToolCallId,
+  classifyPlanUiRequest,
   isClaimedPlanUiRequest,
   isInternalPlanUiRequest,
   isTrustedPlanUiRequest,
@@ -51,9 +61,13 @@ const {
   resolvePlanState,
   startPlanMode,
   openPlanQuestion,
+  restorePlanQuestion,
   answerPlanQuestion,
+  rearmPlanModeAfterLostDialog,
   openPlanReview,
+  restorePlanReview,
   decidePlanReview,
+  shouldAwaitPlanToolResult,
   cancelPlanMode,
   reloadPlanMode,
   planNotificationChoice,
@@ -61,6 +75,104 @@ const {
   unresolvedPlanDialogSummary,
   isInternalPlanRecoveryPrompt,
 } = compiledModule.exports;
+
+test("the Plan launcher selects Prime Agent's process-local RPC without rewriting CLI arguments", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "prime-orbit-plan-launcher-"));
+  try {
+    const runtimeDirectory = join(temporary, "runtime");
+    const agentIndex = join(runtimeDirectory, "index.js");
+    mkdirSync(runtimeDirectory, { recursive: true });
+    writeFileSync(join(runtimeDirectory, "package.json"), JSON.stringify({ type: "module" }));
+    writeFileSync(
+      agentIndex,
+      [
+        "export async function main(args, options) {",
+        "  process.stdout.write(JSON.stringify({",
+        "    args,",
+        "    factoryCount: options.extensionFactories.length,",
+        "    factoryType: typeof options.extensionFactories[0],",
+        "  }));",
+        "}",
+      ].join("\n"),
+    );
+    const launcher = resolve("src-tauri/assets/prime-orbit-plan-launcher.mjs");
+    const child = spawnSync(
+      process.execPath,
+      [launcher, "--mode", "rpc", "--extension", "prime-orbit-plan-mode.ts"],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PRIME_ORBIT_AGENT_INDEX_PATH: agentIndex,
+        },
+      },
+    );
+    assert.equal(child.status, 0, child.stderr);
+    assert.deepEqual(JSON.parse(child.stdout), {
+      args: ["--mode", "rpc", "--extension", "prime-orbit-plan-mode.ts"],
+      factoryCount: 1,
+      factoryType: "function",
+    });
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("only a legacy Revise decision hands off to Prime Agent's second feedback input", () => {
+  assert.equal(shouldAwaitPlanToolResult("review", "revise"), false);
+  assert.equal(shouldAwaitPlanToolResult("review", "revise", true), true);
+  assert.equal(shouldAwaitPlanToolResult("review", "apply"), true);
+  assert.equal(shouldAwaitPlanToolResult("review", "keep"), true);
+  assert.equal(shouldAwaitPlanToolResult("question"), true);
+  assert.equal(shouldAwaitPlanToolResult("custom"), true);
+});
+
+test("inline Plan revision responses round-trip exact multiline Unicode feedback", () => {
+  const encoded = encodePlanInlineRevisionResponse("plan-submit-call", "  Corriger l’API 🔁\nPuis retester.  ");
+  assert.ok(encoded?.startsWith(PLAN_REVIEW_RESPONSE_PREFIX));
+  assert.deepEqual(decodePlanInlineRevisionResponse(encoded, "plan-submit-call"), {
+    v: PLAN_PAYLOAD_VERSION,
+    kind: "review-decision",
+    planId: "plan-submit-call",
+    decision: "revise",
+    feedback: "Corriger l’API 🔁\nPuis retester.",
+  });
+  assert.equal(decodePlanInlineRevisionResponse(encoded, "another-call"), undefined);
+});
+
+test("inline Plan revision responses fail closed on malformed or unbounded envelopes", () => {
+  const envelope = (payload) => `${PLAN_REVIEW_RESPONSE_PREFIX}${Buffer.from(JSON.stringify(payload)).toString("base64url")}`;
+  const valid = {
+    v: PLAN_PAYLOAD_VERSION,
+    kind: "review-decision",
+    planId: "plan-submit-call",
+    decision: "revise",
+    feedback: "Change it",
+  };
+  assert.equal(encodePlanInlineRevisionResponse("plan-submit-call", "   "), undefined);
+  assert.equal(encodePlanInlineRevisionResponse("plan-submit-call", "x".repeat(PLAN_TEXT_MAX_CHARS + 1)), undefined);
+  assert.equal(decodePlanInlineRevisionResponse(`${PLAN_REVIEW_RESPONSE_PREFIX}%%%`, "plan-submit-call"), undefined);
+  assert.equal(decodePlanInlineRevisionResponse(envelope({ ...valid, v: 2 }), "plan-submit-call"), undefined);
+  assert.equal(decodePlanInlineRevisionResponse(envelope({ ...valid, decision: "apply" }), "plan-submit-call"), undefined);
+  assert.equal(decodePlanInlineRevisionResponse(envelope({ ...valid, extra: true }), "plan-submit-call"), undefined);
+  assert.equal(decodePlanInlineRevisionResponse(envelope({ ...valid, feedback: "" }), "plan-submit-call"), undefined);
+});
+
+test("a recovered Plan review replaces a stale aborted document", () => {
+  const restored = restorePlanReview({
+    phase: "review",
+    revision: 4,
+    round: 1,
+    document: { name: "old-plan", markdown: "# Old", round: 1 },
+  }, {
+    document: { name: "current-plan", markdown: "# Current" },
+  });
+  assert.equal(restored.status, "accepted");
+  assert.equal(restored.state.phase, "review");
+  assert.equal(restored.state.document.name, "current-plan");
+  assert.equal(restored.state.document.markdown, "# Current");
+  assert.equal(restored.state.revision, 5);
+});
 
 const QUESTION_PROMPT = "Quelle base de données faut-il utiliser ?";
 const QUESTION_PAYLOAD = {
@@ -73,6 +185,56 @@ const QUESTION_PAYLOAD = {
   ],
   allowOther: false,
 };
+
+test("separates transient dialog ids from durable Plan tool-call ids", () => {
+  const question = {
+    type: "extension_ui_request",
+    id: "dialog-question-uuid",
+    method: "select",
+    title: encodePlanUiRequestTitle(QUESTION_PAYLOAD, QUESTION_PROMPT),
+    options: ["PostgreSQL"],
+  };
+  const review = {
+    type: "extension_ui_request",
+    id: "dialog-review-uuid",
+    method: "select",
+    title: encodePlanUiRequestTitle({
+      kind: "review",
+      planId: "plan-submit-call",
+      title: "Implementation plan",
+    }, "Plan ready"),
+    options: ["Apply", "Keep", "Revise"],
+  };
+
+  assert.equal(planUiToolCallId(question), "tool-1");
+  assert.equal(planUiToolCallId(review), "plan-submit-call");
+  assert.notEqual(planUiToolCallId(question), question.id);
+  assert.equal(planUiToolCallId({ ...question, title: "untrusted" }), undefined);
+});
+
+test("review titles negotiate inline revision without trusting foreign capabilities", () => {
+  const title = encodePlanUiRequestTitle({
+    kind: "review",
+    planId: "plan-submit-call",
+    title: "Implementation plan",
+    revisionResponse: PLAN_INLINE_REVISION_PROTOCOL,
+  }, "Plan ready");
+  assert.deepEqual(decodePlanUiRequestTitle(title)?.payload, {
+    v: PLAN_PAYLOAD_VERSION,
+    kind: "review",
+    planId: "plan-submit-call",
+    title: "Implementation plan",
+    revisionResponse: PLAN_INLINE_REVISION_PROTOCOL,
+  });
+
+  const foreign = encodePlanUiRequestTitle({
+    kind: "review",
+    planId: "plan-submit-call",
+    title: "Implementation plan",
+    revisionResponse: "future-protocol",
+  }, "Plan ready");
+  assert.equal(decodePlanUiRequestTitle(foreign), undefined);
+});
 
 function planTitle(payload = QUESTION_PAYLOAD, humanTitle = "question — Choix de base") {
   const title = encodePlanUiRequestTitle(payload, humanTitle);
@@ -102,13 +264,13 @@ test("distinguishes lost Plan questions from a lost review dialog", () => {
   const summary = unresolvedPlanDialogSummary({
     messages: [{
       tools: [
-        { name: "prime_orbit_plan_question", status: "unresolved" },
+        { id: "question-call", name: "prime_orbit_plan_question", status: "unresolved" },
         { name: "prime_orbit_plan_inspect", status: "unresolved" },
       ],
     }, {
       tools: [
         { name: "prime_orbit_plan_question", status: "failed" },
-        { name: "prime_orbit_plan_submit", status: "unresolved" },
+        { id: "review-call", name: "prime_orbit_plan_submit", status: "unresolved" },
       ],
     }],
   });
@@ -117,6 +279,32 @@ test("distinguishes lost Plan questions from a lost review dialog", () => {
     questionCount: 1,
     reviewCount: 1,
     latestKind: "review",
+    latestToolCallId: "review-call",
+  });
+});
+
+test("ignores Plan dialogs superseded by later durable transcript progress", () => {
+  const summary = unresolvedPlanDialogSummary({
+    messages: [
+      {
+        role: "assistant",
+        content: "Plan ready",
+        tools: [{ name: "prime_orbit_plan_submit", status: "unresolved" }],
+      },
+      {
+        role: "user",
+        content: "Implement the accepted plan",
+      },
+      {
+        role: "assistant",
+        content: "I started implementing it.",
+      },
+    ],
+  });
+  assert.deepEqual(summary, {
+    total: 0,
+    questionCount: 0,
+    reviewCount: 0,
   });
 });
 
@@ -199,6 +387,7 @@ test("transitions reject corrupt states instead of guessing", () => {
     assert.equal(result.status, "rejected");
     assert.equal(result.reason, "invalid_state");
     assert.equal(result.state, EMPTY_PLAN_MODE, "corrupt states fail closed to Normal mode");
+    assert.equal(rearmPlanModeAfterLostDialog(garbage, "question").reason, "invalid_state");
   }
   const inherited = Object.create({ phase: "planning", revision: 3 });
   assert.equal(resolvePlanState(inherited), undefined, "prototype-inherited state fields are invisible");
@@ -247,6 +436,44 @@ test("a second question cannot preempt the pending one", () => {
   const second = openPlanQuestion(questioning, { request: planRequest({ id: "req-2" }) });
   assert.equal(second.reason, "duplicate_question");
   assert.equal(second.state, questioning);
+});
+
+test("a live native question can reattach over a stale persisted request id", () => {
+  const stale = openPlanQuestion(startedPlan(), {
+    request: planRequest({ id: "req-before-reload" }),
+  }).state;
+  const restored = restorePlanQuestion(stale, {
+    request: planRequest({ id: "4b5985-live-native" }),
+  });
+
+  assert.equal(restored.status, "accepted");
+  assert.equal(restored.changed, true);
+  assert.equal(restored.state.phase, "question");
+  assert.equal(restored.state.question.requestId, "4b5985-live-native");
+  assert.equal(restored.state.revision, stale.revision + 1);
+  const answered = answerPlanQuestion(restored.state, {
+    requestId: "4b5985-live-native",
+    value: "SQLite",
+  });
+  assert.equal(answered.status, "accepted");
+  assert.equal(answered.state.phase, "planning");
+});
+
+test("reattaching the same native question is idempotent and rejects the wrong phase", () => {
+  const request = planRequest({ id: "req-live" });
+  const questioning = openPlanQuestion(startedPlan(), { request }).state;
+  const replayed = restorePlanQuestion(questioning, { request });
+  assert.equal(replayed.status, "accepted");
+  assert.equal(replayed.changed, false);
+  assert.equal(replayed.state, questioning);
+
+  const reviewing = openPlanReview(startedPlan(), {
+    document: { name: "plan", markdown: "# Plan" },
+  }).state;
+  const wrongPhase = restorePlanQuestion(reviewing, { request });
+  assert.equal(wrongPhase.status, "rejected");
+  assert.equal(wrongPhase.reason, "wrong_phase");
+  assert.equal(wrongPhase.state, reviewing);
 });
 
 test("non-plan requests are classified, and marked-but-malformed ones fail closed", () => {
@@ -323,6 +550,52 @@ test("answers accept exact options, custom input, and cancellation", () => {
   const cancelled = answerPlanQuestion(reaskedAgain, { requestId: "req-3", cancelled: true, value: "ignored" });
   assert.equal(cancelled.status, "accepted");
   assert.deepEqual(cancelled.state, { phase: "planning", revision: 7 });
+});
+
+test("rearms only a matching lost Plan dialog without inventing an answer", () => {
+  const questioning = openPlanQuestion(startedPlan(), { request: planRequest() }).state;
+  const recoveredQuestion = rearmPlanModeAfterLostDialog(questioning, "question");
+  assert.equal(recoveredQuestion.status, "accepted");
+  assert.equal(recoveredQuestion.changed, true);
+  assert.deepEqual(recoveredQuestion.state, { phase: "planning", revision: 3 });
+  assert.equal(questioning.question.requestId, "req-1", "input state stays untouched");
+
+  const review = reviewedPlan().state;
+  const recoveredReview = rearmPlanModeAfterLostDialog(review, "review");
+  assert.equal(recoveredReview.status, "accepted");
+  assert.equal(recoveredReview.changed, true);
+  assert.deepEqual(recoveredReview.state, { phase: "planning", revision: 5, round: 1 });
+  assert.ok(review.document, "input review document stays untouched");
+});
+
+test("lost-dialog recovery is idempotent and rejects mismatched interactions", () => {
+  const idle = { phase: "idle", revision: 8, outcome: "kept", round: 2 };
+  const idleNoOp = rearmPlanModeAfterLostDialog(idle, "review");
+  assert.equal(idleNoOp.status, "accepted");
+  assert.equal(idleNoOp.changed, false);
+  assert.equal(idleNoOp.state, idle);
+
+  const planning = { phase: "planning", revision: 9, round: 2 };
+  const planningNoOp = rearmPlanModeAfterLostDialog(planning, "review");
+  assert.equal(planningNoOp.status, "accepted");
+  assert.equal(planningNoOp.changed, false);
+  assert.equal(planningNoOp.state, planning);
+
+  const questioning = openPlanQuestion(startedPlan(), { request: planRequest() }).state;
+  assert.equal(rearmPlanModeAfterLostDialog(questioning, "review").reason, "wrong_phase");
+  assert.equal(rearmPlanModeAfterLostDialog(reviewedPlan().state, "question").reason, "wrong_phase");
+  assert.equal(rearmPlanModeAfterLostDialog(questioning, "unknown").reason, "invalid_input");
+  assert.equal(
+    rearmPlanModeAfterLostDialog(questioning, "question", { expectedRevision: 99 }).reason,
+    "stale_revision",
+  );
+
+  const ceiling = {
+    phase: "question",
+    revision: PLAN_REVISION_MAX,
+    question: questioning.question,
+  };
+  assert.equal(rearmPlanModeAfterLostDialog(ceiling, "question").reason, "revision_overflow");
 });
 
 test("double responses and stale responses are rejected, never forwarded twice", () => {
@@ -644,6 +917,22 @@ test("internal Plan requests are recognized precisely", () => {
   }
 });
 
+test("classifies Plan UI requests without inventing a cancellation", () => {
+  const validPlanRequest = planRequest();
+  assert.equal(classifyPlanUiRequest(validPlanRequest, "plan"), "accepted");
+  assert.equal(classifyPlanUiRequest(validPlanRequest, undefined), "blocked");
+  assert.equal(classifyPlanUiRequest(validPlanRequest, "normal"), "blocked");
+
+  const malformedReservedRequest = planRequest({
+    title: "prime-orbit-plan-ui:v1:not-base64\nQuestion",
+  });
+  assert.equal(classifyPlanUiRequest(malformedReservedRequest, "plan"), "blocked");
+
+  const genericRequest = planRequest({ title: "Choose an option" });
+  assert.equal(classifyPlanUiRequest(genericRequest, "plan"), "generic");
+  assert.equal(classifyPlanUiRequest(genericRequest, undefined), "generic");
+});
+
 test("notifications fire only for known events while no window is focused", () => {
   assert.deepEqual(planNotificationChoice({ event: "question", focused: false, language: "fr" }), {
     show: true,
@@ -740,6 +1029,7 @@ test("rejected transitions always echo the untouched input state", () => {
     answerPlanQuestion(questioning, { value: "nope" }),
     openPlanReview(questioning, { document: VALID_DOCUMENT }),
     decidePlanReview(questioning, { decision: "apply" }),
+    rearmPlanModeAfterLostDialog(questioning, "review"),
     cancelPlanMode(questioning, { expectedRevision: 41 }),
     reloadPlanMode(questioning, null),
   ];

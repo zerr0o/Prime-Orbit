@@ -14,7 +14,7 @@ use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     sync::Arc,
-    time::SystemTime,
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
@@ -92,13 +92,22 @@ pub struct SessionHarnessEntry {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionHistoryResult {
+    pub revision: String,
     pub messages: Vec<Value>,
     pub refinements: Vec<SessionRefinementRecord>,
     pub harness_entries: Vec<SessionHarnessEntry>,
     pub read_only: bool,
     pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_agent_task_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionHistoryStamp {
+    pub revision: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -568,6 +577,15 @@ impl FileStamp {
             len: metadata.len(),
             modified: metadata.modified().ok(),
         }
+    }
+
+    fn revision(self) -> String {
+        let modified_nanos = self
+            .modified
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        format!("{}:{modified_nanos}", self.len)
     }
 }
 
@@ -1915,6 +1933,39 @@ where
     }
     let parsed = parse_session(path)?;
     let header_warning = validate(&parsed.header, path)?;
+    let active_path = active_path(&parsed.entries)?;
+    let latest_agent_task_state =
+        active_path
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(path_index, index)| {
+                let entry = &parsed.entries[*index];
+                if string_field(&entry.value, "type") != Some("agent_status") {
+                    return None;
+                }
+                let status = entry.value.get("status")?;
+                let has_newer_context = active_path[path_index + 1..].iter().any(|newer_index| {
+                    let newer = &parsed.entries[*newer_index];
+                    match string_field(&newer.value, "type") {
+                        Some("message" | "branch_summary" | "compaction") => true,
+                        Some("custom_message") => {
+                            string_field(&newer.value, "customType") != Some("refinement_outcome")
+                        }
+                        _ => false,
+                    }
+                });
+                if has_newer_context {
+                    return None;
+                }
+                // Prime Agent owns this verdict. basedOnMessageCount describes the
+                // in-memory AgentSession at the instant it was persisted, but
+                // maintenance records may later be appended without mutating that
+                // array. Causal order is therefore the only reconstructible stale
+                // check: a newer context entry invalidates the status, audit-only
+                // refinement outcomes do not.
+                string_field(status, "taskState").map(str::to_string)
+            });
     let (messages, message_output_truncated) = build_public_messages(&parsed.entries)?;
     let (mut refinements, mut harness_entries, mut refinement_output_truncated) =
         public_refinement_records(&parsed.entries);
@@ -1985,11 +2036,13 @@ where
     };
     Ok((
         SessionHistoryResult {
+            revision: after.revision(),
             messages,
             refinements,
             harness_entries,
             read_only: true,
             truncated,
+            latest_agent_task_state,
             warning,
         },
         after,
@@ -2035,6 +2088,64 @@ fn load_session_history_blocking(
         );
     }
     Ok(second)
+}
+
+fn session_history_stamp_blocking(
+    session_path: String,
+    expected_session_id: Option<String>,
+    project_path: String,
+    home: PathBuf,
+) -> Result<SessionHistoryStamp, String> {
+    let expected_session_id = validate_identifier(expected_session_id)?;
+    let project_path = validate_project_path(project_path)?;
+    let (path, before) = validate_session_file(session_path)?;
+    let file = File::open(&path)
+        .map_err(|error| format!("Impossible d’ouvrir la session Prime Agent: {error}"))?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let read = reader
+        .read_until(b'\n', &mut line)
+        .map_err(|error| format!("Impossible de lire l’en-tête de session: {error}"))?;
+    if read == 0 || line.len() > MAX_LINE_BYTES {
+        return Err("L’en-tête de session Prime Agent est invalide".to_string());
+    }
+    let header: Value = serde_json::from_slice(&line)
+        .map_err(|_| "L’en-tête de session Prime Agent est invalide".to_string())?;
+    validate_header(
+        &header,
+        &path,
+        expected_session_id.as_deref(),
+        &project_path,
+        &home,
+    )?;
+    let after = fs::metadata(&path)
+        .map(|metadata| FileStamp::from_metadata(&metadata))
+        .map_err(|error| format!("Impossible de réinspecter la session: {error}"))?;
+    if before != after {
+        return Err(
+            "La session est en cours de modification; réessayez dans un instant".to_string(),
+        );
+    }
+    Ok(SessionHistoryStamp {
+        revision: after.revision(),
+    })
+}
+
+#[tauri::command]
+pub async fn get_session_history_stamp(
+    app: AppHandle,
+    session_path: String,
+    expected_session_id: Option<String>,
+    project_path: String,
+) -> Result<SessionHistoryStamp, String> {
+    let home = app
+        .path()
+        .home_dir()
+        .map_err(|error| format!("Impossible de localiser le dossier utilisateur: {error}"))?;
+    crate::run_blocking(move || {
+        session_history_stamp_blocking(session_path, expected_session_id, project_path, home)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2298,6 +2409,147 @@ mod tests {
             "{visible}{separator}<prime_orbit_attachment_context v=\"1\" id=\"{context_id}\">\n<prime_orbit_manifest encoding=\"base64url\">{encoded}</prime_orbit_manifest>\n<file name=\"report.pdf\" content_utf16=\"{content_utf16}\">\n{private_fragment}\n</file>\n</prime_orbit_attachment_context>\n<prime_orbit_ui_boundary v=\"1\" id=\"{context_id}\" visible_utf16=\"{}\"/>",
             visible.encode_utf16().count()
         )
+    }
+
+    #[test]
+    fn durable_task_state_is_used_until_new_context_is_persisted() {
+        let fixture = Fixture::new(&[
+            json!({"type":"message","id":"user-1","parentId":null,"message":{"role":"user","content":"hello"}}),
+            json!({"type":"message","id":"assistant-1","parentId":"user-1","message":{"role":"assistant","content":"ready"}}),
+            json!({"type":"agent_status","id":"status-1","parentId":"assistant-1","status":{"taskState":"needs_input","basedOnMessageCount":999}}),
+        ]);
+        assert_eq!(
+            fixture.load().unwrap().latest_agent_task_state.as_deref(),
+            Some("needs_input")
+        );
+
+        let mut file = File::options().append(true).open(&fixture.session).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type":"message","id":"user-2","parentId":"status-1",
+                "message":{"role":"user","content":"new work"}
+            })
+        )
+        .unwrap();
+        drop(file);
+        assert_eq!(fixture.load().unwrap().latest_agent_task_state, None);
+    }
+
+    #[test]
+    fn durable_task_state_accepts_prime_agent_custom_messages_before_the_verdict() {
+        let fixture = Fixture::new(&[
+            json!({"type":"message","id":"user-1","parentId":null,"message":{"role":"user","content":"hello"}}),
+            json!({"type":"custom_message","id":"doctrine-1","parentId":"user-1","display":false,"content":"system context"}),
+            json!({"type":"message","id":"assistant-1","parentId":"doctrine-1","message":{"role":"assistant","content":"ready"}}),
+            json!({"type":"agent_status","id":"status-1","parentId":"assistant-1","status":{"taskState":"needs_input","basedOnMessageCount":1}}),
+        ]);
+        assert_eq!(
+            fixture.load().unwrap().latest_agent_task_state.as_deref(),
+            Some("needs_input")
+        );
+    }
+
+    #[test]
+    fn durable_task_state_ignores_out_of_band_refinement_outcomes() {
+        let fixture = Fixture::new(&[
+            json!({"type":"message","id":"user-1","parentId":null,"message":{"role":"user","content":"hello"}}),
+            json!({"type":"custom_message","id":"doctrine-1","parentId":"user-1","customType":"system_context","display":false,"content":"system context"}),
+            json!({"type":"message","id":"assistant-1","parentId":"doctrine-1","message":{"role":"assistant","content":"ready"}}),
+            json!({"type":"custom_message","id":"refinement-1","parentId":"assistant-1","customType":"refinement_outcome","display":true,"content":"refined once"}),
+            json!({"type":"custom_message","id":"refinement-2","parentId":"refinement-1","customType":"refinement_outcome","display":true,"content":"refined twice"}),
+            json!({"type":"agent_status","id":"status-1","parentId":"refinement-2","status":{"taskState":"needs_input","basedOnMessageCount":3}}),
+        ]);
+        assert_eq!(
+            fixture.load().unwrap().latest_agent_task_state.as_deref(),
+            Some("needs_input")
+        );
+
+        let mut file = File::options().append(true).open(&fixture.session).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type":"message","id":"user-2","parentId":"status-1",
+                "message":{"role":"user","content":"new work"}
+            })
+        )
+        .unwrap();
+        drop(file);
+        assert_eq!(fixture.load().unwrap().latest_agent_task_state, None);
+    }
+
+    #[test]
+    fn durable_task_state_survives_a_later_refinement_outcome() {
+        let fixture = Fixture::new(&[
+            json!({"type":"message","id":"user-1","parentId":null,"message":{"role":"user","content":"hello"}}),
+            json!({"type":"message","id":"assistant-1","parentId":"user-1","message":{"role":"assistant","content":"ready"}}),
+            json!({"type":"agent_status","id":"status-1","parentId":"assistant-1","status":{"taskState":"needs_input","basedOnMessageCount":2}}),
+            json!({"type":"custom_message","id":"refinement-1","parentId":"status-1","customType":"refinement_outcome","display":true,"content":"refined later"}),
+        ]);
+        assert_eq!(
+            fixture.load().unwrap().latest_agent_task_state.as_deref(),
+            Some("needs_input")
+        );
+    }
+
+    #[test]
+    fn durable_task_state_survives_earlier_compacted_context() {
+        let fixture = Fixture::new(&[
+            json!({"type":"message","id":"old-user","parentId":null,"message":{"role":"user","content":"old work"}}),
+            json!({"type":"message","id":"old-assistant","parentId":"old-user","message":{"role":"assistant","content":"old result"}}),
+            json!({"type":"message","id":"kept-user","parentId":"old-assistant","message":{"role":"user","content":"keep me"}}),
+            json!({"type":"compaction","id":"compact-1","parentId":"kept-user","summary":"summary","firstKeptEntryId":"kept-user","tokensBefore":100}),
+            json!({"type":"message","id":"assistant-1","parentId":"compact-1","message":{"role":"assistant","content":"ready"}}),
+            json!({"type":"agent_status","id":"status-1","parentId":"assistant-1","status":{"taskState":"needs_input","basedOnMessageCount":3}}),
+        ]);
+        assert_eq!(
+            fixture.load().unwrap().latest_agent_task_state.as_deref(),
+            Some("needs_input")
+        );
+    }
+
+    #[test]
+    fn newer_compaction_invalidates_the_durable_task_state() {
+        let fixture = Fixture::new(&[
+            json!({"type":"message","id":"user-1","parentId":null,"message":{"role":"user","content":"hello"}}),
+            json!({"type":"message","id":"assistant-1","parentId":"user-1","message":{"role":"assistant","content":"ready"}}),
+            json!({"type":"agent_status","id":"status-1","parentId":"assistant-1","status":{"taskState":"needs_input","basedOnMessageCount":2}}),
+            json!({"type":"compaction","id":"compact-1","parentId":"status-1","summary":"summary","firstKeptEntryId":"user-1","tokensBefore":100}),
+        ]);
+        assert_eq!(fixture.load().unwrap().latest_agent_task_state, None);
+    }
+
+    #[test]
+    fn validated_history_stamp_changes_after_prime_agent_appends() {
+        let fixture = Fixture::new(&[]);
+        let first = session_history_stamp_blocking(
+            fixture.session.to_string_lossy().into_owned(),
+            Some(fixture.session_id.clone()),
+            fixture.project.to_string_lossy().into_owned(),
+            fixture.home.clone(),
+        )
+        .unwrap();
+        let mut file = File::options().append(true).open(&fixture.session).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type":"message","id":"user-1","parentId":null,
+                "message":{"role":"user","content":"hello"}
+            })
+        )
+        .unwrap();
+        drop(file);
+        let second = session_history_stamp_blocking(
+            fixture.session.to_string_lossy().into_owned(),
+            Some(fixture.session_id.clone()),
+            fixture.project.to_string_lossy().into_owned(),
+            fixture.home.clone(),
+        )
+        .unwrap();
+        assert_ne!(first.revision, second.revision);
     }
 
     #[test]

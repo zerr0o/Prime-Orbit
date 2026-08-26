@@ -8,6 +8,7 @@ const { pathToFileURL } = require("node:url");
 const MAX_REQUEST_BYTES = 64 * 1024;
 const SUPPORTED_PROTOCOL_VERSION = 7;
 const RELOAD_REQUEST_TIMEOUT_MS = 120_000;
+const SESSION_STOP_TIMEOUT_MS = 10_000;
 const DAEMON_SHUTDOWN_TIMEOUT_MS = 10_000;
 const HARD_TIMEOUT_MS = RELOAD_REQUEST_TIMEOUT_MS + 15_000;
 const MAX_WINDOWS_DAEMON_SOCKET_BYTES = 240;
@@ -168,6 +169,7 @@ function validRequest(request) {
     && !Array.isArray(request)
     && ((request.action === "shutdown" && Object.keys(request).length === 1)
       || ((request.action === "inspect_owned_session"
+        || request.action === "stop_owned_session"
         || request.action === "reload"
         || request.action === "resume_queue") && validSessionTarget(request)));
 }
@@ -218,6 +220,44 @@ async function inspectOwnedSession(client, request, hello, ownedDescriptor) {
     supported: true,
     activeSessionId: session.activeSessionId,
   };
+}
+
+/** Release the exact client-owned daemon worker before the same persisted
+ * session is resumed by Prime Agent's native process-local Plan runtime. */
+async function stopOwnedSession(client, request, hello, ownedDescriptor, now = Date.now, wait = delay) {
+  if (!validRequest(request)) throw new Error("Requête d’arrêt Prime Agent invalide.");
+  if (!Number.isInteger(hello?.protocol?.version) || hello.protocol.version < SUPPORTED_PROTOCOL_VERSION) {
+    return unsupported("daemon_protocol");
+  }
+  if (!ownedDescriptor) {
+    return { status: "inactive", supported: true };
+  }
+
+  const listSessions = async () => {
+    const list = await client.request({ type: "list", all: true, includeClientOwned: true }, 5_000);
+    if (!list.success) throw new Error(list.error || "Prime Agent a refusé de lister les sessions.");
+    return Array.isArray(list.data?.sessions) ? list.data.sessions : [];
+  };
+  const session = selectSession(await listSessions(), request);
+  if (!session?.activeSessionId) {
+    return { status: "inactive", supported: true };
+  }
+  const response = await client.request({
+    type: "kill",
+    activeSessionId: session.activeSessionId,
+  }, SESSION_STOP_TIMEOUT_MS);
+  if (!response.success) {
+    throw new Error(response.error || "Prime Agent n’a pas pu libérer la session avant le mode Plan.");
+  }
+
+  const deadline = now() + SESSION_STOP_TIMEOUT_MS;
+  while (now() < deadline) {
+    if (!selectSession(await listSessions(), request)) {
+      return { status: "stopped", supported: true };
+    }
+    await wait(50);
+  }
+  throw new Error("Prime Agent n’a pas libéré la session avant le démarrage du mode Plan.");
 }
 
 function isReloadResponseTimeout(error) {
@@ -399,6 +439,8 @@ async function main() {
     const hello = await client.waitForHello(3_000);
     const result = request.action === "inspect_owned_session"
       ? await inspectOwnedSession(client, request, hello, ownedDescriptor)
+      : request.action === "stop_owned_session"
+        ? await stopOwnedSession(client, request, hello, ownedDescriptor)
       : request.action === "resume_queue"
         ? await resumeQueuedWork(client, request, hello)
         : await reloadAgentResources(client, request, hello);
@@ -425,6 +467,7 @@ module.exports = {
   selectSession,
   selectOwnedClientDescriptor,
   shutdownPrimeAgentDaemon,
+  stopOwnedSession,
   validOwnedClientDescriptor,
   validOwnedRequestIdSeed,
   validRequest,

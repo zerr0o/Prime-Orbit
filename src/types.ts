@@ -102,6 +102,8 @@ export interface ChatMessage {
   };
   /** Typed Prime Agent notice with a dedicated, progressively disclosed UI. */
   notice?: ConversationNotice;
+  /** Durable Prime Agent protocol turn retained for reconciliation but hidden from the public transcript. */
+  internal?: "plan_handoff";
   /** A user turn accepted by Prime Agent but not delivered to the model yet. */
   queueDelivery?: "steer" | "follow_up";
   /** Set after the turn has appeared in Prime Agent's authoritative queue snapshot. */
@@ -466,11 +468,17 @@ export interface PendingExtensionUiRequest extends ExtensionUiRequest {
   conversationId: string;
   /** Stable identity across conversations, used to queue and key the modal. */
   requestKey: string;
+  /** Runtime provenance attached by Rust from the exact owning process. */
+  runtimeMode?: "normal" | "plan";
 }
 
 export interface NativeEventPayload {
   conversationId: string;
   line: string;
+  /** Runtime mode attested by the native process registry for interactive
+   * requests. This avoids rejecting a valid Plan dialog while the renderer is
+   * still rebuilding its transient runtime cache after a reconnect. */
+  runtimeMode?: "normal" | "plan";
 }
 
 export interface AgentExitPayload {
@@ -522,12 +530,18 @@ export interface SessionHarnessEntry {
 }
 
 export interface SessionHistoryResult {
+  revision: string;
   messages: unknown[];
   refinements: SessionRefinementRecord[];
   harnessEntries: SessionHarnessEntry[];
   readOnly: true;
   truncated: boolean;
+  latestAgentTaskState?: string;
   warning?: string;
+}
+
+export interface SessionHistoryStamp {
+  revision: string;
 }
 
 export interface InstallProgressPayload {

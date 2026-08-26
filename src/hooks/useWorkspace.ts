@@ -228,7 +228,15 @@ export function useWorkspace() {
             : undefined);
         const shouldRestoreConversation = Boolean(requestedConversation)
           && (hasExplicitConversation || normalized.preferences.restoreLastWorkspace);
-        setState({ ...normalized, selectedProjectId, selectedConversationId });
+        // Fast Refresh can rerun this hydration effect without destroying the
+        // current workspace hook. Persisted state intentionally contains no
+        // transcript, so replacing the live state wholesale would make the
+        // selected conversation look empty until the user navigates away and
+        // back. Preserve runtime-only fields whenever a live projection
+        // already exists; on a cold start the default state has nothing to
+        // preserve and this behaves exactly like the original hydration.
+        const hydrated = restoreRuntimeState(stateRef.current, normalized);
+        setState({ ...hydrated, selectedProjectId, selectedConversationId });
         setView(
           selectedConversationId && shouldRestoreConversation
             ? "chat"
@@ -891,7 +899,7 @@ function mergeChangedFields<T extends object>(base: T, local: T, remote: T): T {
   return merged;
 }
 
-function restoreRuntimeState(runtime: PersistedAppState, durable: PersistedAppState): PersistedAppState {
+export function restoreRuntimeState(runtime: PersistedAppState, durable: PersistedAppState): PersistedAppState {
   const runtimeById = new Map(runtime.conversations.map((conversation) => [conversation.id, conversation]));
   return {
     ...durable,

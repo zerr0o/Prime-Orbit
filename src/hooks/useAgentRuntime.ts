@@ -10,10 +10,11 @@ import {
   listenToAgentRestarts,
   listPendingExtensionUiRequests,
   listRunningAgents,
+  getSessionHistoryStamp,
   notifyPlanAttention,
   loadSessionHistory,
+  reconcilePlanDialogRecovery,
   reloadAgentResources,
-  resumeAgentQueue,
   restartAgent,
   sendRpc,
   startAgent,
@@ -26,18 +27,25 @@ import {
   EMPTY_PLAN_MODE,
   answerPlanQuestion,
   cancelPlanMode,
+  classifyPlanUiRequest,
+  decodePlanInlineRevisionResponse,
   decodePlanUiRequestTitle,
   decidePlanReview,
   isClaimedPlanUiRequest,
   isTrustedPlanUiRequest,
   normalizePlanDocument,
-  openPlanQuestion,
   openPlanReview,
+  planUiToolCallId,
   PLAN_RECOVERY_PROMPT_PREFIX,
+  rearmPlanModeAfterLostDialog,
   recoverablePlanDialogKind,
+  restorePlanQuestion,
+  restorePlanReview,
   resolvePlanState,
+  shouldAwaitPlanToolResult,
   startPlanMode,
   isInternalPlanRecoveryPrompt,
+  unresolvedPlanDialogSummary,
   type PlanDocument,
   type PlanModeState,
   type PlanReviewDecision,
@@ -74,6 +82,7 @@ import type {
   ExtensionUiRequest,
   GoalState,
   ModelInfo,
+  NativeEventPayload,
   PendingExtensionUiRequest,
   Project,
   RpcEnvelope,
@@ -138,13 +147,16 @@ interface PendingConversationRequest {
   reject: (error: Error) => void;
 }
 
-type ConversationResponsePurpose = "goal_mutation";
+type ConversationResponsePurpose = "goal_mutation" | "prompt_admission" | "plan_recovery";
 
 export function shouldConsumeConversationResponse(
   purpose: ConversationResponsePurpose | undefined,
   isSuppressedLateResponse = false,
 ): boolean {
-  return isSuppressedLateResponse || purpose === "goal_mutation";
+  return isSuppressedLateResponse
+    || purpose === "goal_mutation"
+    || purpose === "prompt_admission"
+    || purpose === "plan_recovery";
 }
 
 export function applyRuntimeCompactingState(
@@ -189,11 +201,13 @@ const HISTORY_RESPONSE_TIMEOUT_MS = 30_000;
 const HISTORY_REQUEST_ATTEMPTS = 1;
 const PASSIVE_RESPONSE_TIMEOUT_MS = 30_000;
 const SELECTION_ACTIVATION_TIMEOUT_MS = 5_000;
+export const PLAN_NATIVE_REPLAY_PROBE_TIMEOUT_MS = 5_000;
+export const PLAN_NATIVE_REPLAY_POLL_INTERVAL_MS = 125;
 // A client-owned Prime Agent daemon session keeps its lease for up to 30 s
 // after an abrupt RPC-client disconnect. Stay in one reconnect transaction
 // across that grace period instead of flashing an error and requiring a
 // manual state refresh.
-const RUNTIME_RECOVERY_TIMEOUT_MS = 36_000;
+const RUNTIME_RECOVERY_TIMEOUT_MS = 60_000;
 const RUNTIME_RECOVERY_INITIAL_DELAY_MS = 400;
 const RUNTIME_RECOVERY_MAX_DELAY_MS = 4_000;
 const HTML_EXPORT_RESPONSE_TIMEOUT_MS = 20 * 60_000;
@@ -211,6 +225,8 @@ const COMPACTION_LIFECYCLE_TIMEOUT_MS = 24 * 60 * 60_000;
 const GOAL_MUTATION_LIFECYCLE_TIMEOUT_MS = 24 * 60 * 60_000;
 const RECENT_COMPACTION_END_MS = 10_000;
 const TERMINAL_STATE_RECONCILIATION_DELAY_MS = 600;
+const SESSION_FILE_POLL_INTERVAL_MS = 400;
+const PLAN_RESPONSE_ACK_TIMEOUT_MS = 12_000;
 const OPTIONAL_SELECTION_COMMANDS = new Set([
   "get_available_models",
   "get_commands",
@@ -254,6 +270,63 @@ export function shouldEnterLocalHistoryLoading(
     && conversation.messages.length === 0
     && conversation.status === "offline"
     && !rpcHistoryLoaded;
+}
+
+/** An in-flight local history read is selection-generation scoped. React
+ * StrictMode and HMR can remount selection effects while retaining refs; a
+ * promise started by the previous generation will deliberately refuse to
+ * apply its result, so the new generation must replace it rather than await a
+ * read that can only resolve as a no-op. */
+export function shouldReuseLocalHistoryLoad(
+  inFlightGeneration: number | undefined,
+  requestedGeneration: number,
+): boolean {
+  return inFlightGeneration === requestedGeneration;
+}
+
+/** React Fast Refresh and StrictMode are allowed to clean up and recreate
+ * effects without destroying the desktop page. Session-scoped requests must
+ * survive those development lifecycles and be cancelled only when the WebView
+ * itself is actually leaving. */
+export function bindRuntimePageHideTeardown(
+  target: {
+    addEventListener: (type: "pagehide", listener: EventListener) => void;
+    removeEventListener: (type: "pagehide", listener: EventListener) => void;
+  },
+  teardown: () => void,
+): () => void {
+  const handlePageHide: EventListener = () => teardown();
+  target.addEventListener("pagehide", handlePageHide);
+  return () => target.removeEventListener("pagehide", handlePageHide);
+}
+
+/** A reconnect is transport work, not a new agent turn. If Prime Agent's
+ * attested JSONL already records an idle task verdict, keep presenting that
+ * native state while Orbit reclaims the RPC lease in the background. */
+export function statusDuringRuntimeRecovery(
+  currentStatus: Conversation["status"],
+  hasDurableIdleVerdict: boolean,
+): Conversation["status"] {
+  if (hasDurableIdleVerdict) return "idle";
+  return currentStatus === "streaming" || currentStatus === "tool" || currentStatus === "queued"
+    ? currentStatus
+    : "starting";
+}
+
+/** Prime Agent's previous durable idle verdict cannot finish a prompt that
+ * Orbit has just admitted. A later attested file revision may carry the next
+ * authoritative verdict, but an initial read has no baseline proving that the
+ * verdict was recorded after the prompt. */
+export function shouldApplyDurableIdleTaskState(
+  taskState: string | undefined,
+  promptIsTracked: boolean,
+  previousRevision: string | undefined,
+  currentRevision: string,
+): boolean {
+  const isIdle = taskState === "needs_input" || taskState === "completed";
+  if (!isIdle) return false;
+  if (!promptIsTracked) return true;
+  return previousRevision !== undefined && previousRevision !== currentRevision;
 }
 
 /** Mirrors Prime Agent's native admission rule. An idle prompt starts a turn;
@@ -315,12 +388,113 @@ export function conversationStatusForSessionSnapshot(
   return currentStatus === "starting" ? "starting" : "idle";
 }
 
-export function canResumePendingPlanFinalization(
-  sessionState: Pick<AgentSessionState, "isCompacting" | "isStreaming" | "sessionActions"> | undefined,
+export function canFinalizePendingPlanDecision(
   hasPendingPlanRequest: boolean,
+  hasPersistedDecisionResult: boolean,
 ): boolean {
-  if (!sessionState || hasPendingPlanRequest) return false;
-  return isAuthoritativeIdleSessionSnapshot(sessionState);
+  return hasPersistedDecisionResult && !hasPendingPlanRequest;
+}
+
+/** Renderer state can say idle while the native Plan process is blocked in a
+ * UI call. Replay the native queue whenever either the runtime looks active or
+ * the canonical transcript/Plan state says a dialog is recoverable. */
+export function shouldReplayNativePlanRequests(
+  status: Conversation["status"],
+  recoverableKind: "question" | "review" | undefined,
+): boolean {
+  return Boolean(recoverableKind)
+    || status === "starting"
+    || status === "streaming"
+    || status === "tool"
+    || status === "queued";
+}
+
+export interface PlanReplayGenerationIdentity {
+  pid: number;
+  startedAt: number;
+  toolCallId: string;
+}
+
+export interface PlanReplayAbsenceEvidence extends PlanReplayGenerationIdentity {
+  firstObservedAt: number;
+  lastObservedAt: number;
+  observations: number;
+}
+
+/** Native request absence is meaningful only while the exact Plan process and
+ * durable tool call remain unchanged. Any transient/ambiguous observation
+ * discards the accumulated evidence instead of opening a recovery card. */
+export function updatePlanReplayAbsenceEvidence(
+  current: PlanReplayAbsenceEvidence | undefined,
+  observation: ({ status: "absent" } & PlanReplayGenerationIdentity) | { status: "unknown" },
+  observedAt: number,
+): PlanReplayAbsenceEvidence | undefined {
+  if (observation.status !== "absent") return undefined;
+  if (
+    current
+    && current.pid === observation.pid
+    && current.startedAt === observation.startedAt
+    && current.toolCallId === observation.toolCallId
+  ) {
+    return {
+      ...current,
+      lastObservedAt: observedAt,
+      observations: current.observations + 1,
+    };
+  }
+  return {
+    pid: observation.pid,
+    startedAt: observation.startedAt,
+    toolCallId: observation.toolCallId,
+    firstObservedAt: observedAt,
+    lastObservedAt: observedAt,
+    observations: 1,
+  };
+}
+
+export function hasAttestedPlanReplayAbsence(
+  evidence: PlanReplayAbsenceEvidence | undefined,
+  timeoutMs = PLAN_NATIVE_REPLAY_PROBE_TIMEOUT_MS,
+): boolean {
+  return Boolean(
+    evidence
+    && evidence.observations >= 2
+    && evidence.lastObservedAt - evidence.firstObservedAt >= timeoutMs,
+  );
+}
+
+/** A primitive identity keeps the replay effect stable when workspace updates
+ * clone the selected conversation or project object. Selection generation is
+ * captured after layout and remains a separate stale-work guard. */
+export function planReplayProbeIdentity(
+  conversationId: string | undefined,
+  projectId: string | undefined,
+  expectedToolCallId: string | undefined,
+): string | undefined {
+  if (!conversationId || !projectId) return undefined;
+  return JSON.stringify([conversationId, projectId, expectedToolCallId ?? null]);
+}
+
+/** Finds the live native dialog that owns the durable Plan tool call seen in
+ * Prime Agent's transcript. A transient request from another Plan round must
+ * never make recovery believe that the expected interaction is available. */
+export function matchingNativePlanRequest(
+  payloads: readonly NativeEventPayload[],
+  conversationId: string,
+  expectedToolCallId?: string,
+  excludedRequestIds: ReadonlySet<string> = new Set<string>(),
+): NativeEventPayload | undefined {
+  return payloads.find((payload) => {
+    if (payload.conversationId !== conversationId || payload.runtimeMode !== "plan") return false;
+    try {
+      const request = JSON.parse(payload.line) as ExtensionUiRequest;
+      if (excludedRequestIds.has(request.id)) return false;
+      if (classifyPlanUiRequest(request, payload.runtimeMode) !== "accepted") return false;
+      return expectedToolCallId === undefined || planUiToolCallId(request) === expectedToolCallId;
+    } catch {
+      return false;
+    }
+  });
 }
 
 /** An idle daemon snapshot may repair a missed terminal event, but it must not
@@ -524,7 +698,11 @@ export function promptAttachmentPayload(attachments: Attachment[]) {
 function isLegacyOrbitQueueRow(message: ChatMessage): boolean {
   return Boolean(
     message.role === "user"
-    && (message.status === "pending" || message.queueDelivery || message.queueHistoryPending)
+    && (
+      message.queueDelivery
+      || message.queueHistoryPending
+      || message.status === "pending"
+    )
   );
 }
 
@@ -593,45 +771,21 @@ export function applyAuthoritativeUserMessageStart(
   };
 }
 
-/** Shows an accepted direct prompt immediately while Prime Agent assigns its
- * durable message identity. Queued steering/follow-up prompts never use this
- * path: their only renderer projection remains the daemon queue snapshot. */
-export function appendPendingDirectUserMessage(
-  conversation: Conversation,
-  text: string,
-  createdAt: string,
-  structuredAttachments: Attachment[],
-  provisionalId: string,
-): Conversation {
-  const appended = applyAuthoritativeUserMessageStart(
-    conversation,
-    text,
-    createdAt,
-    structuredAttachments,
-  );
-  const lastIndex = appended.messages.length - 1;
-  const last = appended.messages[lastIndex];
-  if (!last || last.role !== "user") return appended;
-  const messages = [...appended.messages];
-  messages[lastIndex] = {
-    ...last,
-    id: provisionalId,
-    entryId: undefined,
-    status: "pending",
-  };
-  return { ...appended, messages };
+/** Once Prime Agent has published a session file, that append-only file is
+ * the sole transcript projection. Runtime events remain lifecycle signals and
+ * must not add a second copy of the same durable message. */
+export function usesPersistedPrimeAgentTranscript(
+  nativeRuntime: boolean,
+  sessionPath: string | undefined,
+): boolean {
+  return nativeRuntime && typeof sessionPath === "string" && sessionPath.trim().length > 0;
 }
 
-export function removePendingDirectUserMessage(
-  conversation: Conversation,
-  provisionalId: string,
-): Conversation {
-  const messages = conversation.messages.filter((message) => !(
-    message.id === provisionalId && message.role === "user" && message.status === "pending"
-  ));
-  return messages.length === conversation.messages.length
-    ? conversation
-    : { ...conversation, messages };
+export function shouldProjectLiveTranscript(
+  nativeRuntime: boolean,
+  sessionPath: string | undefined,
+): boolean {
+  return !usesPersistedPrimeAgentTranscript(nativeRuntime, sessionPath);
 }
 
 /** Marks only orphaned blocking Plan calls as cancelled before asking Prime
@@ -745,7 +899,7 @@ export function isOptionalSelectionResponseFailure(message: {
 export async function commitPlanRuntimeModeTransition(
   mode: AgentRuntimeMode,
   restartNative: (() => Promise<AgentRuntimeMode | undefined>) | undefined,
-  persistPlanState: () => void,
+  persistPlanState: () => void | Promise<void>,
   setExpectedRuntimeMode: (mode: AgentRuntimeMode | undefined) => void = () => undefined,
 ): Promise<void> {
   // The native restarted event can refresh this conversation before the
@@ -766,7 +920,7 @@ export async function commitPlanRuntimeModeTransition(
     // Persist only after the native process reports the requested mode. This
     // prevents the selection effect from observing the new Plan state early
     // and racing a second restart against the first one.
-    persistPlanState();
+    await persistPlanState();
   } finally {
     setExpectedRuntimeMode(undefined);
   }
@@ -778,6 +932,7 @@ export function recordedPlanResponseValue(
   decoded: ReturnType<typeof decodePlanUiRequestTitle>,
 ): string | undefined {
   if (pending?.stage !== "decisionRecorded" || decoded?.payload.kind !== "review") return undefined;
+  if (decoded.payload.planId !== pending.handoffId) return undefined;
   return request.options?.[pending.decision === "apply" ? 0 : 1];
 }
 
@@ -810,8 +965,46 @@ export function conversationHasPlanHandoff(
 ): boolean {
   const marker = planHandoffMarker(handoffId);
   return Boolean(conversation?.messages.some(
-    (message) => message.role === "user" && message.content.includes(marker),
+    (message) => message.role === "user"
+      && (message.internal === "plan_handoff" || message.content.includes(marker))
+      && message.content.includes(marker),
   ));
+}
+
+/** The exact persisted Prime Agent tool result is the acknowledgement boundary
+ * for Apply/Keep. It is safe to terminate the isolated Plan runtime only after
+ * this canonical result exists; renderer state and `message_end` are not ACKs. */
+export function conversationHasPlanDecisionResult(
+  conversation: Pick<Conversation, "messages"> | undefined,
+  handoffId: string,
+): boolean {
+  return Boolean(conversation?.messages.some((message) => (
+    message.tools ?? []
+  ).some((tool) => (
+    tool.id === handoffId
+      && tool.name === "prime_orbit_plan_submit"
+      && tool.status === "completed"
+  ))));
+}
+
+export function persistedPlanToolResultStatus(
+  messages: unknown[],
+  requestId: string,
+): "completed" | "failed" | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = asRecord(messages[index]);
+    if (
+      message?.role !== "toolResult"
+      || message.toolCallId !== requestId
+      || (message.toolName !== "prime_orbit_plan_question" && message.toolName !== "prime_orbit_plan_submit")
+    ) continue;
+    return message.isError === true ? "failed" : "completed";
+  }
+  return undefined;
+}
+
+export function isInternalPlanHandoffPrompt(value: unknown): boolean {
+  return typeof value === "string" && value.startsWith(`<!-- ${PLAN_HANDOFF_MARKER_PREFIX}`);
 }
 
 function planImplementationPrompt(document: PlanDocument, relativePath: string, handoffId: string): string {
@@ -921,12 +1114,15 @@ export function useAgentRuntime(options: {
   } = options;
   const [runtimes, setRuntimes] = useState<RuntimeMap>({});
   const [extensionRequests, setExtensionRequests] = useState<PendingExtensionUiRequest[]>([]);
+  const [planReplayProbeConversationId, setPlanReplayProbeConversationId] = useState<string>();
   const [eventsReady, setEventsReady] = useState(!isNative());
   const started = useRef(new Set<string>());
   const runtimeModes = useRef(new Map<string, AgentRuntimeMode>());
   const expectedRuntimeModeTransitions = useRef(new Map<string, AgentRuntimeMode>());
   const pendingPlanFinalizations = useRef(new Map<string, PendingPlanFinalization>());
   const planFinalizationsInFlight = useRef(new Set<string>());
+  const persistedPlanDecisionResults = useRef(new Map<string, string>());
+  const planReviewDocumentRefreshes = useRef(new Set<string>());
   const startInFlight = useRef(new Map<string, Promise<void>>());
   const runtimeBootstraps = useRef(new Map<string, RuntimeBootstrap>());
   const historyInFlight = useRef(new Map<string, HistoryLoad>());
@@ -936,9 +1132,13 @@ export function useAgentRuntime(options: {
   const stateEpoch = useRef(new Map<string, number>());
   const goalEpoch = useRef(new Map<string, number>());
   const latestGoalByConversation = useRef(new Map<string, GoalState>());
-  const localHistoryInFlight = useRef(new Map<string, Promise<void>>());
+  const localHistoryInFlight = useRef(new Map<string, {
+    generation: number;
+    promise: Promise<string | undefined>;
+  }>());
   const localHistoryLoaded = useRef(new Set<string>());
   const localHistoryApplied = useRef(new Map<string, string>());
+  const localHistoryRevisions = useRef(new Map<string, string>());
   const sessionActionsByConversation = useRef(new Map<string, AgentSessionState["sessionActions"]>());
   const bootstrapGeneration = useRef(new Map<string, number>());
   const pendingSelectionRequests = useRef(new Map<string, PendingSelectionRequest>());
@@ -959,6 +1159,7 @@ export function useAgentRuntime(options: {
   const compactionRefreshPending = useRef(new Set<string>());
   const terminalStateReconciliationTimers = useRef(new Map<string, number>());
   const activeSelection = useRef<SelectionToken>({ generation: 0 });
+  const planReplayProbeGeneration = useRef(0);
   const selectedConversationId = useRef(active ? selectedConversation?.id : undefined);
   const runtimeViewActive = useRef(active);
   const runtimeEventsReady = useRef(eventsReady);
@@ -970,6 +1171,7 @@ export function useAgentRuntime(options: {
   // process-local marker closes that gap so the second prompt is represented
   // as queued even when both handlers crossed ensureStarted concurrently.
   const activePromptRuns = useRef(new Set<string>());
+  const persistedIdleConversations = useRef(new Set<string>());
   const pendingPromptAdmissions = useRef(new Set<string>());
   // Keep the real agent lifecycle separate from optimistic/queued prompts.
   // Otherwise deleting the last follow-up during Compact can leave a phantom
@@ -1046,6 +1248,7 @@ export function useAgentRuntime(options: {
     fields: Record<string, unknown> = {},
     timeoutMs = PASSIVE_RESPONSE_TIMEOUT_MS,
     purpose?: ConversationResponsePurpose,
+    expectedRuntimeMode?: AgentRuntimeMode,
   ): Promise<RpcEnvelope> => {
     const requestId = uid(type);
     let resolveResponse!: (message: RpcEnvelope) => void;
@@ -1067,7 +1270,11 @@ export function useAgentRuntime(options: {
       resolve: resolveResponse,
       reject: rejectResponse,
     });
-    return sendRpc(conversationId, { id: requestId, type, ...fields })
+    return sendRpc(
+      conversationId,
+      { id: requestId, type, ...fields },
+      { expectedRuntimeMode },
+    )
       .then(() => response)
       .catch((error) => {
         clearPendingConversationRequest(requestId);
@@ -1192,19 +1399,24 @@ export function useAgentRuntime(options: {
     conversation: Conversation,
     project: Project,
     generation: number,
+    force = false,
   ) => {
-    if (!isNative() || !conversation.sessionPath) return Promise.resolve();
+    if (!isNative() || !conversation.sessionPath) return Promise.resolve(undefined);
     const identity = localHistoryIdentity(conversation);
     if (
+      !force
+      &&
       localHistoryLoaded.current.has(identity)
       && localHistoryApplied.current.get(conversation.id) === identity
       && conversation.messages.length > 0
     ) {
-      return Promise.resolve();
+      return Promise.resolve(undefined);
     }
     localHistoryLoaded.current.delete(identity);
     const existing = localHistoryInFlight.current.get(identity);
-    if (existing) return existing;
+    if (existing && shouldReuseLocalHistoryLoad(existing.generation, generation)) {
+      return existing.promise;
+    }
 
     const load = loadSessionHistory(
       conversation.sessionPath,
@@ -1228,42 +1440,103 @@ export function useAgentRuntime(options: {
           };
         });
         const mapped = mapAgentMessages(history.messages);
+        const previousRevision = localHistoryRevisions.current.get(identity);
+        localHistoryRevisions.current.set(identity, history.revision);
+        const pendingPlan = pendingPlanFinalizations.current.get(conversation.id)
+          ?? currentMetadata.pendingPlanAction;
+        const persistedIdle = shouldApplyDurableIdleTaskState(
+          history.latestAgentTaskState,
+          activePromptRuns.current.has(conversation.id),
+          previousRevision,
+          history.revision,
+        );
+        // Transcript shape is not a Prime Agent lifecycle verdict. An
+        // assistant-looking tail can be followed by more tools or model work,
+        // so only the persisted task state (or native terminal events handled
+        // by the live runtime path) may transition Orbit to idle here.
+        const persistedSettled = persistedIdle;
+        if (persistedSettled) {
+          persistedIdleConversations.current.add(conversation.id);
+          activeAgentLifecycles.current.delete(conversation.id);
+          activePromptRuns.current.delete(conversation.id);
+          cancelTerminalStateReconciliation(conversation.id);
+        } else {
+          persistedIdleConversations.current.delete(conversation.id);
+        }
+        if (
+          pendingPlan?.stage === "decisionRecorded"
+          && conversationHasPlanDecisionResult({ messages: mapped }, pendingPlan.handoffId)
+        ) {
+          persistedPlanDecisionResults.current.set(conversation.id, pendingPlan.handoffId);
+        } else if (
+          persistedPlanDecisionResults.current.get(conversation.id)
+          && persistedPlanDecisionResults.current.get(conversation.id) !== pendingPlan?.handoffId
+        ) {
+          persistedPlanDecisionResults.current.delete(conversation.id);
+        }
+        const handoffId = pendingPlan?.stage === "applySending"
+          ? pendingPlan.handoffId
+          : conversationPlanState(currentMetadata).phase === "review"
+            ? currentMetadata.planArtifactId
+            : undefined;
+        const handoffCommitted = Boolean(
+          handoffId && conversationHasPlanHandoff({ messages: mapped }, handoffId),
+        );
+        if (handoffCommitted) pendingPlanFinalizations.current.delete(conversation.id);
         updateConversation(conversation.id, (current) => {
-          // RPC text remains authoritative, but the bounded local-history
-          // reader is the only source of safe historical image thumbnails.
-          // Merge those previews regardless of which asynchronous load wins.
-          // If RPC returned an empty transcript for a non-empty session, the
-          // validated file projection is also the recovery source of text.
-          if (historyLoaded.current.has(conversation.id)) {
-            const messages = reconcileLocalTranscriptAfterRpc(current.messages, mapped);
-            return {
-              ...current,
-              messages,
-              status: messages.length > 0 && current.status === "starting"
-                ? "idle"
-                : current.status,
-            };
-          }
-          const previousLocalIdentity = localHistoryApplied.current.get(conversation.id);
-          // Preserve live/user messages, while allowing a newly selected local
-          // session to replace a transcript known to come from an older path.
-          if (current.messages.length > 0 && !previousLocalIdentity) return current;
+          // The JSONL file remains the durable record, but Orbit must not
+          // erase a Prime Agent projection it already received from the same
+          // session while the file is still between two writes. Reconcile the
+          // two authoritative Prime Agent projections instead of replacing the
+          // current transcript wholesale.
+          const messages = reconcileLocalTranscriptAfterRpc(current.messages, mapped);
           localHistoryApplied.current.set(conversation.id, identity);
           return {
             ...current,
-            messages: mapped,
+            messages,
             hasContent: history.messages.length > 0 ? true : current.hasContent,
+            status: persistedSettled
+              ? compactingConversations.current.has(conversation.id) ? "tool" : "idle"
+              : current.status,
+            ...(persistedSettled ? { lastError: undefined } : {}),
+            ...(handoffCommitted ? {
+              planMode: EMPTY_PLAN_MODE,
+              planArtifactId: undefined,
+              pendingPlanAction: undefined,
+              lastError: undefined,
+            } : {}),
           };
         });
+        if (handoffCommitted) void flushWorkspaceState();
+        return history.revision;
       })
       .finally(() => {
-        if (localHistoryInFlight.current.get(identity) === load) {
+        if (localHistoryInFlight.current.get(identity)?.promise === load) {
           localHistoryInFlight.current.delete(identity);
         }
       });
-    localHistoryInFlight.current.set(identity, load);
+    localHistoryInFlight.current.set(identity, { generation, promise: load });
     return load;
-  }, [isCurrentSelection, updateConversation]);
+  }, [cancelTerminalStateReconciliation, flushWorkspaceState, isCurrentSelection, sendSelectionRequest, updateConversation]);
+
+  const refreshPersistedTranscript = useCallback((conversationId: string, delayMs = 80) => {
+    if (!isNative()) return;
+    window.setTimeout(() => {
+      const token = activeSelection.current;
+      const conversation = getConversationRef.current(conversationId);
+      const project = conversation ? getProjectRef.current(conversation.projectId) : undefined;
+      if (
+        token.conversationId !== conversationId
+        || !isCurrentSelection(conversationId, token.generation)
+        || !conversation?.sessionPath
+        || !project
+      ) return;
+      const identity = localHistoryIdentity(conversation);
+      localHistoryLoaded.current.delete(identity);
+      localHistoryApplied.current.delete(conversationId);
+      void loadLocalConversationHistory(conversation, project, token.generation, true).catch(() => undefined);
+    }, delayMs);
+  }, [isCurrentSelection, loadLocalConversationHistory]);
 
   const refreshLocalRefinements = useCallback(async (conversationId: string, generation: number) => {
     if (!isCurrentSelection(conversationId, generation)) return Promise.resolve();
@@ -1275,7 +1548,7 @@ export function useAgentRuntime(options: {
     // still in flight. Reusing that promise would apply the pre-refinement
     // snapshot and mark it loaded forever. Let it settle, then deliberately
     // perform a second disk read for the post-refinement state.
-    const pending = localHistoryInFlight.current.get(identity);
+    const pending = localHistoryInFlight.current.get(identity)?.promise;
     if (pending) {
       try {
         await pending;
@@ -1290,6 +1563,72 @@ export function useAgentRuntime(options: {
     localHistoryLoaded.current.delete(identity);
     await loadLocalConversationHistory(conversation, project, generation);
   }, [isCurrentSelection, loadLocalConversationHistory]);
+
+  const refreshPlanReviewDocument = useCallback(async (
+    conversationId: string,
+    generation: number,
+    planId: string,
+    title: string,
+  ) => {
+    const initialConversation = getConversationRef.current(conversationId);
+    if (!initialConversation?.sessionPath) return;
+    const identity = localHistoryIdentity(initialConversation);
+
+    // The extension request can beat the matching JSONL tool-call projection
+    // by a few milliseconds. Let any older read settle, then perform bounded
+    // forced reads until the exact persisted call is visible. The UUID remains
+    // authoritative throughout; no document is inferred from another call.
+    for (const delayMs of [0, 40, 120, 240]) {
+      const pending = localHistoryInFlight.current.get(identity)?.promise;
+      if (pending) {
+        try {
+          await pending;
+        } catch {
+          // The forced read below is also the retry for the failed snapshot.
+        }
+      }
+      if (!isCurrentSelection(conversationId, generation)) return;
+      const current = getConversationRef.current(conversationId);
+      if (current && planDocumentForReview(current, planId, title)) return;
+      if (delayMs > 0) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, delayMs));
+      }
+      if (!isCurrentSelection(conversationId, generation)) return;
+      const conversation = getConversationRef.current(conversationId);
+      const project = conversation ? getProjectRef.current(conversation.projectId) : undefined;
+      if (!conversation?.sessionPath || !project || localHistoryIdentity(conversation) !== identity) return;
+      localHistoryLoaded.current.delete(identity);
+      localHistoryApplied.current.delete(conversationId);
+      await loadLocalConversationHistory(conversation, project, generation, true);
+    }
+  }, [isCurrentSelection, loadLocalConversationHistory]);
+
+  const waitForPersistedPlanToolResult = useCallback(async (
+    conversation: Conversation,
+    project: Project,
+    requestId: string,
+  ): Promise<"completed" | "failed" | undefined> => {
+    if (!isNative() || !conversation.sessionPath) return "completed";
+    const deadline = Date.now() + PLAN_RESPONSE_ACK_TIMEOUT_MS;
+    let delayMs = 40;
+    while (Date.now() < deadline) {
+      try {
+        const history = await loadSessionHistory(
+          conversation.sessionPath,
+          conversation.sessionId,
+          project.path,
+        );
+        const status = persistedPlanToolResultStatus(history.messages, requestId);
+        if (status) return status;
+      } catch {
+        // A concurrent JSONL append can invalidate one atomic-read attempt.
+        // The next bounded pass retries the same attested session file.
+      }
+      await new Promise<void>((resolve) => window.setTimeout(resolve, delayMs));
+      delayMs = Math.min(500, delayMs * 2);
+    }
+    return undefined;
+  }, []);
 
   const ensureRuntime = useCallback((conversationId: string) => {
     setRuntimes((current) => {
@@ -1433,8 +1772,14 @@ export function useAgentRuntime(options: {
     const epoch = transcriptEpoch.current.get(conversationId) ?? 0;
     void sendSelectionRequest(conversationId, token.generation, "get_state").catch(() => undefined);
     void sendSelectionRequest(conversationId, token.generation, "get_session_stats").catch(() => undefined);
-    void loadConversationHistory(conversationId, token.generation, epoch).catch(() => undefined);
-  }, [isCurrentSelection, loadConversationHistory, sendSelectionRequest]);
+    const conversation = getConversationRef.current(conversationId);
+    const project = conversation ? getProjectRef.current(conversation.projectId) : undefined;
+    if (isNative() && conversation?.sessionPath && project) {
+      void loadLocalConversationHistory(conversation, project, token.generation, true).catch(() => undefined);
+    } else {
+      void loadConversationHistory(conversationId, token.generation, epoch).catch(() => undefined);
+    }
+  }, [isCurrentSelection, loadConversationHistory, loadLocalConversationHistory, sendSelectionRequest]);
 
   /** Apply a complete state snapshot without coupling it to the current
    * selection. Goal mutations and their final reconciliation belong to the
@@ -1525,10 +1870,16 @@ export function useAgentRuntime(options: {
           || !isCurrentSelection(conversationId, token.generation)
         ) return;
         const epoch = transcriptEpoch.current.get(conversationId) ?? 0;
-        void loadConversationHistory(conversationId, token.generation, epoch).catch(() => undefined);
+        const conversation = getConversationRef.current(conversationId);
+        const project = conversation ? getProjectRef.current(conversation.projectId) : undefined;
+        if (isNative() && conversation?.sessionPath && project) {
+          void loadLocalConversationHistory(conversation, project, token.generation, true).catch(() => undefined);
+        } else {
+          void loadConversationHistory(conversationId, token.generation, epoch).catch(() => undefined);
+        }
       }, 0);
     }
-  }, [cancelTerminalStateReconciliation, isCurrentSelection, loadConversationHistory, updateConversation]);
+  }, [cancelTerminalStateReconciliation, isCurrentSelection, loadConversationHistory, loadLocalConversationHistory, updateConversation]);
 
   const handleResponse = useCallback(
     (conversationId: string, message: RpcEnvelope) => {
@@ -1658,6 +2009,22 @@ export function useAgentRuntime(options: {
         localHistoryApplied.current.delete(conversationId);
         const mapped = mapAgentMessages(data.messages);
         const sourceMessageCount = data.messages.length;
+        const persistedConversation = getConversationRef.current(conversationId);
+        const persistedProject = persistedConversation
+          ? getProjectRef.current(persistedConversation.projectId)
+          : undefined;
+        if (isNative() && persistedConversation?.sessionPath && persistedProject) {
+          // A published session file makes JSONL the sole transcript
+          // projection. Treat get_messages only as a wake-up signal so RPC
+          // history cannot erase, duplicate, or reorder durable file history.
+          void loadLocalConversationHistory(
+            persistedConversation,
+            persistedProject,
+            activeSelection.current.generation,
+            true,
+          ).catch(() => undefined);
+          return;
+        }
         updateConversation(conversationId, (conversation) => ({
           ...conversation,
           messages: reconcileRpcTranscript(conversation.messages, mapped),
@@ -1826,7 +2193,7 @@ export function useAgentRuntime(options: {
         updateConversation(conversationId, { model: `${model.provider}/${model.id}` });
       }
     },
-    [addActivity, applySessionStateSnapshot, isCurrentSelection, loadConversationHistory, recentCompactionEnd, sendSelectionRequest, setRuntimeCompacting, updateConversation],
+    [addActivity, applySessionStateSnapshot, isCurrentSelection, loadConversationHistory, loadLocalConversationHistory, recentCompactionEnd, sendSelectionRequest, setRuntimeCompacting, updateConversation],
   );
 
   const finalizePendingPlan = useCallback(async (conversationId: string) => {
@@ -1856,6 +2223,7 @@ export function useAgentRuntime(options: {
 
     const clearCompletedHandoff = async () => {
       pendingPlanFinalizations.current.delete(conversationId);
+      persistedPlanDecisionResults.current.delete(conversationId);
       updateConversation(conversationId, {
         planMode: EMPTY_PLAN_MODE,
         planArtifactId: undefined,
@@ -1876,10 +2244,20 @@ export function useAgentRuntime(options: {
           // The canonical transcript decides whether the stable handoff marker
           // was admitted before a reload. Never retry until a fresh history
           // snapshot has completed after the admission stage.
-          await loadConversationHistory(
-            conversationId,
-            activeSelection.current.generation,
-          );
+          const project = getProject(conversation.projectId);
+          if (project) {
+            await loadLocalConversationHistory(
+              conversation,
+              project,
+              activeSelection.current.generation,
+              true,
+            );
+          } else {
+            await loadConversationHistory(
+              conversationId,
+              activeSelection.current.generation,
+            );
+          }
           if (historyLoaded.current.has(conversationId)) {
             window.setTimeout(() => void finalizePendingPlan(conversationId), 0);
             return;
@@ -1892,16 +2270,22 @@ export function useAgentRuntime(options: {
       }
 
       if (pending.stage === "decisionRecorded") {
-        const result = await restartAgent(conversationId, "normal");
-        if (!result || result.agent.runtimeMode !== "normal") {
-          throw new Error(planRuntimeText(
-            "Prime Agent n’a pas pu quitter le runtime Plan.",
-            "Prime Agent could not exit the Plan runtime.",
-          ));
-        }
-        runtimeModes.current.set(conversationId, result.agent.runtimeMode);
-        started.current.add(conversationId);
-        await persistStage("runtimeNormal");
+        await commitPlanRuntimeModeTransition(
+          "normal",
+          async () => {
+            const result = await restartAgent(conversationId, "normal", pending.handoffId);
+            if (result) {
+              runtimeModes.current.set(conversationId, result.agent.runtimeMode);
+              started.current.add(conversationId);
+            }
+            return result?.agent.runtimeMode;
+          },
+          () => persistStage("runtimeNormal"),
+          (expectedMode) => {
+            if (expectedMode) expectedRuntimeModeTransitions.current.set(conversationId, expectedMode);
+            else expectedRuntimeModeTransitions.current.delete(conversationId);
+          },
+        );
       }
 
       if (pending.decision === "keep") {
@@ -1914,13 +2298,23 @@ export function useAgentRuntime(options: {
           pending.handoffId,
         );
         historyLoaded.current.delete(conversationId);
+        persistedIdleConversations.current.delete(conversationId);
         activePromptRuns.current.add(conversationId);
         updateConversation(conversationId, { status: "starting", lastError: undefined });
-        await sendRpc(conversationId, {
-          id: `plan-apply-${pending.handoffId}`,
-          type: "prompt",
-          message,
-        }, { expectedRuntimeMode: "normal" });
+        const admission = await sendConversationRequest(
+          conversationId,
+          "prompt",
+          { message },
+          PASSIVE_RESPONSE_TIMEOUT_MS,
+          "prompt_admission",
+          "normal",
+        );
+        if (admission.success === false) {
+          throw new Error(admission.error ?? planRuntimeText(
+            "Prime Agent a refusé le démarrage de l’implémentation du plan.",
+            "Prime Agent rejected the start of the plan implementation.",
+          ));
+        }
         updateConversation(conversationId, {
           hasContent: true,
           updatedAt: now(),
@@ -1948,31 +2342,37 @@ export function useAgentRuntime(options: {
     } finally {
       planFinalizationsInFlight.current.delete(conversationId);
     }
-  }, [addActivity, flushWorkspaceState, getConversation, loadConversationHistory, updateConversation]);
+  }, [addActivity, flushWorkspaceState, getConversation, getProject, loadConversationHistory, loadLocalConversationHistory, sendConversationRequest, updateConversation]);
 
   useEffect(() => {
     const conversationId = selectedConversation?.id;
-    const sessionState = conversationId ? runtimes[conversationId]?.state : undefined;
+    const pendingPlan = selectedConversation?.pendingPlanAction;
     const hasPendingPlanRequest = conversationId
       ? extensionRequests.some((request) => (
           request.conversationId === conversationId
-          && isTrustedPlanUiRequest(request, runtimeModes.current.get(conversationId))
+          && isTrustedPlanUiRequest(request, request.runtimeMode)
         ))
       : false;
     if (
-      selectedConversation?.pendingPlanAction
-      && selectedConversation.status === "idle"
+      pendingPlan
       && started.current.has(selectedConversation.id)
       && eventsReady
-      && (!isNative() || canResumePendingPlanFinalization(sessionState, hasPendingPlanRequest))
+      && (!isNative() || canFinalizePendingPlanDecision(
+        hasPendingPlanRequest,
+        persistedPlanDecisionResults.current.get(selectedConversation.id) === pendingPlan.handoffId,
+      ))
     ) {
-      pendingPlanFinalizations.current.set(selectedConversation.id, selectedConversation.pendingPlanAction);
+      pendingPlanFinalizations.current.set(selectedConversation.id, pendingPlan);
       void finalizePendingPlan(selectedConversation.id);
     }
-  }, [eventsReady, extensionRequests, finalizePendingPlan, runtimes, selectedConversation]);
+  }, [eventsReady, extensionRequests, finalizePendingPlan, selectedConversation]);
 
   const handleAgentEvent = useCallback(
-    (conversationId: string, event: RpcEnvelope) => {
+    (
+      conversationId: string,
+      event: RpcEnvelope,
+      attestedRuntimeMode?: AgentRuntimeMode,
+    ) => {
       const eventType = event.type;
       if (eventType === "response") {
         handleResponse(conversationId, event);
@@ -1989,16 +2389,20 @@ export function useAgentRuntime(options: {
           });
           void sendRpc(conversationId, { type: "extension_ui_response", id: request.id, cancelled: true }).catch(() => undefined);
         } else if (request.method !== "setStatus" && request.method !== "setWidget" && request.method !== "setTitle" && request.method !== "set_editor_text") {
+          const observedRuntimeMode = attestedRuntimeMode
+            ?? runtimeModes.current.get(conversationId);
           const pendingRequest: PendingExtensionUiRequest = {
             ...request,
             conversationId,
             requestKey: extensionRequestKey(conversationId, request.id),
+            runtimeMode: attestedRuntimeMode ?? observedRuntimeMode,
           };
-          const claimedPlanRequest = isClaimedPlanUiRequest(request);
-          const validPlanRequest = isTrustedPlanUiRequest(
+          const planRequestClassification = classifyPlanUiRequest(
             request,
-            runtimeModes.current.get(conversationId),
+            observedRuntimeMode,
           );
+          const claimedPlanRequest = planRequestClassification !== "generic";
+          const validPlanRequest = planRequestClassification === "accepted";
           const decoded = validPlanRequest ? decodePlanUiRequestTitle(request.title) : undefined;
           const recordedPending = pendingPlanFinalizations.current.get(conversationId)
             ?? getConversationRef.current(conversationId)?.pendingPlanAction;
@@ -2052,19 +2456,14 @@ export function useAgentRuntime(options: {
             addActivity(conversationId, {
               id: `plan-protocol-error:${request.id}`,
               type: "plan_protocol_error",
-              title: planRuntimeText("Dialogue Plan invalide bloqué", "Invalid Plan dialog blocked"),
+              title: planRuntimeText("Dialogue Plan en attente d’attestation", "Plan dialog awaiting attestation"),
               detail: planRuntimeText(
-                "Le marqueur interne est présent mais son contrat versionné est invalide.",
-                "The internal marker is present, but its versioned contract is invalid.",
+                "Prime Orbit conserve la demande bloquée sans répondre à la place de l’utilisateur. Elle sera affichée uniquement après attestation du runtime Plan natif.",
+                "Prime Orbit keeps the request blocked without answering for the user. It will be shown only after native Plan runtime attestation.",
               ),
-              status: "error",
+              status: "warning",
               raw: request,
             });
-            void sendRpc(conversationId, {
-              type: "extension_ui_response",
-              id: request.id,
-              cancelled: true,
-            }).catch(() => undefined);
           } else {
             setExtensionRequests((current) => enqueueExtensionRequest(current, pendingRequest));
           }
@@ -2076,29 +2475,37 @@ export function useAgentRuntime(options: {
                 if (startedPlan.status === "accepted") state = startedPlan.state;
               }
               if (decoded?.payload.kind === "review") {
+                if (state.phase === "question") {
+                  const rearmed = rearmPlanModeAfterLostDialog(state, "question");
+                  if (rearmed.status === "accepted") state = rearmed.state;
+                }
                 const document = planDocumentForReview(
                   conversation,
                   decoded.payload.planId,
                   decoded.payload.title,
                 );
                 if (!document) return conversation;
-                const transition = openPlanReview(state, { document });
+                const transition = restorePlanReview(state, { document });
                 return transition.status === "accepted"
                   ? {
                       ...conversation,
                       status: "tool",
                       planMode: transition.state,
-                      planArtifactId: conversation.planArtifactId ?? crypto.randomUUID(),
+                      planArtifactId: decoded.payload.planId,
                     }
                   : conversation;
               }
-              const transition = openPlanQuestion(state, { request });
+              if (state.phase === "review") {
+                const rearmed = rearmPlanModeAfterLostDialog(state, "review");
+                if (rearmed.status === "accepted") state = rearmed.state;
+              }
+              const transition = restorePlanQuestion(state, { request });
               return transition.status === "accepted"
                 ? {
                     ...conversation,
                     status: "tool",
                     planMode: transition.state,
-                    planArtifactId: conversation.planArtifactId ?? crypto.randomUUID(),
+                    planArtifactId: conversation.planArtifactId,
                   }
                 : conversation;
             });
@@ -2135,6 +2542,7 @@ export function useAgentRuntime(options: {
         cancelTerminalStateReconciliation(conversationId);
         stateEpoch.current.set(conversationId, (stateEpoch.current.get(conversationId) ?? 0) + 1);
         transcriptEpoch.current.set(conversationId, (transcriptEpoch.current.get(conversationId) ?? 0) + 1);
+        persistedIdleConversations.current.delete(conversationId);
         activeAgentLifecycles.current.add(conversationId);
         activePromptRuns.current.add(conversationId);
         updateConversation(conversationId, { status: "streaming", lastError: undefined });
@@ -2147,6 +2555,7 @@ export function useAgentRuntime(options: {
         // an idle snapshot requested from the preceding message_end.
         cancelTerminalStateReconciliation(conversationId);
         stateEpoch.current.set(conversationId, (stateEpoch.current.get(conversationId) ?? 0) + 1);
+        persistedIdleConversations.current.delete(conversationId);
         activePromptRuns.current.add(conversationId);
         updateConversation(conversationId, { status: "streaming", lastError: undefined });
         addActivity(conversationId, {
@@ -2165,10 +2574,13 @@ export function useAgentRuntime(options: {
         const error = cleanDiagnostic(event.finalError) ?? "Prime Agent n’a pas pu terminer la nouvelle tentative.";
         const boundaryTime = now();
         updateConversation(conversationId, (conversation) => ({
-          ...finalizeConversationTools(conversation, "failed", boundaryTime),
+          ...(shouldProjectLiveTranscript(isNative(), conversation.sessionPath)
+            ? finalizeConversationTools(conversation, "failed", boundaryTime)
+            : conversation),
           status: "error",
           lastError: error,
         }));
+        refreshPersistedTranscript(conversationId, 0);
         addActivity(conversationId, {
           type: eventType,
           title: "Nouvelle tentative échouée",
@@ -2303,15 +2715,20 @@ export function useAgentRuntime(options: {
         activePromptRuns.current.delete(conversationId);
         const boundaryTime = now();
         updateConversation(conversationId, (conversation) => {
+          const status = compactingConversations.current.has(conversationId) ? "tool" : "idle";
+          if (!shouldProjectLiveTranscript(isNative(), conversation.sessionPath)) {
+            return { ...conversation, status, lastError: undefined };
+          }
           const finalized = finalizeConversationTools(conversation, "completed", boundaryTime);
           return {
           ...finalized,
-          status: compactingConversations.current.has(conversationId) ? "tool" : "idle",
+          status,
           messages: finalized.messages
             .filter((item) => item.role !== "assistant" || item.content.trim() || (item.tools?.length ?? 0) > 0)
             .map((item) => (item.status === "streaming" ? { ...item, status: "complete" } : item)),
           };
         });
+        refreshPersistedTranscript(conversationId, 0);
         addActivity(conversationId, { type: eventType, title: "Exécution terminée", status: "success", raw: event });
         const pendingPlan = pendingPlanFinalizations.current.get(conversationId);
         if (pendingPlan?.stage === "applySending") {
@@ -2324,11 +2741,25 @@ export function useAgentRuntime(options: {
           });
           void flushWorkspaceState();
         } else if (pendingPlan) {
-          void finalizePendingPlan(conversationId);
+          const canFinalize = pendingPlan.stage !== "decisionRecorded"
+            || !isNative()
+            || persistedPlanDecisionResults.current.get(conversationId) === pendingPlan.handoffId;
+          if (canFinalize) void finalizePendingPlan(conversationId);
+          else refreshPersistedTranscript(conversationId, 0);
         }
         window.setTimeout(() => {
           const token = activeSelection.current;
           if (token.conversationId !== conversationId) return;
+          // Re-read Prime Agent's transcript at the terminal boundary. This is
+          // the canonical fallback when a live user/assistant event was lost,
+          // and it replaces equivalent event projections without inventing a
+          // renderer-owned message.
+          const conversation = getConversationRef.current(conversationId);
+          if (usesPersistedPrimeAgentTranscript(isNative(), conversation?.sessionPath)) {
+            refreshPersistedTranscript(conversationId, 0);
+          } else {
+            void sendSelectionRequest(conversationId, token.generation, "get_messages").catch(() => undefined);
+          }
           void sendSelectionRequest(conversationId, token.generation, "get_session_stats").catch(() => undefined);
         }, 150);
         if (compactionRefreshPending.current.has(conversationId)) {
@@ -2348,6 +2779,16 @@ export function useAgentRuntime(options: {
           transcriptEpoch.current.set(conversationId, (transcriptEpoch.current.get(conversationId) ?? 0) + 1);
           const pending = pendingPlanFinalizations.current.get(conversationId);
           const message = asRecord(event.message);
+          if (message?.role === "user") {
+            // A native user message_start means Prime Agent admitted the turn.
+            // This is the authoritative fallback when agent_start is delayed
+            // or lost; queued follow-ups emit it only when they begin running.
+            cancelTerminalStateReconciliation(conversationId);
+            stateEpoch.current.set(conversationId, (stateEpoch.current.get(conversationId) ?? 0) + 1);
+            persistedIdleConversations.current.delete(conversationId);
+            activePromptRuns.current.add(conversationId);
+            updateConversation(conversationId, { status: "streaming", lastError: undefined });
+          }
           if (
             pending?.stage === "applySending"
             && message?.role === "user"
@@ -2363,14 +2804,34 @@ export function useAgentRuntime(options: {
             void flushWorkspaceState();
           }
         }
-        handleMessageEvent(conversationId, event, updateConversation);
+        const persistedConversation = getConversationRef.current(conversationId);
+        if (shouldProjectLiveTranscript(isNative(), persistedConversation?.sessionPath)) {
+          handleMessageEvent(conversationId, event, updateConversation);
+        } else {
+          refreshPersistedTranscript(conversationId, eventType === "message_end" ? 0 : 80);
+        }
         if (shouldScheduleTerminalStateReconciliation(event)) {
           scheduleTerminalStateReconciliation(conversationId);
         }
         return;
       }
       if (eventType === "tool_execution_start" || eventType === "tool_execution_update" || eventType === "tool_execution_end") {
-        handleToolEvent(conversationId, event, updateConversation);
+        const persistedConversation = getConversationRef.current(conversationId);
+        if (shouldProjectLiveTranscript(isNative(), persistedConversation?.sessionPath)) {
+          handleToolEvent(conversationId, event, updateConversation);
+        } else {
+          refreshPersistedTranscript(conversationId, eventType === "tool_execution_end" ? 0 : 120);
+          addActivity(conversationId, {
+            id: `tool:${textValue(event.toolCallId) ?? stableToken(`${event.toolName ?? "tool"}:${event.type}`)}`,
+            type: eventType,
+            title: humanizeEvent(eventType),
+            detail: summarizeToolInvocation(textValue(event.toolName) ?? "tool", event.args),
+            status: eventType === "tool_execution_end"
+              ? event.isError === true ? "error" : "success"
+              : "running",
+            raw: event,
+          });
+        }
         return;
       }
       if (eventType === "rlm_child_update") {
@@ -2560,6 +3021,7 @@ export function useAgentRuntime(options: {
           status: cancelled ? "warning" : failed ? "error" : "success",
           raw: event,
         });
+        refreshPersistedTranscript(conversationId, 0);
         return;
       }
       if (eventType === "goal_update") {
@@ -2617,10 +3079,13 @@ export function useAgentRuntime(options: {
         const error = redactText(String(event.error ?? event.message ?? "Erreur inconnue"));
         const boundaryTime = now();
         updateConversation(conversationId, (conversation) => ({
-          ...finalizeConversationTools(conversation, "failed", boundaryTime),
+          ...(shouldProjectLiveTranscript(isNative(), conversation.sessionPath)
+            ? finalizeConversationTools(conversation, "failed", boundaryTime)
+            : conversation),
           status: "error",
           lastError: error,
         }));
+        refreshPersistedTranscript(conversationId, 0);
         addActivity(conversationId, { type: eventType, title: "Exécution interrompue", detail: error, status: "error", raw: event });
         return;
       }
@@ -2628,14 +3093,19 @@ export function useAgentRuntime(options: {
         addActivity(conversationId, { type: eventType, title: humanizeEvent(eventType), status: "info", raw: event });
       }
     },
-    [addActivity, cancelTerminalStateReconciliation, finalizePendingPlan, flushWorkspaceState, handleResponse, invalidateCompactionHistory, isCurrentSelection, recentCompactionEnd, refreshAfterCompaction, refreshLocalRefinements, removeActivity, scheduleTerminalStateReconciliation, sendSelectionRequest, setGoalMutationState, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation],
+    [addActivity, cancelTerminalStateReconciliation, finalizePendingPlan, flushWorkspaceState, handleResponse, invalidateCompactionHistory, isCurrentSelection, recentCompactionEnd, refreshAfterCompaction, refreshLocalRefinements, refreshPersistedTranscript, removeActivity, scheduleTerminalStateReconciliation, sendSelectionRequest, setGoalMutationState, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation],
   );
 
-  const consumeAgentEventLine = useCallback(({ conversationId, line }: { conversationId: string; line: string }) => {
+  const consumeAgentEventLine = useCallback(({ conversationId, line, runtimeMode }: NativeEventPayload) => {
     try {
       const event = JSON.parse(line) as RpcEnvelope;
+      // Blocking extension requests can arrive immediately after a native
+      // restart, before React has rebuilt `runtimeModes`. Trust the mode that
+      // Rust attached from the exact registered child process rather than
+      // cancelling Prime Agent's valid dialog from a stale renderer cache.
+      if (runtimeMode) runtimeModes.current.set(conversationId, runtimeMode);
       addLog(conversationId, "rpc", summarizeRpcLog(line, event));
-      handleAgentEvent(conversationId, event);
+      handleAgentEvent(conversationId, event, runtimeMode);
     } catch {
       addLog(conversationId, "rpc", truncateRuntimeLog(line));
       addActivity(conversationId, {
@@ -2712,10 +3182,13 @@ export function useAgentRuntime(options: {
         const terminalToolStatus: ToolActivity["status"] = expected ? "cancelled" : "failed";
         const boundaryTime = now();
         updateConversation(conversationId, (conversation) => ({
-          ...finalizeConversationTools(conversation, terminalToolStatus, boundaryTime),
+          ...(shouldProjectLiveTranscript(isNative(), conversation.sessionPath)
+            ? finalizeConversationTools(conversation, terminalToolStatus, boundaryTime)
+            : conversation),
           status: expected ? "idle" : recovering ? "starting" : "error",
           lastError: recovering ? undefined : exitDiagnostic,
         }));
+        refreshPersistedTranscript(conversationId, 0);
       },
       onInstallProgress: ({ phase, message }) => onInstallProgress(phase, redactText(message)),
       onInstallComplete: (result) => onInstallComplete(redactValue(result)),
@@ -2731,15 +3204,12 @@ export function useAgentRuntime(options: {
       if (isNative()) setEventsReady(false);
       unlisten?.();
     };
-  }, [addActivity, addLog, cancelConversationRequests, cancelPersistentConversationRequests, cancelTerminalStateReconciliation, consumeAgentEventLine, onInstallComplete, onInstallProgress, rejectGoalMutation, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation]);
+  }, [addActivity, addLog, cancelConversationRequests, cancelPersistentConversationRequests, cancelTerminalStateReconciliation, consumeAgentEventLine, onInstallComplete, onInstallProgress, refreshPersistedTranscript, rejectGoalMutation, setRuntimeCompacting, setRuntimeRefining, settleCompactionWaiter, updateConversation]);
 
   const ensureProcessStarted = useCallback(
     async (conversation: Conversation, project: Project) => {
       ensureRuntime(conversation.id);
       if (!isNative()) return;
-      if (!detection?.installed) {
-        throw new Error(detection?.error ?? "Prime Agent n’est pas installé.");
-      }
       const desiredRuntimeMode = desiredRuntimeModeForConversation(
         getConversation(conversation.id) ?? conversation,
         expectedRuntimeModeTransitions.current.get(conversation.id),
@@ -2761,19 +3231,21 @@ export function useAgentRuntime(options: {
             }),
         runtimeMode: desiredRuntimeMode,
       };
-      if (started.current.has(conversation.id)) {
-        // The renderer can outlive a crashed/removed native client. Never trust
-        // its local marker without checking the authoritative Rust registry.
-        const running = (await listRunningAgents()).find(
-          (agent) => agent.conversationId === conversation.id,
-        );
-        if (!running) {
-          started.current.delete(conversation.id);
-          runtimeModes.current.delete(conversation.id);
-        } else if (running.runtimeMode === desiredRuntimeMode) {
-          // start_agent is idempotent for an existing runtime and is also its
-          // ownership handshake. Reclaim the interactive lease so unanswered
-          // native dialogs can be presented by this selected window.
+      // Rust's running-agent registry is authoritative even if a concurrent
+      // --version health probe temporarily failed. Reclaim an existing runtime
+      // first; start_agent is idempotent in this path and does not need to
+      // rediscover the executable. For a new runtime, start_agent performs its
+      // own fresh native detection instead of trusting a stale UI snapshot.
+      const running = (await listRunningAgents()).find(
+        (agent) => agent.conversationId === conversation.id,
+      );
+      if (!running) {
+        started.current.delete(conversation.id);
+        runtimeModes.current.delete(conversation.id);
+      } else {
+        started.current.add(conversation.id);
+        runtimeModes.current.set(conversation.id, running.runtimeMode);
+        if (running.runtimeMode === desiredRuntimeMode) {
           const reacquired = await startAgent(startOptions);
           if (!reacquired || reacquired.runtimeMode !== desiredRuntimeMode) {
             throw new Error(planRuntimeText(
@@ -2833,7 +3305,7 @@ export function useAgentRuntime(options: {
       startInFlight.current.set(conversation.id, start);
       return start;
     },
-    [detection?.error, detection?.installed, ensureRuntime, getConversation],
+    [ensureRuntime, getConversation],
   );
 
   const waitForConversationActivation = useCallback(async (conversationId: string) => {
@@ -2886,7 +3358,7 @@ export function useAgentRuntime(options: {
       () => {
         updateConversation(conversationId, {
           planMode: transition.state,
-          planArtifactId: mode === "plan" ? conversation.planArtifactId ?? crypto.randomUUID() : undefined,
+          planArtifactId: mode === "plan" ? conversation.planArtifactId : undefined,
           lastError: undefined,
         });
       },
@@ -2920,11 +3392,15 @@ export function useAgentRuntime(options: {
 
       const bootstrapTask = (async () => {
         if (!historyLoaded.current.has(conversation.id)) {
-          updateConversation(conversation.id, (current) => (
-            current.status === "starting" && current.lastError === undefined
+          updateConversation(conversation.id, (current) => {
+            const status = statusDuringRuntimeRecovery(
+              current.status,
+              persistedIdleConversations.current.has(conversation.id),
+            );
+            return current.status === status && current.lastError === undefined
               ? current
-              : { ...current, status: "starting", lastError: undefined }
-          ));
+              : { ...current, status, lastError: undefined };
+          });
         }
         const recoveryDeadline = Date.now() + RUNTIME_RECOVERY_TIMEOUT_MS;
         let retryDelay = RUNTIME_RECOVERY_INITIAL_DELAY_MS;
@@ -3040,17 +3516,15 @@ export function useAgentRuntime(options: {
             started.current.delete(conversation.id);
             runtimeModes.current.delete(conversation.id);
             bootstrapGeneration.current.delete(conversation.id);
-            updateConversation(conversation.id, (current) => (
-              current.status === "starting" && current.lastError === undefined
+            updateConversation(conversation.id, (current) => {
+              const status = statusDuringRuntimeRecovery(
+                current.status,
+                persistedIdleConversations.current.has(conversation.id),
+              );
+              return current.status === status && current.lastError === undefined
                 ? current
-                : {
-                    ...current,
-                    status: current.status === "streaming" || current.status === "tool" || current.status === "queued"
-                      ? current.status
-                      : "starting",
-                    lastError: undefined,
-                  }
-            ));
+                : { ...current, status, lastError: undefined };
+            });
             await new Promise<void>((resolve) => window.setTimeout(resolve, retryDelay));
             retryDelay = Math.min(retryDelay * 2, RUNTIME_RECOVERY_MAX_DELAY_MS);
           }
@@ -3214,6 +3688,14 @@ export function useAgentRuntime(options: {
     };
     register(listenToAgentRestarts((result) => {
       runtimeModes.current.set(result.agent.conversationId, result.agent.runtimeMode);
+      // A controlled Plan mode transition owns its own readiness and durable
+      // state transaction. Running the generic maintenance refresh here would
+      // observe the pre-commit Plan state and can immediately restart the new
+      // Normal runtime back into Plan mode.
+      if (
+        expectedRuntimeModeTransitions.current.get(result.agent.conversationId)
+        === result.agent.runtimeMode
+      ) return;
       trackMaintenanceRefresh(result.agent.conversationId, "restart");
     }));
     register(listenToAgentResourceReloads(({ conversationId }) => {
@@ -3262,33 +3744,113 @@ export function useAgentRuntime(options: {
       }));
     }
     void loadLocalConversationHistory(selectedConversation, selectedProject, token.generation).catch(() => undefined);
-  }, [active, loadLocalConversationHistory, selectedConversation?.id, selectedConversation?.sessionId, selectedConversation?.sessionPath, selectedProject?.id, selectedProject?.path, updateConversation]);
+  }, [active, loadLocalConversationHistory, selectedConversation?.id, selectedConversation?.messages.length, selectedConversation?.sessionId, selectedConversation?.sessionPath, selectedProject?.id, selectedProject?.path, updateConversation]);
+
+  // Prime Agent's append-only JSONL file is the selected conversation's
+  // durable transcript and task-state clock. Poll only its cheap native stamp;
+  // parse and replace the public projection when that revision changes.
+  useEffect(() => {
+    if (
+      !isNative()
+      || !active
+      || !selectedConversation?.sessionPath
+      || !selectedProject
+    ) return;
+    const conversationId = selectedConversation.id;
+    const identity = localHistoryIdentity(selectedConversation);
+    const generation = activeSelection.current.generation;
+    let cancelled = false;
+    let timeout: number | undefined;
+    let appliedRevision: string | undefined;
+
+    const schedule = () => {
+      if (cancelled) return;
+      timeout = window.setTimeout(() => void poll(), SESSION_FILE_POLL_INTERVAL_MS);
+    };
+    const poll = async () => {
+      try {
+        const current = getConversationRef.current(conversationId);
+        if (
+          cancelled
+          || !current?.sessionPath
+          || localHistoryIdentity(current) !== identity
+          || !isCurrentSelection(conversationId, generation)
+        ) return;
+        const stamp = await getSessionHistoryStamp(
+          current.sessionPath,
+          current.sessionId,
+          selectedProject.path,
+        );
+        if (cancelled) return;
+        if (stamp.revision !== appliedRevision) {
+          const loadedRevision = await loadLocalConversationHistory(
+            current,
+            selectedProject,
+            generation,
+            true,
+          );
+          if (!cancelled) appliedRevision = loadedRevision;
+          return;
+        }
+        if (
+          persistedIdleConversations.current.has(conversationId)
+          && !pendingPromptAdmissions.current.has(conversationId)
+          && !pendingCompactions.current.has(conversationId)
+          && !compactingConversations.current.has(conversationId)
+          && current.status !== "idle"
+        ) {
+          activeAgentLifecycles.current.delete(conversationId);
+          activePromptRuns.current.delete(conversationId);
+          updateConversation(conversationId, { status: "idle", lastError: undefined });
+        }
+      } catch {
+        // Prime Agent may be between two JSONL writes. Keep the last complete
+        // projection and retry the same revision instead of surfacing a false
+        // conversation failure.
+      } finally {
+        schedule();
+      }
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timeout !== undefined) window.clearTimeout(timeout);
+    };
+  }, [active, isCurrentSelection, loadLocalConversationHistory, selectedConversation?.id, selectedConversation?.sessionId, selectedConversation?.sessionPath, selectedProject?.id, selectedProject?.path, updateConversation]);
 
   useEffect(() => {
     if (!active || !selectedConversation || !selectedProject || !detection) return;
-    if (!detection.installed) {
-      const token = activeSelection.current;
-      void loadLocalConversationHistory(selectedConversation, selectedProject, token.generation)
-        .then(() => ({ localError: undefined as string | undefined }))
-        .catch((error) => ({ localError: error instanceof Error ? error.message : String(error) }))
-        .then(({ localError }) => {
-          if (!isCurrentSelection(selectedConversation.id, token.generation)) return;
-          const runtimeError = detection.error ?? "Prime Agent est indisponible. L’historique local reste consultable.";
-          const diagnostic = redactText(localError
-            ? `${runtimeError}\n\nHistorique local : ${localError}`
-            : runtimeError);
-          updateConversation(selectedConversation.id, (current) => {
-            if (current.status === "error" && current.lastError === diagnostic) return current;
-            return { ...current, status: "error", lastError: diagnostic };
-          });
-        });
-      return;
-    }
     if (!eventsReady || activeSelection.current.conversationId !== selectedConversation.id) return;
-    void ensureStarted(selectedConversation, selectedProject).catch(() => undefined);
+    const token = activeSelection.current;
+    void ensureStarted(selectedConversation, selectedProject).catch(async (error) => {
+      let localError: string | undefined;
+      try {
+        await loadLocalConversationHistory(
+          selectedConversation,
+          selectedProject,
+          token.generation,
+        );
+      } catch (cause) {
+        localError = cause instanceof Error ? cause.message : String(cause);
+      }
+      if (!isCurrentSelection(selectedConversation.id, token.generation)) return;
+      const runtimeError = error instanceof Error
+        ? error.message
+        : detection.error ?? planRuntimeText(
+            "Prime Agent est indisponible. L’historique local reste consultable.",
+            "Prime Agent is unavailable. Local history remains readable.",
+          );
+      const diagnostic = redactText(localError
+        ? `${runtimeError}\n\n${planRuntimeText("Historique local", "Local history")}: ${localError}`
+        : runtimeError);
+      updateConversation(selectedConversation.id, (current) => {
+        if (current.status === "error" && current.lastError === diagnostic) return current;
+        return { ...current, status: "error", lastError: diagnostic };
+      });
+    });
   }, [active, detection, ensureStarted, eventsReady, isCurrentSelection, loadLocalConversationHistory, selectedConversation?.id, selectedConversation?.sessionId, selectedConversation?.sessionPath, selectedProject?.id, selectedProject?.path, updateConversation]);
 
-  useEffect(() => () => {
+  useEffect(() => bindRuntimePageHideTeardown(window, () => {
     const conversationId = activeSelection.current.conversationId;
     selectedConversationId.current = undefined;
     activeSelection.current = { generation: activeSelection.current.generation + 1 };
@@ -3303,7 +3865,7 @@ export function useAgentRuntime(options: {
       window.clearTimeout(timeout);
     }
     terminalStateReconciliationTimers.current.clear();
-  }, [cancelConversationRequests, clearPendingConversationRequest, settleCompactionWaiter]);
+  }), [cancelConversationRequests, clearPendingConversationRequest, settleCompactionWaiter]);
 
   const sendPrompt = useCallback(
     async (message: string, attachments: Attachment[], requestedDelivery?: "steer" | "follow_up") => {
@@ -3336,6 +3898,7 @@ export function useAgentRuntime(options: {
       // before agent_start and erase the rapid-submit marker for a real run.
       stateEpoch.current.set(conversationId, (stateEpoch.current.get(conversationId) ?? 0) + 1);
       transcriptEpoch.current.set(conversationId, (transcriptEpoch.current.get(conversationId) ?? 0) + 1);
+      persistedIdleConversations.current.delete(conversationId);
       activePromptRuns.current.add(conversationId);
       pendingPromptAdmissions.current.add(conversationId);
       try {
@@ -3350,12 +3913,12 @@ export function useAgentRuntime(options: {
         // no run to track. Keeping the marker would force every later prompt
         // into queued delivery until an agent_end that can never arrive.
         activePromptRuns.current.delete(conversationId);
-        throw error;
-      } finally {
         pendingPromptAdmissions.current.delete(conversationId);
+        throw error;
       }
       const content = trimmed;
       if (!isNative()) {
+        pendingPromptAdmissions.current.delete(conversationId);
         updateConversation(conversationId, (conversation) => ({
           ...applyAuthoritativeUserMessageStart(
             conversation,
@@ -3390,26 +3953,34 @@ export function useAgentRuntime(options: {
       const expectedRuntimeMode = runtimeModeForConversationPlan(
         getConversationRef.current(conversationId) ?? beforeStart,
       );
-      const provisionalMessageId = !forceQueued ? uid("user-pending") : undefined;
-      if (provisionalMessageId) {
-        updateConversation(conversationId, (conversation) => appendPendingDirectUserMessage(
-          conversation,
-          content,
-          now(),
-          attachments.map(durableAttachmentMetadata),
-          provisionalMessageId,
-        ));
-      }
       try {
-        await sendRpc(conversationId, {
-          id: uid("prompt"),
-          type: "prompt",
-          message: content,
-          ...attachmentPayload,
-          ...(forceQueued
-            ? { streamingBehavior: effectiveDelivery === "steer" ? "steer" : "followUp" }
-            : {}),
-        }, { expectedRuntimeMode });
+        const admission = await sendConversationRequest(
+          conversationId,
+          "prompt",
+          {
+            message: content,
+            ...attachmentPayload,
+            ...(forceQueued
+              ? { streamingBehavior: effectiveDelivery === "steer" ? "steer" : "followUp" }
+              : {}),
+          },
+          PASSIVE_RESPONSE_TIMEOUT_MS,
+          "prompt_admission",
+          expectedRuntimeMode,
+        );
+        if (admission.success === false) {
+          throw new Error(admission.error ?? planRuntimeText(
+            "Prime Agent a refusé le message.",
+            "Prime Agent rejected the message.",
+          ));
+        }
+        // Prime Agent's correlated `response(command=prompt)` is the admission
+        // boundary. A native stdin flush alone does not prove that the daemon
+        // accepted the turn or its requested queue lane.
+        updateConversation(conversationId, {
+          status: compactingConversations.current.has(conversationId) ? "tool" : "streaming",
+          lastError: undefined,
+        });
         if (forceQueued) {
           const token = activeSelection.current;
           window.setTimeout(() => {
@@ -3417,20 +3988,17 @@ export function useAgentRuntime(options: {
             void sendSelectionRequest(conversationId, token.generation, "get_state").catch(() => undefined);
           }, 50);
         }
-      } catch (error) {
-        // The RPC was rejected before reaching Prime Agent's stdin. Remove the
-        // direct-delivery placeholder; native queue rows never use one.
-        if (provisionalMessageId) {
-          updateConversation(conversationId, (conversation) => removePendingDirectUserMessage(
-            conversation,
-            provisionalMessageId,
-          ));
+        if (usesPersistedPrimeAgentTranscript(isNative(), getConversationRef.current(conversationId)?.sessionPath)) {
+          refreshPersistedTranscript(conversationId, 40);
         }
+      } catch (error) {
         activePromptRuns.current.delete(conversationId);
         throw error;
+      } finally {
+        pendingPromptAdmissions.current.delete(conversationId);
       }
     },
-    [cancelTerminalStateReconciliation, ensureStarted, isCurrentSelection, resynchronizeConversationForPrompt, selectedConversation, selectedProject, sendSelectionRequest, updateConversation],
+    [cancelTerminalStateReconciliation, ensureStarted, isCurrentSelection, refreshPersistedTranscript, resynchronizeConversationForPrompt, selectedConversation, selectedProject, sendConversationRequest, sendSelectionRequest, updateConversation],
   );
 
   const retryMessage = useCallback(async (assistantMessageId: string) => {
@@ -3489,30 +4057,157 @@ export function useAgentRuntime(options: {
   }, [isCurrentSelection, selectedConversation, sendSelectionRequest, setRuntimeRefining, updateConversation]);
 
   const recoverPlanDialogs = useCallback(async () => {
-    if (!selectedConversation) return;
+    if (!selectedConversation || !selectedProject) return;
     const conversationId = selectedConversation.id;
     const recoveryKind = recoverablePlanDialogKind(selectedConversation);
     if (!recoveryKind) return;
-    const token = activeSelection.current;
-    const queuedBeforeAbort = sessionActionsByConversation.current.get(conversationId)?.queuedCount ?? 0;
-    await sendRpc(conversationId, { id: uid("recover-plan-abort"), type: "abort" }, {
-      expectedRuntimeMode: "plan",
-    });
-    const resumeResult = await resumeAgentQueue(conversationId);
-    if (resumeResult.status === "unavailable") {
+    const expectedToolCallId = unresolvedPlanDialogSummary(selectedConversation).latestToolCallId;
+    if (!expectedToolCallId) {
       throw new Error(planRuntimeText(
-        "La session Prime Agent n’est plus active dans le daemon.",
-        "The Prime Agent session is no longer active in the daemon.",
+        "Prime Agent n’a pas publié l’identifiant durable du dialogue Plan.",
+        "Prime Agent did not publish the durable Plan dialog identifier.",
       ));
     }
-    if (resumeResult.status === "unsupported") {
+    const token = activeSelection.current;
+
+    const findLivePlanRequest = (payloads: NativeEventPayload[], excluded = new Set<string>()) => (
+      matchingNativePlanRequest(payloads, conversationId, undefined, excluded)
+    );
+
+    // Reclaim/stabilize the exact native process before interpreting an empty
+    // dialog cache. This applies even when JSONL already looks recoverable:
+    // the durable tool call can precede native extension request publication.
+    await ensureStarted(selectedConversation, selectedProject);
+    if (!isCurrentSelection(conversationId, token.generation)) return;
+    const runningAgent = (await listRunningAgents()).find(
+      (agent) => agent.conversationId === conversationId,
+    );
+    if (!runningAgent || runningAgent.runtimeMode !== "plan") {
       throw new Error(planRuntimeText(
-        "Cette version de Prime Agent ne permet pas de reprendre sa file après un arrêt.",
-        "This Prime Agent version cannot resume its queue after an abort.",
+        "La génération Prime Agent Plan active est introuvable.",
+        "The active Prime Agent Plan generation could not be found.",
       ));
     }
 
-    for (let attempt = 0; attempt < 50; attempt += 1) {
+    const reconcileExactRequest = (abortRequestId?: string) => reconcilePlanDialogRecovery({
+      conversationId,
+      expectedPid: runningAgent.pid,
+      expectedStartedAt: runningAgent.startedAt,
+      expectedToolCallId,
+      abortRequestId,
+    });
+
+    // A renderer reload can lose only React's transient card while the same
+    // native process still owns the real UUID. Replay that request verbatim;
+    // do not restart or reconstruct anything when Prime Agent can answer it.
+    // The JSONL write can become visible several seconds before Rust caches
+    // the blocking request, so probe that exact durable call on the same
+    // pid/startedAt generation for a named bounded interval.
+    const replayDeadline = Date.now() + PLAN_NATIVE_REPLAY_PROBE_TIMEOUT_MS;
+    for (;;) {
+      if (!isCurrentSelection(conversationId, token.generation)) return;
+      const disposition = await reconcileExactRequest();
+      if (disposition.status === "replayed") {
+        consumeAgentEventLine(disposition.request);
+        return;
+      }
+      if (disposition.status === "conflict") {
+        refreshPersistedTranscript(conversationId, 0);
+        throw new Error(planRuntimeText(
+          "Une autre demande interactive Prime Agent est déjà active. Son état doit être resynchronisé avant toute récupération.",
+          "Another Prime Agent interactive request is already active. Resynchronize its state before recovery.",
+        ));
+      }
+      if (Date.now() >= replayDeadline) break;
+      await new Promise<void>((resolve) => window.setTimeout(
+        resolve,
+        PLAN_NATIVE_REPLAY_POLL_INTERVAL_MS,
+      ));
+    }
+
+    const retiredRequestIds = new Set(
+      extensionRequests
+        .filter((request) => request.conversationId === conversationId)
+        .map((request) => request.id),
+    );
+    const abortRequestId = uid("abort");
+    let resolveAbort!: (message: RpcEnvelope) => void;
+    let rejectAbort!: (error: Error) => void;
+    const abortResponsePromise = new Promise<RpcEnvelope>((resolve, reject) => {
+      resolveAbort = resolve;
+      rejectAbort = reject;
+    });
+    const abortTimeout = window.setTimeout(() => {
+      clearPendingConversationRequest(
+        abortRequestId,
+        new Error(planRuntimeText(
+          "Prime Agent n’a pas répondu à l’abort Plan dans le délai prévu.",
+          "Prime Agent did not respond to the Plan abort in time.",
+        )),
+      );
+    }, PASSIVE_RESPONSE_TIMEOUT_MS);
+    pendingConversationRequests.current.set(abortRequestId, {
+      conversationId,
+      timeout: abortTimeout,
+      purpose: "plan_recovery",
+      resolve: resolveAbort,
+      reject: rejectAbort,
+    });
+
+    let abortResponse: RpcEnvelope;
+    try {
+      const atomicDeadline = Date.now() + PLAN_NATIVE_REPLAY_PROBE_TIMEOUT_MS;
+      for (;;) {
+        if (!isCurrentSelection(conversationId, token.generation)) {
+          clearPendingConversationRequest(abortRequestId);
+          return;
+        }
+        const disposition = await reconcileExactRequest(abortRequestId);
+        if (disposition.status === "replayed") {
+          clearPendingConversationRequest(abortRequestId);
+          consumeAgentEventLine(disposition.request);
+          return;
+        }
+        if (disposition.status === "conflict") {
+          clearPendingConversationRequest(abortRequestId);
+          throw new Error(planRuntimeText(
+            "Prime Agent a publié une autre demande interactive avant l’abort. Aucune demande n’a été annulée.",
+            "Prime Agent published another interactive request before abort. No request was cancelled.",
+          ));
+        }
+        if (disposition.status === "abortSent") break;
+        if (Date.now() >= atomicDeadline) {
+          clearPendingConversationRequest(abortRequestId);
+          throw new Error(planRuntimeText(
+            "Prime Agent écrit déjà sur cette session. Réessayez la récupération dans un instant.",
+            "Prime Agent is already writing to this session. Retry recovery in a moment.",
+          ));
+        }
+        await new Promise<void>((resolve) => window.setTimeout(
+          resolve,
+          PLAN_NATIVE_REPLAY_POLL_INTERVAL_MS,
+        ));
+      }
+      abortResponse = await abortResponsePromise;
+    } catch (error) {
+      clearPendingConversationRequest(abortRequestId);
+      throw error;
+    }
+    if (abortResponse.success === false) {
+      throw new Error(abortResponse.error ?? planRuntimeText(
+        "Prime Agent n’a pas confirmé l’arrêt de l’ancien dialogue Plan.",
+        "Prime Agent did not confirm cancellation of the old Plan dialog.",
+      ));
+    }
+    // Plan sessions use Orbit's managed-generation daemon rather than Prime
+    // Agent's global default daemon. The abort above releases the orphaned
+    // interactive call owned by that exact RPC process; the replacement below
+    // starts a fresh Plan runtime on the same isolated daemon generation.
+    // Queue recovery still belongs to the RPC runtime and must not gate this
+    // exact dialog recovery path.
+
+    let confirmedIdle = false;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
       if (!isCurrentSelection(conversationId, token.generation)) {
         throw new DOMException(planRuntimeText(
           "La récupération a été remplacée par une autre conversation.",
@@ -3527,98 +4222,139 @@ export function useAgentRuntime(options: {
         ));
       }
       const state = asRecord(response?.data) as unknown as AgentSessionState | undefined;
-      if (state) {
-        const queuedNow = state.sessionActions?.queuedCount ?? 0;
-        if (state.isStreaming && queuedBeforeAbort > 0 && queuedNow < queuedBeforeAbort) {
-          // Prime Agent consumed the instruction that was already queued. Its
-          // next extension_ui_request will rebuild the real form normally.
-          return;
-        }
-        if (!state.isStreaming && queuedNow === 0) {
-          activeAgentLifecycles.current.delete(conversationId);
-          activePromptRuns.current.delete(conversationId);
-          directRefinementActivities.current.delete(conversationId);
-          uncertainRefinementConversations.current.delete(conversationId);
-          setRuntimeRefining(conversationId, false);
-          updateConversation(conversationId, (conversation) => ({
-            ...finalizeConversationTools(
-              cancelUnresolvedPlanDialogs(conversation, now()),
-              "cancelled",
-              now(),
-            ),
-            status: "starting",
-            lastError: undefined,
-          }));
-          stateEpoch.current.set(conversationId, (stateEpoch.current.get(conversationId) ?? 0) + 1);
-          transcriptEpoch.current.set(conversationId, (transcriptEpoch.current.get(conversationId) ?? 0) + 1);
-
-          // A Plan dialog can be stranded precisely because the RPC client
-          // detached after Prime Agent admitted the tool call. Reusing that
-          // process would submit another dialog to the same broken transport.
-          // Restart only Orbit's RPC client; the resident daemon worker and its
-          // persisted session remain untouched. A successful get_state from
-          // the replacement is the readiness barrier before the recovery turn.
-          cancelConversationRequests(conversationId, planRuntimeText(
-            "La connexion Plan est recréée.",
-            "The Plan connection is being recreated.",
-          ));
-          const restarted = await restartAgent(conversationId, "plan");
-          if (!restarted || restarted.agent.runtimeMode !== "plan") {
-            throw new Error(planRuntimeText(
-              "Prime Orbit n’a pas pu recréer la connexion interactive Plan.",
-              "Prime Orbit could not recreate the interactive Plan connection.",
-            ));
-          }
-          started.current.add(conversationId);
-          runtimeModes.current.set(conversationId, restarted.agent.runtimeMode);
-          processExitErrors.current.delete(conversationId);
-          lastStderr.current.delete(conversationId);
-          const ready = await sendSelectionRequest(conversationId, token.generation, "get_state", true);
-          if (ready?.success === false) {
-            throw new Error(ready.error ?? planRuntimeText(
-              "La nouvelle connexion Plan ne répond pas.",
-              "The replacement Plan connection is not responding.",
-            ));
-          }
-
-          activePromptRuns.current.add(conversationId);
-          const recoveryMessage = recoveryKind === "review"
-            ? `${PLAN_RECOVERY_PROMPT_PREFIX} The previous Plan review dialog was lost during a client reconnection. `
-              + "Submit the same current plan again with prime_orbit_plan_submit so the user can apply, keep, or revise it. "
-              + "Do not ask the completed planning questions again and do not create a different plan."
-            : `${PLAN_RECOVERY_PROMPT_PREFIX} The previous Plan question dialogs were lost during a client reconnection. `
-              + "Ask every still unresolved planning question again with prime_orbit_plan_question, one at a time. "
-              + "Do not reuse the cancelled tool calls.";
-          const submitRecoveryPrompt = () => sendRpc(conversationId, {
-            id: uid("recover-plan-prompt"),
-            type: "prompt",
-            message: recoveryMessage,
-          }, { expectedRuntimeMode: "plan" });
-          try {
-            try {
-              await submitRecoveryPrompt();
-            } catch (error) {
-              const detail = error instanceof Error ? error.message : String(error);
-              if (!detail.toLowerCase().includes("queued session input is suspended")) throw error;
-              const resumed = await resumeAgentQueue(conversationId);
-              if (resumed.status !== "resumed") throw error;
-              await submitRecoveryPrompt();
-            }
-          } catch (error) {
-            activePromptRuns.current.delete(conversationId);
-            updateConversation(conversationId, { status: "idle" });
-            throw error;
-          }
-          return;
-        }
+      if (state && isAuthoritativeIdleSessionSnapshot(state)) {
+        confirmedIdle = true;
+        break;
       }
       await new Promise<void>((resolve) => window.setTimeout(resolve, 100));
     }
-    throw new Error(planRuntimeText(
-      "Prime Agent n’a pas libéré l’ancien dialogue Plan dans le délai prévu.",
-      "Prime Agent did not release the previous Plan dialog in time.",
+    if (!confirmedIdle) {
+      throw new Error(planRuntimeText(
+        "Prime Agent n’a pas libéré l’ancien dialogue Plan dans le délai prévu.",
+        "Prime Agent did not release the previous Plan dialog in time.",
+      ));
+    }
+
+    activeAgentLifecycles.current.delete(conversationId);
+    activePromptRuns.current.delete(conversationId);
+    directRefinementActivities.current.delete(conversationId);
+    uncertainRefinementConversations.current.delete(conversationId);
+    setRuntimeRefining(conversationId, false);
+    setExtensionRequests((current) => current.filter(
+      (request) => request.conversationId !== conversationId,
     ));
-  }, [cancelConversationRequests, isCurrentSelection, selectedConversation, sendSelectionRequest, setRuntimeRefining, updateConversation]);
+    const rearmed = rearmPlanModeAfterLostDialog(
+      conversationPlanState(selectedConversation),
+      recoveryKind,
+    );
+    if (rearmed.status === "rejected") {
+      throw new Error(planRuntimeText(
+        `Le dialogue Plan local ne peut pas être réarmé (${rearmed.reason}).`,
+        `The local Plan dialog cannot be rearmed (${rearmed.reason}).`,
+      ));
+    }
+    updateConversation(conversationId, (conversation) => ({
+      ...conversation,
+      planMode: rearmed.state,
+      planArtifactId: undefined,
+      status: "starting",
+      lastError: undefined,
+    }));
+    refreshPersistedTranscript(conversationId, 0);
+    stateEpoch.current.set(conversationId, (stateEpoch.current.get(conversationId) ?? 0) + 1);
+    transcriptEpoch.current.set(conversationId, (transcriptEpoch.current.get(conversationId) ?? 0) + 1);
+
+    cancelConversationRequests(conversationId, planRuntimeText(
+      "La connexion Plan est recréée.",
+      "The Plan connection is being recreated.",
+    ));
+    const restarted = await restartAgent(conversationId, "plan");
+    if (!restarted || restarted.agent.runtimeMode !== "plan") {
+      throw new Error(planRuntimeText(
+        "Prime Orbit n’a pas pu recréer la connexion interactive Plan.",
+        "Prime Orbit could not recreate the interactive Plan connection.",
+      ));
+    }
+    started.current.add(conversationId);
+    runtimeModes.current.set(conversationId, restarted.agent.runtimeMode);
+    processExitErrors.current.delete(conversationId);
+    lastStderr.current.delete(conversationId);
+    const ready = await sendSelectionRequest(conversationId, token.generation, "get_state", true);
+    if (ready?.success === false) {
+      throw new Error(ready.error ?? planRuntimeText(
+        "La nouvelle connexion Plan ne répond pas.",
+        "The replacement Plan connection is not responding.",
+      ));
+    }
+
+    persistedIdleConversations.current.delete(conversationId);
+    activePromptRuns.current.add(conversationId);
+    const recoveryMessage = recoveryKind === "review"
+      ? `${PLAN_RECOVERY_PROMPT_PREFIX} The previous Plan review dialog was lost during a client reconnection. `
+        + "Submit the same previously written Plan document again with prime_orbit_plan_submit. "
+        + "Do not change its decisions and do not reuse the cancelled tool call."
+      : `${PLAN_RECOVERY_PROMPT_PREFIX} The previous Plan question dialog was lost during a client reconnection. `
+        + "Ask the still unresolved planning question again with prime_orbit_plan_question. "
+        + "Do not reuse the cancelled tool call.";
+    try {
+      const admission = await sendConversationRequest(
+        conversationId,
+        "prompt",
+        { message: recoveryMessage },
+        PASSIVE_RESPONSE_TIMEOUT_MS,
+        "prompt_admission",
+        "plan",
+      );
+      if (admission.success === false) {
+        throw new Error(admission.error ?? planRuntimeText(
+          "Prime Agent a refusé la récupération du dialogue Plan.",
+          "Prime Agent rejected the Plan dialog recovery prompt.",
+        ));
+      }
+
+      // The recovery is successful only when Prime Agent creates a fresh,
+      // live dialog UUID. A prompt acknowledgement or idle snapshot is not a
+      // substitute for the actual blocking request.
+      for (let attempt = 0; attempt < 600; attempt += 1) {
+        if (!isCurrentSelection(conversationId, token.generation)) {
+          throw new DOMException(planRuntimeText(
+            "La récupération a été remplacée par une autre conversation.",
+            "Recovery was replaced by another conversation.",
+          ), "AbortError");
+        }
+        const pending = await listPendingExtensionUiRequests(conversationId);
+        const freshRequest = findLivePlanRequest(pending, retiredRequestIds);
+        if (freshRequest) {
+          consumeAgentEventLine(freshRequest);
+          return;
+        }
+        if (attempt > 10 && attempt % 10 === 0) {
+          const stateResponse = await sendSelectionRequest(
+            conversationId,
+            token.generation,
+            "get_state",
+            true,
+          );
+          const state = asRecord(stateResponse?.data) as unknown as AgentSessionState | undefined;
+          if (state && isAuthoritativeIdleSessionSnapshot(state)) {
+            throw new Error(planRuntimeText(
+              "Prime Agent a terminé sans recréer le dialogue Plan attendu.",
+              "Prime Agent finished without recreating the expected Plan dialog.",
+            ));
+          }
+        }
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 200));
+      }
+      throw new Error(planRuntimeText(
+        "Prime Agent n’a pas recréé le dialogue Plan dans le délai prévu.",
+        "Prime Agent did not recreate the Plan dialog in time.",
+      ));
+    } catch (error) {
+      activePromptRuns.current.delete(conversationId);
+      updateConversation(conversationId, { status: "idle" });
+      throw error;
+    }
+  }, [cancelConversationRequests, clearPendingConversationRequest, consumeAgentEventLine, ensureStarted, extensionRequests, isCurrentSelection, refreshPersistedTranscript, selectedConversation, selectedProject, sendConversationRequest, sendSelectionRequest, setRuntimeRefining, updateConversation]);
 
   const closeRuntime = useCallback(async () => {
     if (!selectedConversation) return;
@@ -4287,11 +5023,14 @@ export function useAgentRuntime(options: {
     extensionResponsesInFlight.current.add(request.requestKey);
     const isPlanRequest = isTrustedPlanUiRequest(
       request,
-      runtimeModes.current.get(request.conversationId),
+      request.runtimeMode,
     );
     let previousPlanState: PlanModeState | undefined;
     let previousPlanArtifactId: string | undefined;
     let pendingFinalizationInstalled = false;
+    let planRequestKind: "question" | "custom" | "review" | undefined;
+    let planReviewDecision: PlanReviewDecision | undefined;
+    let inlinePlanRevision = false;
     try {
       if (isPlanRequest) {
         const conversation = getConversation(request.conversationId);
@@ -4302,13 +5041,20 @@ export function useAgentRuntime(options: {
           "Invalid Plan request or unavailable conversation.",
         ));
         previousPlanState = conversationPlanState(conversation);
+        planRequestKind = decoded.payload.kind;
         previousPlanArtifactId = conversation.planArtifactId;
-        const planArtifactId = conversation.planArtifactId
-          ?? (decoded.payload.kind === "review" ? decoded.payload.planId : crypto.randomUUID());
+        const planToolCallId = planUiToolCallId(request);
+        if (!planToolCallId) throw new Error(planRuntimeText(
+          "L’identifiant durable du dialogue Plan est invalide.",
+          "The durable Plan dialog identifier is invalid.",
+        ));
+        const planArtifactId = decoded.payload.kind === "review"
+          ? decoded.payload.planId
+          : conversation.planArtifactId;
         let nextPlanState = previousPlanState;
 
         if (decoded.payload.kind === "review") {
-          let document = previousPlanState.document;
+          let document: PlanDocument | undefined = previousPlanState.document;
           if (!document) {
             const recovered = planDocumentForReview(conversation, decoded.payload.planId, decoded.payload.title);
             if (recovered) {
@@ -4325,16 +5071,22 @@ export function useAgentRuntime(options: {
           ));
           const value = typeof response.value === "string" ? response.value : undefined;
           const index = value === undefined ? -1 : (request.options ?? []).indexOf(value);
-          const decision = (["apply", "keep", "revise"] as const)[index] as PlanReviewDecision | undefined;
+          const inlineRevision = decodePlanInlineRevisionResponse(value, decoded.payload.planId);
+          const decision = inlineRevision
+            ? "revise"
+            : (["apply", "keep", "revise"] as const)[index] as PlanReviewDecision | undefined;
           if (!decision) throw new Error(planRuntimeText("Décision de plan non reconnue.", "Unrecognized plan decision."));
+          planReviewDecision = decision;
+          inlinePlanRevision = Boolean(inlineRevision);
           const written = decision === "apply" || decision === "keep"
-            ? await writePlanDocument({
+              ? await writePlanDocument({
                 conversationId: request.conversationId,
                 requestId: request.id,
                 projectPath: project.path,
-                planId: planArtifactId,
+                planId: decoded.payload.planId,
                 title: document.name,
                 markdown: document.markdown,
+                recoveredFromTranscript: false,
               })
             : undefined;
           const decided = decidePlanReview(nextPlanState, { decision });
@@ -4348,13 +5100,23 @@ export function useAgentRuntime(options: {
               decision,
               document,
               relativePath: written.relativePath,
-              handoffId: planArtifactId,
+              handoffId: decoded.payload.planId,
               stage: "decisionRecorded",
             });
             pendingFinalizationInstalled = true;
           }
         } else {
-          const answered = answerPlanQuestion(previousPlanState, {
+          let questionState = previousPlanState;
+          if (questionState.phase === "review") {
+            const rearmed = rearmPlanModeAfterLostDialog(questionState, "review");
+            if (rearmed.status === "accepted") questionState = rearmed.state;
+          }
+          const restored = restorePlanQuestion(questionState, { request });
+          if (restored.status === "rejected") throw new Error(planRuntimeText(
+            `Question Plan impossible à restaurer (${restored.reason}).`,
+            `Plan question could not be restored (${restored.reason}).`,
+          ));
+          const answered = answerPlanQuestion(restored.state, {
             requestId: request.id,
             cancelled: response.cancelled === true,
             value: response.value,
@@ -4385,7 +5147,43 @@ export function useAgentRuntime(options: {
           id: request.id,
           ...response,
         });
+        if (
+          planRequestKind
+          && !shouldAwaitPlanToolResult(planRequestKind, planReviewDecision, inlinePlanRevision)
+        ) {
+          // Prime Agent's native Revise path continues the same Plan tool call
+          // with a second `ctx.ui.input`. Release the answered select now so
+          // that exact next request can become the visible, actionable card.
+          // Waiting for the final tool result here would deadlock the UI: the
+          // result cannot be persisted until the user answers that input.
+          setExtensionRequests((current) => current.filter((item) => item.requestKey !== request.requestKey));
+          return;
+        }
+        const acknowledgement = await waitForPersistedPlanToolResult(
+          conversation,
+          project,
+          planToolCallId,
+        );
+        if (acknowledgement !== "completed") {
+          // Rust has already consumed the one-shot native UUID after writing
+          // the response. Never leave a deceptively retryable form behind;
+          // the canonical unresolved call drives the explicit recovery card.
+          setExtensionRequests((current) => current.filter((item) => item.requestKey !== request.requestKey));
+          throw new Error(acknowledgement === "failed"
+            ? planRuntimeText(
+                "Prime Agent a refusé la réponse au dialogue Plan.",
+                "Prime Agent rejected the Plan dialog response.",
+              )
+            : planRuntimeText(
+                "Prime Agent n’a pas confirmé la réponse au dialogue Plan.",
+                "Prime Agent did not acknowledge the Plan dialog response.",
+              ));
+        }
+        if (pendingFinalizationInstalled) {
+          persistedPlanDecisionResults.current.set(request.conversationId, planToolCallId);
+        }
         setExtensionRequests((current) => current.filter((item) => item.requestKey !== request.requestKey));
+        refreshPersistedTranscript(request.conversationId, 0);
         return;
       }
 
@@ -4399,14 +5197,23 @@ export function useAgentRuntime(options: {
       });
     } catch (error) {
       if (isPlanRequest && previousPlanState) {
-        updateConversation(request.conversationId, {
-          planMode: previousPlanState,
-          planArtifactId: previousPlanArtifactId,
-          pendingPlanAction: undefined,
-        });
         if (pendingFinalizationInstalled) {
-          pendingPlanFinalizations.current.delete(request.conversationId);
+          // Writing the attested plan is irreversible. Preserve the recorded
+          // decision so background reconciliation can resume safely instead
+          // of resurrecting the already-answered review form.
+          const pending = pendingPlanFinalizations.current.get(request.conversationId);
+          updateConversation(request.conversationId, {
+            pendingPlanAction: pending,
+            status: "error",
+            lastError: error instanceof Error ? error.message : String(error),
+          });
           await flushWorkspaceState();
+        } else {
+          updateConversation(request.conversationId, {
+            planMode: previousPlanState,
+            planArtifactId: previousPlanArtifactId,
+            pendingPlanAction: undefined,
+          });
         }
       }
       addActivity(request.conversationId, {
@@ -4423,37 +5230,231 @@ export function useAgentRuntime(options: {
     } finally {
       extensionResponsesInFlight.current.delete(request.requestKey);
     }
-  }, [addActivity, flushWorkspaceState, getConversation, getProject, updateConversation]);
+  }, [addActivity, flushWorkspaceState, getConversation, getProject, refreshPersistedTranscript, updateConversation, waitForPersistedPlanToolResult]);
 
   const extensionRequest = extensionRequests.find((request) => !isClaimedPlanUiRequest(request));
-  const planExtensionRequest = extensionRequests.find((request) => (
+  const nativePlanExtensionRequest = extensionRequests.find((request) => (
     request.conversationId === selectedConversation?.id
-      && isTrustedPlanUiRequest(request, runtimeModes.current.get(request.conversationId))
+      && isTrustedPlanUiRequest(request, request.runtimeMode)
   ));
+  // Only a live request still owned by the native Prime Agent process is
+  // actionable. Historical tool calls and cached renderer state may explain
+  // why a dialog was lost, but they can never recreate its response UUID.
+  const planExtensionRequest = nativePlanExtensionRequest;
+  const planReplayConversationId = selectedConversation?.id;
+  const planReplayProjectId = selectedProject?.id;
+  const planReplayConversationStatus = selectedConversation?.status;
+  const planReplayRecoverySummary = selectedConversation
+    ? unresolvedPlanDialogSummary(selectedConversation)
+    : undefined;
+  const planReplayRecoverableKind = selectedConversation
+    ? recoverablePlanDialogKind(selectedConversation)
+    : undefined;
+  const planReplayExpectedToolCallId = planReplayRecoverySummary?.latestToolCallId;
+  const planReplayShouldRun = planReplayConversationStatus
+    ? shouldReplayNativePlanRequests(planReplayConversationStatus, planReplayRecoverableKind)
+    : false;
+  const planReplayIdentity = planReplayProbeIdentity(
+    planReplayConversationId,
+    planReplayProjectId,
+    planReplayExpectedToolCallId,
+  );
   useEffect(() => {
+    const conversationId = planReplayConversationId;
+    const projectId = planReplayProjectId;
     if (
       !isNative()
-      || !eventsReady
-      || !selectedConversation
-      || !selectedProject
-      || planExtensionRequest
-      || !["starting", "streaming", "tool", "queued"].includes(selectedConversation.status)
+      || !conversationId
+      || !projectId
+      || !planReplayIdentity
     ) {
       return;
     }
-    const conversationId = selectedConversation.id;
+    if (planExtensionRequest || !planReplayShouldRun) {
+      setPlanReplayProbeConversationId((current) => (
+        current === conversationId ? undefined : current
+      ));
+      return;
+    }
+    // Event bridge setup and native runtime discovery are unknown states, not
+    // proof that Prime Agent lost the request. Suppress the recovery affordance
+    // while either one is still settling.
+    setPlanReplayProbeConversationId(conversationId);
+    if (!eventsReady) return;
+
     const generation = activeSelection.current.generation;
+    if (!isCurrentSelection(conversationId, generation)) return;
+    const probeGeneration = planReplayProbeGeneration.current + 1;
+    planReplayProbeGeneration.current = probeGeneration;
+    let cancelled = false;
+    let absenceEvidence: PlanReplayAbsenceEvidence | undefined;
+    let observedRuntimeIdentity: string | undefined;
+    let ownershipEstablished = false;
+    let nextConflictRefreshAt = 0;
+    const waitForNextProbe = (delayMs = PLAN_NATIVE_REPLAY_POLL_INTERVAL_MS) => (
+      new Promise<void>((resolve) => window.setTimeout(resolve, delayMs))
+    );
+    const resetAbsenceEvidence = () => {
+      absenceEvidence = updatePlanReplayAbsenceEvidence(
+        absenceEvidence,
+        { status: "unknown" },
+        Date.now(),
+      );
+    };
+    const clearCurrentProbe = () => {
+      if (
+        cancelled
+        || !isCurrentSelection(conversationId, generation)
+        || planReplayProbeGeneration.current !== probeGeneration
+      ) return;
+      setPlanReplayProbeConversationId((current) => (
+        current === conversationId ? undefined : current
+      ));
+    };
     // A renderer refresh can lose React's transient dialog queue while the
     // native RPC client still owns the unanswered requests. Re-read that
     // authoritative queue whenever active Plan work has no visible dialog.
-    void ensureStarted(selectedConversation, selectedProject)
-      .then(() => listPendingExtensionUiRequests(conversationId))
-      .then((requests) => {
-        if (!isCurrentSelection(conversationId, generation)) return;
-        requests.forEach(consumeAgentEventLine);
-      })
-      .catch(() => undefined);
-  }, [consumeAgentEventLine, ensureStarted, eventsReady, isCurrentSelection, planExtensionRequest?.requestKey, selectedConversation?.id, selectedConversation?.status, selectedProject?.id]);
+    // JSONL publication and native request caching are independent writes, so
+    // stabilize the exact runtime first and require repeated absence from that
+    // same pid/start/tool-call generation for the entire replay window.
+    void (async () => {
+      try {
+        for (;;) {
+          if (cancelled || !isCurrentSelection(conversationId, generation)) return;
+          const currentConversation = getConversationRef.current(conversationId);
+          const currentProject = getProjectRef.current(projectId);
+          if (!currentConversation || currentConversation.projectId !== projectId || !currentProject) {
+            return;
+          }
+
+          if (!ownershipEstablished) {
+            // Use current refs rather than the render snapshot: transcript and
+            // session metadata may legitimately advance while the probe runs.
+            await ensureStarted(currentConversation, currentProject);
+            if (cancelled || !isCurrentSelection(conversationId, generation)) return;
+            ownershipEstablished = true;
+          }
+
+          try {
+            const runningAgent = (await listRunningAgents()).find(
+              (agent) => agent.conversationId === conversationId,
+            );
+            if (!runningAgent || runningAgent.runtimeMode !== "plan") {
+              resetAbsenceEvidence();
+              observedRuntimeIdentity = undefined;
+              ownershipEstablished = false;
+              await waitForNextProbe();
+              continue;
+            }
+
+            const runtimeIdentity = `${runningAgent.pid}:${runningAgent.startedAt}`;
+            if (observedRuntimeIdentity && observedRuntimeIdentity !== runtimeIdentity) {
+              resetAbsenceEvidence();
+              observedRuntimeIdentity = runtimeIdentity;
+              ownershipEstablished = false;
+              await waitForNextProbe();
+              continue;
+            }
+            observedRuntimeIdentity = runtimeIdentity;
+
+            if (!planReplayExpectedToolCallId) {
+              const matchingRequest = matchingNativePlanRequest(
+                await listPendingExtensionUiRequests(conversationId),
+                conversationId,
+              );
+              if (matchingRequest) {
+                consumeAgentEventLine(matchingRequest);
+                clearCurrentProbe();
+                return;
+              }
+              absenceEvidence = updatePlanReplayAbsenceEvidence(
+                absenceEvidence,
+                {
+                  status: "absent",
+                  pid: runningAgent.pid,
+                  startedAt: runningAgent.startedAt,
+                  toolCallId: "<pending-native-plan-request>",
+                },
+                Date.now(),
+              );
+            } else {
+              const disposition = await reconcilePlanDialogRecovery({
+                conversationId,
+                expectedPid: runningAgent.pid,
+                expectedStartedAt: runningAgent.startedAt,
+                expectedToolCallId: planReplayExpectedToolCallId,
+              });
+              if (
+                disposition.pid !== runningAgent.pid
+                || disposition.startedAt !== runningAgent.startedAt
+              ) {
+                resetAbsenceEvidence();
+                ownershipEstablished = false;
+                await waitForNextProbe();
+                continue;
+              }
+              if (disposition.status === "replayed") {
+                consumeAgentEventLine(disposition.request);
+                clearCurrentProbe();
+                return;
+              }
+              if (disposition.status === "conflict") {
+                resetAbsenceEvidence();
+                const now = Date.now();
+                if (now >= nextConflictRefreshAt) {
+                  refreshPersistedTranscript(conversationId, 0);
+                  nextConflictRefreshAt = now + 500;
+                }
+                await waitForNextProbe();
+                continue;
+              }
+              absenceEvidence = updatePlanReplayAbsenceEvidence(
+                absenceEvidence,
+                disposition.status === "absent"
+                  ? {
+                      status: "absent",
+                      pid: disposition.pid,
+                      startedAt: disposition.startedAt,
+                      toolCallId: planReplayExpectedToolCallId,
+                    }
+                  : { status: "unknown" },
+                Date.now(),
+              );
+            }
+
+            if (hasAttestedPlanReplayAbsence(absenceEvidence)) {
+              clearCurrentProbe();
+              return;
+            }
+            await waitForNextProbe();
+          } catch {
+            // A failed native read or a temporary ownership transition is not
+            // absence. Drop any partial proof and reacquire before retrying.
+            resetAbsenceEvidence();
+            ownershipEstablished = false;
+            await waitForNextProbe(Math.max(400, PLAN_NATIVE_REPLAY_POLL_INTERVAL_MS));
+          }
+        }
+      } catch {
+        // ensureStarted owns the normal runtime error surface. Keep this probe
+        // unknown: an exception never proves that Prime Agent lost a dialog.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    consumeAgentEventLine,
+    ensureStarted,
+    eventsReady,
+    isCurrentSelection,
+    planExtensionRequest?.requestKey,
+    planReplayConversationId,
+    planReplayIdentity,
+    planReplayProjectId,
+    planReplayShouldRun,
+    refreshPersistedTranscript,
+  ]);
   useEffect(() => {
     if (!planExtensionRequest || !selectedConversation) return;
     // Answering a Plan question updates the persisted state before the native
@@ -4466,27 +5467,68 @@ export function useAgentRuntime(options: {
     if (!decoded) return;
     if (decoded.payload.kind !== "review") {
       if (currentState.phase === "question" && currentState.question?.requestId === planExtensionRequest.id) return;
-      const opened = openPlanQuestion(currentState, { request: planExtensionRequest });
+      let reconciledState = currentState;
+      if (reconciledState.phase === "review") {
+        const rearmed = rearmPlanModeAfterLostDialog(reconciledState, "review");
+        if (rearmed.status === "accepted") reconciledState = rearmed.state;
+      }
+      const opened = restorePlanQuestion(reconciledState, { request: planExtensionRequest });
       if (opened.status !== "accepted" || !opened.changed) return;
       updateConversation(selectedConversation.id, {
         status: "tool",
         planMode: opened.state,
-        planArtifactId: selectedConversation.planArtifactId ?? crypto.randomUUID(),
+        planArtifactId: selectedConversation.planArtifactId,
       });
       return;
     }
-    if (currentState.document) return;
     const document = planDocumentForReview(
       selectedConversation,
       decoded.payload.planId,
       decoded.payload.title,
     );
-    if (!document) return;
-    const opened = openPlanReview(currentState, { document });
-    if (opened.status !== "accepted") return;
+    if (!document) {
+      if (!planReviewDocumentRefreshes.current.has(planExtensionRequest.requestKey)) {
+        planReviewDocumentRefreshes.current.add(planExtensionRequest.requestKey);
+        const generation = activeSelection.current.generation;
+        void refreshPlanReviewDocument(
+          selectedConversation.id,
+          generation,
+          decoded.payload.planId,
+          decoded.payload.title,
+        ).finally(() => {
+          planReviewDocumentRefreshes.current.delete(planExtensionRequest.requestKey);
+        });
+      }
+      return;
+    }
+    let reconciledState = currentState;
+    if (reconciledState.phase === "question") {
+      const rearmed = rearmPlanModeAfterLostDialog(reconciledState, "question");
+      if (rearmed.status === "accepted") reconciledState = rearmed.state;
+    }
+    const opened = restorePlanReview(reconciledState, { document });
+    if (opened.status !== "accepted" || !opened.changed) return;
     updateConversation(selectedConversation.id, {
       planMode: opened.state,
-      planArtifactId: selectedConversation.planArtifactId ?? crypto.randomUUID(),
+      planArtifactId: decoded.payload.planId,
+    });
+  }, [planExtensionRequest, refreshPlanReviewDocument, selectedConversation, updateConversation]);
+  useEffect(() => {
+    if (planExtensionRequest || !selectedConversation || selectedConversation.messages.length === 0) return;
+    if (!["idle", "offline", "error"].includes(selectedConversation.status)) return;
+    const currentState = conversationPlanState(selectedConversation);
+    if (currentState.phase !== "question" && currentState.phase !== "review") return;
+    // Prime Agent's persisted transcript is authoritative. Once it contains
+    // the terminal result for the old dialog, a renderer snapshot must not
+    // keep presenting that UUID as recoverable work.
+    if (unresolvedPlanDialogSummary(selectedConversation).total > 0) return;
+    const rearmed = rearmPlanModeAfterLostDialog(currentState, currentState.phase);
+    if (rearmed.status !== "accepted" || !rearmed.changed) return;
+    updateConversation(selectedConversation.id, {
+      planMode: rearmed.state,
+      planArtifactId: currentState.phase === "review"
+        ? undefined
+        : selectedConversation.planArtifactId,
     });
   }, [planExtensionRequest, selectedConversation, updateConversation]);
 
@@ -4521,6 +5563,7 @@ export function useAgentRuntime(options: {
     extensionRequest,
     extensionRequestCount: extensionRequests.filter((request) => !isClaimedPlanUiRequest(request)).length,
     planExtensionRequest,
+    isPlanRequestReplayPending: planReplayProbeConversationId === selectedConversation?.id,
     ensureStarted,
     setConversationRuntimeMode,
     retryPlanFinalization: finalizePendingPlan,
@@ -4578,6 +5621,7 @@ export function handleMessageEvent(
     if (
       event.type !== "message_start"
       || isInternalPlanRecoveryPrompt(extracted)
+      || isInternalPlanHandoffPrompt(extracted)
       || (!extracted && !eventAttachments.length)
     ) return;
     const timestamp = typeof rawMessage?.timestamp === "number" ? rawMessage.timestamp : undefined;
@@ -4621,6 +5665,7 @@ export function handleMessageEvent(
   const assistantEvent = event.assistantMessageEvent as Record<string, unknown> | undefined;
   const isTextDelta = assistantEvent?.type === "text_delta";
   const delta = isTextDelta && typeof assistantEvent.delta === "string" ? assistantEvent.delta : "";
+  const assistantCreatedAt = historyTimestamp(rawMessage?.timestamp);
   if (event.type === "message_update" && !isTextDelta) return;
   updateConversation(conversationId, (conversation) => {
     const streamingIndex = [...conversation.messages].reverse().findIndex((item) => item.role === "assistant" && item.status === "streaming");
@@ -4632,7 +5677,7 @@ export function handleMessageEvent(
     if (event.type === "message_end") {
       if (actualIndex < 0) {
         if (!extracted) return conversation;
-        return { ...conversation, hasContent: true, messages: [...conversation.messages, { id: eventId || uid("assistant"), role: "assistant", content: extracted, createdAt: now(), status: "complete" }] };
+        return { ...conversation, hasContent: true, messages: [...conversation.messages, { id: eventId || uid("assistant"), role: "assistant", content: extracted, createdAt: assistantCreatedAt, status: "complete" }] };
       }
       const messages = [...conversation.messages];
       const current = messages[actualIndex]!;
@@ -4660,7 +5705,7 @@ export function handleMessageEvent(
         id: eventId || uid("assistant"),
         role: "assistant",
         content: extracted,
-        createdAt: now(),
+        createdAt: assistantCreatedAt,
         status: "streaming",
       };
       return { ...conversation, hasContent: true, messages: [...conversation.messages, message] };
@@ -4668,7 +5713,7 @@ export function handleMessageEvent(
 
     if (actualIndex < 0 && !extracted && !delta) return conversation;
     if (actualIndex < 0) {
-      return { ...conversation, hasContent: true, messages: [...conversation.messages, { id: eventId || uid("assistant"), role: "assistant", content: extracted || delta, createdAt: now(), status: "streaming" }] };
+      return { ...conversation, hasContent: true, messages: [...conversation.messages, { id: eventId || uid("assistant"), role: "assistant", content: extracted || delta, createdAt: assistantCreatedAt, status: "streaming" }] };
     }
     const messages = [...conversation.messages];
     const current = messages[actualIndex]!;
@@ -5321,6 +6366,7 @@ export function mapAgentMessages(messages: unknown[]): ChatMessage[] {
     if (role === "user" || role === "system") {
       const extracted = extractMessageText(message);
       if (role === "user" && isInternalPlanRecoveryPrompt(extracted)) continue;
+      const internalPlanHandoff = role === "user" && isInternalPlanHandoffPrompt(extracted);
       const parsedContext = role === "user"
         ? parsePrimeOrbitAttachmentContext(extracted)
         : { visibleText: extracted, attachments: [] };
@@ -5339,10 +6385,13 @@ export function mapAgentMessages(messages: unknown[]): ChatMessage[] {
       mapped.push({
         id: String(message.id ?? `history-${index}`),
         role,
-        content,
+        content: internalPlanHandoff
+          ? extracted.slice(0, extracted.indexOf("\n") >= 0 ? extracted.indexOf("\n") : undefined)
+          : content,
         createdAt,
         status: "complete",
         attachments: attachments.length ? attachments : undefined,
+        ...(internalPlanHandoff ? { internal: "plan_handoff" as const } : {}),
       });
       continue;
     }
@@ -5520,30 +6569,136 @@ export function mergeHistoricalAttachmentPreviews(next: ChatMessage[], previous:
   });
 }
 
+const PRIME_AGENT_PROJECTION_MATCH_WINDOW_MS = 15_000;
+
+function projectionTimestamp(message: ChatMessage): number {
+  const timestamp = Date.parse(message.createdAt);
+  return Number.isFinite(timestamp) ? timestamp : Number.POSITIVE_INFINITY;
+}
+
+function primeAgentProjectionShape(message: ChatMessage): string | undefined {
+  if (message.role === "system") return undefined;
+  const tools = (message.tools ?? []).map((tool) => tool.id).sort();
+  const attachments = (message.attachments ?? []).map((attachment) => (
+    `${attachment.isImage ? "image" : "document"}:${attachment.mimeType}`
+  ));
+  return JSON.stringify([message.role, message.content.trim(), tools, attachments]);
+}
+
+/** Live events and get_messages are two Prime Agent projections of the same
+ * durable record, but get_messages does not always retain the session-tree id.
+ * Match only exact Prime Agent fields, within a tight timestamp window. */
+function equivalentPrimeAgentProjection(left: ChatMessage, right: ChatMessage): boolean {
+  const leftShape = primeAgentProjectionShape(left);
+  if (!leftShape || leftShape !== primeAgentProjectionShape(right)) return false;
+  const leftTime = projectionTimestamp(left);
+  const rightTime = projectionTimestamp(right);
+  if (!Number.isFinite(leftTime) || !Number.isFinite(rightTime)) return false;
+  return Math.abs(leftTime - rightTime) <= PRIME_AGENT_PROJECTION_MATCH_WINDOW_MS;
+}
+
 /** An empty daemon projection is not evidence that a persisted transcript was
- * deleted. Preserve already rendered messages until a non-empty authoritative
- * projection arrives. */
+ * deleted. Preserve already rendered Prime Agent messages until a non-empty
+ * authoritative projection arrives. */
 export function reconcileRpcTranscript(
   current: ChatMessage[],
   rpc: ChatMessage[],
 ): ChatMessage[] {
   const durableCurrent = stripLegacyOrbitQueueMessages(current);
-  return rpc.length === 0 && durableCurrent.length > 0
-    ? durableCurrent
-    : mergeHistoricalAttachmentPreviews(rpc, durableCurrent);
+  if (rpc.length === 0) return durableCurrent;
+  const incoming = mergeHistoricalAttachmentPreviews(rpc, durableCurrent);
+  if (durableCurrent.length === 0) return incoming;
+
+  const messageKeys = (message: ChatMessage) => [message.entryId, message.id]
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
+  const incomingByKey = new Map<string, number>();
+  incoming.forEach((message, index) => {
+    for (const key of messageKeys(message)) incomingByKey.set(key, index);
+  });
+  const matched = new Map<number, number>();
+  const currentExactMatches = durableCurrent.map((message) => messageKeys(message)
+    .map((key) => incomingByKey.get(key))
+    .find((index): index is number => index !== undefined));
+
+  // Pair remaining event/history projections globally by closest authoritative
+  // timestamp. This preserves legitimate repeated messages while collapsing
+  // the same Prime Agent record when the RPC projection has no tree id.
+  const projectionCandidates: Array<{ currentIndex: number; incomingIndex: number; distance: number }> = [];
+  const incomingProjectionBuckets = new Map<string, number[]>();
+  incoming.forEach((message, incomingIndex) => {
+    const shape = primeAgentProjectionShape(message);
+    if (!shape) return;
+    const bucket = incomingProjectionBuckets.get(shape) ?? [];
+    bucket.push(incomingIndex);
+    incomingProjectionBuckets.set(shape, bucket);
+  });
+  durableCurrent.forEach((message, currentIndex) => {
+    if (currentExactMatches[currentIndex] !== undefined) return;
+    const shape = primeAgentProjectionShape(message);
+    if (!shape) return;
+    (incomingProjectionBuckets.get(shape) ?? []).forEach((incomingIndex) => {
+      const candidate = incoming[incomingIndex]!;
+      if (!equivalentPrimeAgentProjection(message, candidate)) return;
+      projectionCandidates.push({
+        currentIndex,
+        incomingIndex,
+        distance: Math.abs(projectionTimestamp(message) - projectionTimestamp(candidate)),
+      });
+    });
+  });
+  projectionCandidates
+    .sort((left, right) => left.distance - right.distance
+      || left.currentIndex - right.currentIndex
+      || left.incomingIndex - right.incomingIndex);
+  const semanticallyMatchedIncoming = new Set<number>();
+  projectionCandidates
+    .forEach(({ currentIndex, incomingIndex }) => {
+      if (matched.has(currentIndex) || semanticallyMatchedIncoming.has(incomingIndex)) return;
+      matched.set(currentIndex, incomingIndex);
+      semanticallyMatchedIncoming.add(incomingIndex);
+    });
+  // A previously merged history copy can share an incoming id with the native
+  // event projection paired above. Map both to the same authoritative record;
+  // the emission pass below renders that record exactly once.
+  currentExactMatches.forEach((incomingIndex, currentIndex) => {
+    if (incomingIndex !== undefined) matched.set(currentIndex, incomingIndex);
+  });
+
+  const emittedIncoming = new Set<number>();
+  const merged = durableCurrent.flatMap((message, index) => {
+    const match = matched.get(index);
+    if (match === undefined) return [message];
+    if (emittedIncoming.has(match)) return [];
+    emittedIncoming.add(match);
+    return [incoming[match]!];
+  });
+  incoming.forEach((message, index) => {
+    if (!emittedIncoming.has(index)) merged.push(message);
+  });
+
+  // Both projections are chronological. A stable timestamp sort inserts
+  // newly discovered history without reordering equal-time live events.
+  return merged
+    .map((message, index) => ({ message, index, time: Date.parse(message.createdAt) }))
+    .sort((left, right) => {
+      const leftTime = Number.isFinite(left.time) ? left.time : Number.MAX_SAFE_INTEGER;
+      const rightTime = Number.isFinite(right.time) ? right.time : Number.MAX_SAFE_INTEGER;
+      return leftTime - rightTime || left.index - right.index;
+    })
+    .map(({ message }) => message);
 }
 
 /** If an empty RPC response won the initial race, let the validated session
- * file repopulate text as well as attachment previews. */
+ * file reconcile onto the same Prime Agent transcript without erasing newer
+ * authoritative turns that have not been flushed yet. */
 export function reconcileLocalTranscriptAfterRpc(
   current: ChatMessage[],
   local: ChatMessage[],
 ): ChatMessage[] {
   const durableCurrent = stripLegacyOrbitQueueMessages(current);
   const durableLocal = stripLegacyOrbitQueueMessages(local);
-  return durableCurrent.length === 0
-    ? durableLocal
-    : mergeHistoricalAttachmentPreviews(durableCurrent, durableLocal);
+  if (durableLocal.length === 0) return durableCurrent;
+  return reconcileRpcTranscript(durableCurrent, durableLocal);
 }
 
 function historyTimestamp(value: unknown): string {

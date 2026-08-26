@@ -770,6 +770,7 @@ function App() {
             changes={changes}
             resourceReloadSupported={detection.mode !== "system"}
             planRequest={agent.planExtensionRequest}
+            isPlanRequestReplayPending={agent.isPlanRequestReplayPending}
             onPlanMode={(mode) => agent.setConversationRuntimeMode(selectedConversation.id, mode)}
             onRetryPlanFinalization={agent.retryPlanFinalization}
             onRecoverPlanDialogs={agent.recoverPlanDialogs}

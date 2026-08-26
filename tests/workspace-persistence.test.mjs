@@ -24,6 +24,7 @@ const {
   jsonValuesEqual,
   mergeFavoriteModelRefs,
   rebaseWorkspaceState,
+  restoreRuntimeState,
   resolveNewConversationModel,
   workspaceStatesEqual,
 } = compiledModule.exports;
@@ -91,6 +92,37 @@ function sortObjectKeys(value) {
   if (!value || typeof value !== "object") return value;
   return Object.fromEntries(Object.keys(value).sort().map((key) => [key, sortObjectKeys(value[key])]));
 }
+
+test("repeated workspace hydration preserves the selected live transcript", () => {
+  const liveMessage = {
+    id: "message-live",
+    role: "assistant",
+    content: "Already rendered from Prime Agent",
+    createdAt: "2026-08-25T21:00:00.000Z",
+    status: "complete",
+  };
+  const runtime = state({
+    conversations: [conversation({
+      status: "idle",
+      messages: [liveMessage],
+      activities: [{ id: "activity-live", label: "Complete", status: "complete" }],
+    })],
+  });
+  const durable = state({
+    conversations: [conversation({
+      status: "offline",
+      messages: [],
+      activities: [],
+      hasContent: true,
+    })],
+  });
+
+  const restored = restoreRuntimeState(runtime, durable);
+  assert.deepEqual(restored.conversations[0].messages, [liveMessage]);
+  assert.equal(restored.conversations[0].status, "idle");
+  assert.equal(restored.conversations[0].activities.length, 1);
+  assert.equal(restored.conversations[0].hasContent, true, "durable metadata still comes from disk");
+});
 
 test("treats serde-sorted snapshots and frontend insertion order as the same workspace", () => {
   const frontendState = state();

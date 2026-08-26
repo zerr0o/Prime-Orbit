@@ -20,13 +20,12 @@ new Function("module", "exports", "require", buildResult.outputFiles[0].text)(
 );
 const {
   activeStatusForSessionActions,
-  appendPendingDirectUserMessage,
   applyAuthoritativeUserMessageStart,
   applyRuntimeCompactingState,
   compactResponseDisposition,
   compactionEndPresentation,
   commitPlanRuntimeModeTransition,
-  canResumePendingPlanFinalization,
+  canFinalizePendingPlanDecision,
   conversationStatusForSessionSnapshot,
   conversationHasPlanHandoff,
   conversationPlanState,
@@ -48,20 +47,31 @@ const {
   isRecoverableConversationActivationError,
   isRecoverableRuntimeBootstrapError,
   mapAgentMessages,
+  matchingNativePlanRequest,
   mergeHistoricalAttachmentPreviews,
+  hasAttestedPlanReplayAbsence,
+  planReplayProbeIdentity,
   resolveNativePromptDelivery,
   promptAttachmentPayload,
   reconcileLocalTranscriptAfterRpc,
   reconcileRpcTranscript,
-  removePendingDirectUserMessage,
   cancelUnresolvedPlanDialogs,
   recordedPlanResponseValue,
   selectForkEntryId,
   shouldApplyHistoryResponse,
+  usesPersistedPrimeAgentTranscript,
   shouldEnterLocalHistoryLoading,
+  shouldReuseLocalHistoryLoad,
+  bindRuntimePageHideTeardown,
+  shouldApplyDurableIdleTaskState,
+  statusDuringRuntimeRecovery,
   shouldConsumeConversationResponse,
   stripLegacyOrbitQueueRows,
   shouldRecoverIdleSessionState,
+  conversationHasPlanDecisionResult,
+  persistedPlanToolResultStatus,
+  shouldReplayNativePlanRequests,
+  updatePlanReplayAbsenceEvidence,
   shouldApplySessionStateResponse,
   shouldScheduleTerminalStateReconciliation,
   isCompactDaemonAcknowledgementTimeout,
@@ -69,42 +79,90 @@ const {
   refineLifecycleDisposition,
   refinementResultPresentation,
   rlmChildPresentation,
+  PLAN_NATIVE_REPLAY_POLL_INTERVAL_MS,
+  PLAN_NATIVE_REPLAY_PROBE_TIMEOUT_MS,
 } = compiledModule.exports;
 
-test("keeps an accepted direct prompt visible until Prime Agent supplies its identity", () => {
-  const pending = appendPendingDirectUserMessage(
-    conversation(),
-    "Build the feature",
-    "2026-08-25T00:00:00.000Z",
-    [],
-    "local-prompt",
-  );
-  assert.equal(pending.messages.length, 1);
-  assert.equal(pending.messages[0].id, "local-prompt");
-  assert.equal(pending.messages[0].status, "pending");
-
-  const authoritative = applyAuthoritativeUserMessageStart(
-    pending,
-    "Build the feature",
-    "2026-08-25T00:00:00.050Z",
-    [],
-    "entry-native",
-  );
-  assert.equal(authoritative.messages.length, 1);
-  assert.equal(authoritative.messages[0].id, "entry-native");
-  assert.equal(authoritative.messages[0].status, "complete");
+test("Plan replay waits on a named multi-second native stabilization window", () => {
+  assert.ok(PLAN_NATIVE_REPLAY_PROBE_TIMEOUT_MS >= 5_000);
+  assert.ok(PLAN_NATIVE_REPLAY_POLL_INTERVAL_MS >= 50);
+  assert.ok(PLAN_NATIVE_REPLAY_POLL_INTERVAL_MS <= 500);
 });
 
-test("rolls back only the rejected direct prompt placeholder", () => {
-  const pending = appendPendingDirectUserMessage(
-    conversation({ messages: [{ id: "older", role: "user", content: "Older", status: "complete" }] }),
-    "Rejected",
-    "2026-08-25T00:00:00.000Z",
-    [],
-    "local-rejected",
+test("Plan replay identity ignores cloned workspace objects but changes with the durable call", () => {
+  assert.equal(
+    planReplayProbeIdentity("conversation", "project", "call-1"),
+    planReplayProbeIdentity(`${"conversation"}`, `${"project"}`, `${"call-1"}`),
   );
-  const rolledBack = removePendingDirectUserMessage(pending, "local-rejected");
-  assert.deepEqual(rolledBack.messages.map((message) => message.id), ["older"]);
+  assert.notEqual(
+    planReplayProbeIdentity("conversation", "project", "call-1"),
+    planReplayProbeIdentity("conversation", "project", "call-2"),
+  );
+  assert.equal(planReplayProbeIdentity(undefined, "project", "call-1"), undefined);
+});
+
+test("Plan replay attests absence only after repeated observations of one exact generation", () => {
+  const generation = { pid: 41, startedAt: 1_000, toolCallId: "call-current" };
+  let evidence = updatePlanReplayAbsenceEvidence(
+    undefined,
+    { status: "absent", ...generation },
+    10_000,
+  );
+  assert.equal(hasAttestedPlanReplayAbsence(evidence), false);
+
+  evidence = updatePlanReplayAbsenceEvidence(
+    evidence,
+    { status: "absent", ...generation },
+    10_000 + PLAN_NATIVE_REPLAY_PROBE_TIMEOUT_MS,
+  );
+  assert.equal(hasAttestedPlanReplayAbsence(evidence), true);
+
+  const restarted = updatePlanReplayAbsenceEvidence(
+    evidence,
+    { status: "absent", ...generation, pid: 42 },
+    20_000,
+  );
+  assert.equal(restarted?.observations, 1);
+  assert.equal(hasAttestedPlanReplayAbsence(restarted), false);
+  assert.equal(
+    updatePlanReplayAbsenceEvidence(restarted, { status: "unknown" }, 20_100),
+    undefined,
+  );
+});
+
+test("a published Prime Agent session file is the sole transcript projection", () => {
+  assert.equal(usesPersistedPrimeAgentTranscript(true, "C:/Users/test/.prime/agent/sessions/a.jsonl"), true);
+  assert.equal(usesPersistedPrimeAgentTranscript(true, ""), false);
+  assert.equal(usesPersistedPrimeAgentTranscript(false, "preview.jsonl"), false);
+});
+
+test("runtime reconnect preserves Prime Agent's durable idle verdict", () => {
+  assert.equal(statusDuringRuntimeRecovery("starting", true), "idle");
+  assert.equal(statusDuringRuntimeRecovery("error", true), "idle");
+  assert.equal(statusDuringRuntimeRecovery("idle", false), "starting");
+  assert.equal(statusDuringRuntimeRecovery("streaming", false), "streaming");
+  assert.equal(statusDuringRuntimeRecovery("tool", false), "tool");
+  assert.equal(statusDuringRuntimeRecovery("queued", false), "queued");
+});
+
+test("an admitted prompt requires a later revision carrying Prime Agent's durable idle verdict", () => {
+  assert.equal(shouldApplyDurableIdleTaskState("needs_input", false, "10:1", "10:1"), true);
+  assert.equal(shouldApplyDurableIdleTaskState("needs_input", true, "10:1", "10:1"), false);
+  assert.equal(shouldApplyDurableIdleTaskState("completed", true, "10:1", "20:2"), true);
+  assert.equal(
+    shouldApplyDurableIdleTaskState("needs_input", true, undefined, "20:2"),
+    false,
+    "an initial history read has no pre-prompt revision baseline",
+  );
+  assert.equal(shouldApplyDurableIdleTaskState(undefined, true, "10:1", "20:2"), false);
+});
+
+test("transcript shape cannot substitute for a durable Prime Agent idle verdict", () => {
+  assert.equal(
+    shouldApplyDurableIdleTaskState(undefined, false, "10:1", "20:2"),
+    false,
+    "even an advanced transcript remains active without a persisted task verdict",
+  );
 });
 
 test("keeps internal Plan recovery prompts out of live and restored transcripts", () => {
@@ -170,8 +228,13 @@ test("conversation Plan state selects the isolated runtime and recovers submitte
   assert.equal(recordedPlanResponseValue(
     { ...pendingPlanAction, stage: "decisionRecorded" },
     { options: ["apply-wire", "keep-wire", "revise-wire"] },
-    { payload: { kind: "review" } },
+    { payload: { kind: "review", planId: "handoff" } },
   ), "apply-wire");
+  assert.equal(recordedPlanResponseValue(
+    { ...pendingPlanAction, stage: "decisionRecorded" },
+    { options: ["apply-wire", "keep-wire", "revise-wire"] },
+    { payload: { kind: "review", planId: "different-call" } },
+  ), undefined, "a durable decision must never answer a different Prime Agent call");
 
   const document = planDocumentForReview({
     messages: [{
@@ -220,6 +283,23 @@ test("a Plan mode switch publishes intent, restarts, then commits UI state", asy
   ]);
 });
 
+test("a Plan mode switch keeps its published intent through asynchronous persistence", async () => {
+  const observations = [];
+  let expectedMode;
+  await commitPlanRuntimeModeTransition(
+    "normal",
+    async () => "normal",
+    async () => {
+      observations.push(expectedMode);
+      await Promise.resolve();
+      observations.push(expectedMode);
+    },
+    (mode) => { expectedMode = mode; },
+  );
+  assert.deepEqual(observations, ["normal", "normal"]);
+  assert.equal(expectedMode, undefined);
+});
+
 test("a failed Plan mode restart leaves persisted mode untouched and clears intent", async () => {
   let persisted = false;
   let expectedMode;
@@ -249,6 +329,22 @@ test("a stable Plan handoff marker reconciles an admitted Apply prompt after rel
     content: `<!-- prime-orbit-plan-handoff:v1:${handoffId} -->\nImplement`,
   }] }, handoffId), true);
   assert.equal(conversationHasPlanHandoff({ messages: [] }, handoffId), false);
+});
+
+test("an internal Plan handoff remains available for reconciliation without exposing its document", () => {
+  const [message] = mapAgentMessages([{
+    id: "handoff-message",
+    role: "user",
+    timestamp: Date.now(),
+    content: [{
+      type: "text",
+      text: "<!-- prime-orbit-plan-handoff:v1:artifact-123 -->\n[Prime Orbit approved plan]\n# Private plan body",
+    }],
+  }]);
+  assert.equal(message.internal, "plan_handoff");
+  assert.equal(message.content, "<!-- prime-orbit-plan-handoff:v1:artifact-123 -->");
+  assert.equal(message.content.includes("Private plan body"), false);
+  assert.equal(conversationHasPlanHandoff({ messages: [message] }, "artifact-123"), true);
 });
 
 test("historical Plan submit keeps its typed Markdown projection above the generic history limit", () => {
@@ -386,6 +482,40 @@ test("an empty RPC history cannot be relatched into local-history loading", () =
   );
 });
 
+test("a remounted selection never reuses a stale local-history read", () => {
+  assert.equal(shouldReuseLocalHistoryLoad(7, 7), true, "the same selection generation shares one disk read");
+  assert.equal(
+    shouldReuseLocalHistoryLoad(7, 8),
+    false,
+    "HMR or StrictMode must replace a read whose stale guard can no longer apply it",
+  );
+  assert.equal(shouldReuseLocalHistoryLoad(undefined, 8), false);
+});
+
+test("React effect cleanup does not masquerade as a real WebView teardown", () => {
+  let listener;
+  let teardownCount = 0;
+  const target = {
+    addEventListener(type, next) {
+      assert.equal(type, "pagehide");
+      listener = next;
+    },
+    removeEventListener(type, previous) {
+      assert.equal(type, "pagehide");
+      if (listener === previous) listener = undefined;
+    },
+  };
+
+  const cleanup = bindRuntimePageHideTeardown(target, () => { teardownCount += 1; });
+  cleanup();
+  assert.equal(teardownCount, 0, "Fast Refresh only detaches the old listener");
+
+  const cleanupAfterRemount = bindRuntimePageHideTeardown(target, () => { teardownCount += 1; });
+  listener(new Event("pagehide"));
+  assert.equal(teardownCount, 1, "the real page lifecycle still tears down runtime requests");
+  cleanupAfterRemount();
+});
+
 test("an idle bootstrap snapshot cannot erase a prompt admission still in progress", () => {
   assert.equal(shouldRecoverIdleSessionState(true, false, true), false);
   assert.equal(shouldRecoverIdleSessionState(true, false, false), true);
@@ -441,9 +571,6 @@ test("an active daemon session action remains visible and forces queued prompt d
   assert.equal(sessionActionsHaveWork(activePlanTool.sessionActions), true);
   assert.equal(activeStatusForSessionActions(activePlanTool.sessionActions), "streaming");
   assert.equal(conversationStatusForSessionSnapshot(activePlanTool, "idle", false), "streaming");
-  assert.equal(canResumePendingPlanFinalization(activePlanTool, false), false);
-  assert.equal(canResumePendingPlanFinalization(idleSessionSnapshot(), true), false);
-  assert.equal(canResumePendingPlanFinalization(idleSessionSnapshot(), false), true);
   assert.equal(conversationStatusForSessionSnapshot(idleSessionSnapshot({
     sessionActions: {
       queuedCount: 0,
@@ -460,6 +587,91 @@ test("an active daemon session action remains visible and forces queued prompt d
   assert.equal(activeStatusForSessionActions(preservedQueue.sessionActions), undefined);
   assert.equal(conversationStatusForSessionSnapshot(preservedQueue, "streaming", false), "idle");
   assert.equal(resolveNativePromptDelivery("idle", undefined, sessionActionsHaveWork(preservedQueue.sessionActions)), undefined);
+});
+
+test("only an exact persisted Plan result unlocks the runtime handoff", () => {
+  const conversation = {
+    messages: [{
+      tools: [{ id: "plan-call", name: "prime_orbit_plan_submit", status: "completed" }],
+    }],
+  };
+  assert.equal(conversationHasPlanDecisionResult(conversation, "plan-call"), true);
+  assert.equal(conversationHasPlanDecisionResult(conversation, "other-call"), false);
+  assert.equal(conversationHasPlanDecisionResult({
+    messages: [{ tools: [{ id: "plan-call", name: "prime_orbit_plan_submit", status: "unresolved" }] }],
+  }, "plan-call"), false);
+  assert.equal(canFinalizePendingPlanDecision(false, true), true);
+  assert.equal(canFinalizePendingPlanDecision(true, true), false);
+  assert.equal(canFinalizePendingPlanDecision(false, false), false);
+});
+
+test("Plan responses wait for Prime Agent's exact persisted tool result", () => {
+  const messages = [{
+    role: "toolResult",
+    toolCallId: "question-call",
+    toolName: "prime_orbit_plan_question",
+    isError: false,
+  }, {
+    role: "toolResult",
+    toolCallId: "review-call",
+    toolName: "prime_orbit_plan_submit",
+    isError: true,
+  }];
+  assert.equal(persistedPlanToolResultStatus(messages, "question-call"), "completed");
+  assert.equal(persistedPlanToolResultStatus(messages, "review-call"), "failed");
+  assert.equal(persistedPlanToolResultStatus(messages, "other-call"), undefined);
+  assert.equal(persistedPlanToolResultStatus([{
+    role: "toolResult",
+    toolCallId: "question-call",
+    toolName: "untrusted_tool",
+    isError: false,
+  }], "question-call"), undefined);
+});
+
+test("replays native Plan requests while Prime Agent waits in an idle projection", () => {
+  assert.equal(shouldReplayNativePlanRequests("idle", "question"), true);
+  assert.equal(shouldReplayNativePlanRequests("error", "review"), true);
+  assert.equal(shouldReplayNativePlanRequests("tool", undefined), true);
+  assert.equal(shouldReplayNativePlanRequests("idle", undefined), false);
+});
+
+test("native Plan replay correlates the transient request to the durable transcript call", () => {
+  const titleFor = (planId) => {
+    const encoded = Buffer.from(JSON.stringify({
+      kind: "review",
+      planId,
+      title: "Implementation plan",
+      v: 1,
+    }), "utf8").toString("base64url");
+    return `prime-orbit-plan-ui:v1:${encoded}\nPlan ready`;
+  };
+  const payloadFor = (conversationId, requestId, planId, runtimeMode = "plan") => ({
+    conversationId,
+    runtimeMode,
+    line: JSON.stringify({
+      type: "extension_ui_request",
+      id: requestId,
+      method: "select",
+      title: titleFor(planId),
+      options: ["Apply", "Keep", "Revise"],
+    }),
+  });
+  const stale = payloadFor("conversation", "request-old", "call-old");
+  const expected = payloadFor("conversation", "request-current", "call-current");
+  const wrongRuntime = payloadFor("conversation", "request-normal", "call-current", "normal");
+
+  assert.equal(
+    matchingNativePlanRequest([stale, wrongRuntime, expected], "conversation", "call-current"),
+    expected,
+  );
+  assert.equal(
+    matchingNativePlanRequest([stale], "conversation", "call-current"),
+    undefined,
+  );
+  assert.equal(
+    matchingNativePlanRequest([expected], "other-conversation", "call-current"),
+    undefined,
+  );
 });
 
 test("rejects an idle snapshot requested before a newer prompt or lifecycle epoch", () => {
@@ -525,9 +737,10 @@ test("an authoritative idle snapshot closes orphaned Python tools and their runn
   );
 });
 
-test("goal prompt responses stay scoped to their mutation, including late failures", () => {
+test("owned command responses stay scoped to their initiating transaction", () => {
   assert.equal(shouldConsumeConversationResponse(undefined), false);
   assert.equal(shouldConsumeConversationResponse("goal_mutation"), true);
+  assert.equal(shouldConsumeConversationResponse("prompt_admission"), true);
   assert.equal(shouldConsumeConversationResponse(undefined, true), true);
 });
 
@@ -742,6 +955,80 @@ test("an empty RPC transcript never erases a validated persisted conversation", 
     current,
     "local history fills the transcript when an empty RPC response won the race",
   );
+});
+
+test("a stale validated session file does not erase newer Prime Agent turns already rendered", () => {
+  const current = [
+    { id: "history-user-1", entryId: "history-user-1", role: "user", content: "First", createdAt: "2026-08-25T00:00:00.000Z", status: "complete" },
+    { id: "history-assistant-1", entryId: "history-assistant-1", role: "assistant", content: "Answer", createdAt: "2026-08-25T00:00:01.000Z", status: "complete" },
+    { id: "rpc-user-2", role: "user", content: "Second", createdAt: "2026-08-25T00:00:02.000Z", status: "complete" },
+  ];
+  const local = [
+    { id: "history-user-1", entryId: "history-user-1", role: "user", content: "First", createdAt: "2026-08-25T00:00:00.000Z", status: "complete" },
+    { id: "history-assistant-1", entryId: "history-assistant-1", role: "assistant", content: "Answer", createdAt: "2026-08-25T00:00:01.000Z", status: "complete" },
+  ];
+
+  const reconciled = reconcileLocalTranscriptAfterRpc(current, local);
+  assert.deepEqual(reconciled.map((message) => message.id), ["history-user-1", "history-assistant-1", "rpc-user-2"]);
+});
+
+test("a partial RPC transcript cannot erase already rendered durable turns", () => {
+  const current = [
+    { id: "user-1", entryId: "user-1", role: "user", content: "First", createdAt: "2026-08-25T00:00:00.000Z", status: "complete" },
+    { id: "assistant-1", entryId: "assistant-1", role: "assistant", content: "Answer", createdAt: "2026-08-25T00:00:01.000Z", status: "complete" },
+    { id: "user-2", entryId: "user-2", role: "user", content: "Second", createdAt: "2026-08-25T00:00:02.000Z", status: "complete" },
+  ];
+  const rpc = [
+    { ...current[1], content: "Authoritative answer" },
+    { id: "assistant-2", entryId: "assistant-2", role: "assistant", content: "Latest", createdAt: "2026-08-25T00:00:03.000Z", status: "complete" },
+  ];
+
+  const reconciled = reconcileRpcTranscript(current, rpc);
+  assert.deepEqual(reconciled.map((message) => message.id), ["user-1", "assistant-1", "user-2", "assistant-2"]);
+  assert.equal(reconciled[1].content, "Authoritative answer");
+});
+
+test("RPC history replaces id-less projections of the same Prime Agent records", () => {
+  const live = [
+    { id: "event-user", role: "user", content: "My prompt", createdAt: "2026-08-25T00:00:01.000Z", status: "complete" },
+    { id: "event-assistant", role: "assistant", content: "Answer", createdAt: "2026-08-25T00:00:02.000Z", status: "complete" },
+  ];
+  const rpc = [
+    { id: "history-0", role: "user", content: "My prompt", createdAt: "2026-08-25T00:00:01.000Z", status: "complete" },
+    { id: "history-1", role: "assistant", content: "Answer", createdAt: "2026-08-25T00:00:02.000Z", status: "complete" },
+  ];
+
+  const reconciled = reconcileRpcTranscript(live, rpc);
+  assert.deepEqual(reconciled.map((message) => message.id), ["history-0", "history-1"]);
+});
+
+test("a later Prime Agent snapshot collapses duplicates left by two native projections", () => {
+  const current = [
+    { id: "event-user", role: "user", content: "My prompt", createdAt: "2026-08-25T00:00:01.000Z", status: "complete" },
+    { id: "history-0", role: "user", content: "My prompt", createdAt: "2026-08-25T00:00:01.000Z", status: "complete" },
+    { id: "event-assistant", role: "assistant", content: "Answer", createdAt: "2026-08-25T00:00:02.000Z", status: "complete" },
+    { id: "history-1", role: "assistant", content: "Answer", createdAt: "2026-08-25T00:00:02.000Z", status: "complete" },
+  ];
+  const rpc = [
+    { id: "history-0", role: "user", content: "My prompt", createdAt: "2026-08-25T00:00:01.000Z", status: "complete" },
+    { id: "history-1", role: "assistant", content: "Answer", createdAt: "2026-08-25T00:00:02.000Z", status: "complete" },
+  ];
+
+  const reconciled = reconcileRpcTranscript(current, rpc);
+  assert.deepEqual(reconciled.map((message) => message.id), ["history-0", "history-1"]);
+});
+
+test("projection reconciliation preserves repeated Prime Agent messages by occurrence", () => {
+  const current = [
+    { id: "old-user", role: "user", content: "same", createdAt: "2026-08-25T00:00:00.000Z", status: "complete" },
+    { id: "new-user", role: "user", content: "same", createdAt: "2026-08-25T00:00:10.000Z", status: "complete" },
+  ];
+  const partialRpc = [
+    { id: "history-new-user", role: "user", content: "same", createdAt: "2026-08-25T00:00:10.000Z", status: "complete" },
+  ];
+
+  const reconciled = reconcileRpcTranscript(current, partialRpc);
+  assert.deepEqual(reconciled.map((message) => message.id), ["old-user", "history-new-user"]);
 });
 
 test("never resurrects attachments onto a different or attachment-free historical turn", () => {

@@ -40,6 +40,8 @@ const LEGACY_PLAN_RECOVERY_PROMPTS = [
 ] as const;
 export const PLAN_REQUEST_TOKEN_MAX_CHARS = 65_536;
 export const PLAN_REQUEST_JSON_MAX_CHARS = 12_000;
+export const PLAN_INLINE_REVISION_PROTOCOL = "inline-feedback-v1";
+export const PLAN_REVIEW_RESPONSE_PREFIX = "prime-orbit-plan-review-response:v1:";
 
 export const PLAN_ID_MAX_CHARS = 200;
 export const PLAN_TEXT_MAX_CHARS = 4_096;
@@ -61,6 +63,7 @@ export type PlanModePhase = "idle" | "planning" | "question" | "review";
 export type PlanOutcome = "applied" | "kept" | "cancelled";
 export type PlanReviewDecision = "apply" | "keep" | "revise";
 export type PlanUiRequestKind = "question" | "review";
+export type PlanUiRequestClassification = "accepted" | "blocked" | "generic";
 
 export interface PlanUiDialogOption {
   readonly value: string;
@@ -89,12 +92,31 @@ export type PlanUiDialogPayload =
       readonly kind: "review";
       readonly planId: string;
       readonly title: string;
+      readonly revisionResponse?: typeof PLAN_INLINE_REVISION_PROTOCOL;
     };
 
 export interface DecodedPlanUiDialog {
   readonly payload: PlanUiDialogPayload;
   readonly humanTitle: string;
 }
+
+/** Legacy `revise` is only the first half of Prime Agent's native review flow:
+ * the same tool call opens a second input. Orbit's capability-negotiated
+ * inline response already carries feedback, so that form can await the exact
+ * persisted terminal result like every other completed Plan response. */
+export function shouldAwaitPlanToolResult(
+  kind: PlanUiDialogPayload["kind"],
+  decision?: PlanReviewDecision,
+  inlineRevision = false,
+): boolean {
+  return kind !== "review" || decision !== "revise" || inlineRevision;
+}
+
+type PlanUiDialogPayloadInput = PlanUiDialogPayload extends infer Payload
+  ? Payload extends { readonly v: typeof PLAN_PAYLOAD_VERSION }
+    ? Omit<Payload, "v">
+    : never
+  : never;
 
 /** A blocked, human-facing Plan question rendered from an internal request. */
 export interface PlanQuestionView {
@@ -184,6 +206,30 @@ export interface PlanDialogRecoverySummary {
   readonly reviewCount: number;
   /** The last unresolved blocking interaction in transcript order. */
   readonly latestKind?: PlanDialogRecoveryKind;
+  /** Durable Prime Agent tool-call id for that latest interaction. This is
+   * distinct from the transient extension UI request UUID. */
+  readonly latestToolCallId?: string;
+}
+
+const PLAN_DIALOG_TOOL_NAMES = new Set([
+  "prime_orbit_plan_question",
+  "prime_orbit_plan_submit",
+]);
+
+export function planDialogHasLaterDurableProgress(
+  messages: readonly ChatMessage[],
+  messageIndex: number,
+): boolean {
+  return messages.slice(messageIndex + 1).some((message) => {
+    if (message.internal === "plan_handoff") return true;
+    if (message.role === "user") return true;
+    if (message.role === "system") return message.content.trim().length > 0;
+    if (message.role !== "assistant") return false;
+    if (message.content.trim().length > 0) return true;
+    return (message.tools ?? []).some((tool) => (
+      tool.status !== "unresolved" || !PLAN_DIALOG_TOOL_NAMES.has(tool.name)
+    ));
+  });
 }
 
 export interface PlanNotification {
@@ -205,15 +251,21 @@ export function unresolvedPlanDialogSummary(
   let questionCount = 0;
   let reviewCount = 0;
   let latestKind: PlanDialogRecoveryKind | undefined;
-  for (const message of conversation.messages) {
+  let latestToolCallId: string | undefined;
+  for (let messageIndex = 0; messageIndex < conversation.messages.length; messageIndex += 1) {
+    const message = conversation.messages[messageIndex]!;
+    const superseded = planDialogHasLaterDurableProgress(conversation.messages, messageIndex);
     for (const tool of message.tools ?? []) {
       if (tool.status !== "unresolved") continue;
+      if (superseded) continue;
       if (tool.name === "prime_orbit_plan_question") {
         questionCount += 1;
         latestKind = "question";
+        latestToolCallId = tool.id;
       } else if (tool.name === "prime_orbit_plan_submit") {
         reviewCount += 1;
         latestKind = "review";
+        latestToolCallId = tool.id;
       }
     }
   }
@@ -222,6 +274,7 @@ export function unresolvedPlanDialogSummary(
     questionCount,
     reviewCount,
     ...(latestKind ? { latestKind } : {}),
+    ...(latestToolCallId ? { latestToolCallId } : {}),
   };
 }
 
@@ -348,6 +401,71 @@ function encodeBase64UrlUtf8(text: string): string {
   return btoa(binary).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/gu, "");
 }
 
+export interface PlanInlineRevisionResponse {
+  readonly v: typeof PLAN_PAYLOAD_VERSION;
+  readonly kind: "review-decision";
+  readonly planId: string;
+  readonly decision: "revise";
+  readonly feedback: string;
+}
+
+/** Encodes the complete Revise interaction into the existing native select
+ * response UUID. Prime Agent can therefore finish the same tool call without
+ * relying on a second UI request that a daemon catch-up cannot reconstruct. */
+export function encodePlanInlineRevisionResponse(
+  planId: string,
+  feedback: string,
+): string | undefined {
+  const boundedPlanId = strictText(planId, 1, 256);
+  const normalizedFeedback = feedback.trim();
+  if (!boundedPlanId || normalizedFeedback.length < 1 || normalizedFeedback.length > PLAN_TEXT_MAX_CHARS) {
+    return undefined;
+  }
+  const payload: PlanInlineRevisionResponse = {
+    v: PLAN_PAYLOAD_VERSION,
+    kind: "review-decision",
+    planId: boundedPlanId,
+    decision: "revise",
+    feedback: normalizedFeedback,
+  };
+  const json = JSON.stringify(payload);
+  if (json.length > PLAN_REQUEST_JSON_MAX_CHARS) return undefined;
+  return `${PLAN_REVIEW_RESPONSE_PREFIX}${encodeBase64UrlUtf8(json)}`;
+}
+
+/** Strictly decodes and attests an inline Revise response against the exact
+ * durable Plan submit call. Foreign values remain ordinary select responses. */
+export function decodePlanInlineRevisionResponse(
+  value: unknown,
+  expectedPlanId?: string,
+): PlanInlineRevisionResponse | undefined {
+  if (typeof value !== "string" || !value.startsWith(PLAN_REVIEW_RESPONSE_PREFIX)) return undefined;
+  const json = decodeBase64UrlUtf8(value.slice(PLAN_REVIEW_RESPONSE_PREFIX.length));
+  if (!json) return undefined;
+  try {
+    const record = asRecord(JSON.parse(json));
+    if (
+      !record
+      || Object.keys(record).length !== 5
+      || ownField(record, "v") !== PLAN_PAYLOAD_VERSION
+      || ownField(record, "kind") !== "review-decision"
+      || ownField(record, "decision") !== "revise"
+    ) return undefined;
+    const planId = strictText(ownField(record, "planId"), 1, 256);
+    const feedback = strictText(ownField(record, "feedback"), 1, PLAN_TEXT_MAX_CHARS)?.trim();
+    if (!planId || !feedback || (expectedPlanId !== undefined && planId !== expectedPlanId)) return undefined;
+    return {
+      v: PLAN_PAYLOAD_VERSION,
+      kind: "review-decision",
+      planId,
+      decision: "revise",
+      feedback,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 function strictDialogOption(value: unknown): PlanUiDialogOption | undefined {
   const record = asRecord(value);
   if (!record) return undefined;
@@ -406,8 +524,17 @@ function validatePlanUiDialogPayload(value: unknown): PlanUiDialogPayload | unde
   if (kind === "review") {
     const planId = strictText(ownField(record, "planId"), 1, 256);
     const title = strictText(ownField(record, "title"), 1, 512);
-    return planId && title
-      ? { v: PLAN_PAYLOAD_VERSION, kind, planId, title }
+    const revisionResponse = ownField(record, "revisionResponse");
+    return planId
+      && title
+      && (revisionResponse === undefined || revisionResponse === PLAN_INLINE_REVISION_PROTOCOL)
+      ? {
+          v: PLAN_PAYLOAD_VERSION,
+          kind,
+          planId,
+          title,
+          ...(revisionResponse === PLAN_INLINE_REVISION_PROTOCOL ? { revisionResponse } : {}),
+        }
       : undefined;
   }
   return undefined;
@@ -432,7 +559,7 @@ export function decodePlanUiRequestTitle(title: unknown): DecodedPlanUiDialog | 
 
 /** Test and fixture helper using the exact extension title format. */
 export function encodePlanUiRequestTitle(
-  payload: Omit<PlanUiDialogPayload, "v">,
+  payload: PlanUiDialogPayloadInput,
   humanTitle: string,
 ): string | undefined {
   const json = JSON.stringify({ ...payload, v: PLAN_PAYLOAD_VERSION });
@@ -453,13 +580,20 @@ export function planUiRequestKind(request: ExtensionUiRequest | unknown): PlanUi
   return method === "input" ? "question" : undefined;
 }
 
-export function isInternalPlanUiRequest(request: ExtensionUiRequest | unknown): boolean {
-  return planUiRequestKind(request) !== undefined;
+/** Returns the durable Prime Agent tool-call id carried by Orbit's trusted
+ * Plan marker. This is intentionally distinct from the transient RPC dialog
+ * UUID in `request.id`, which never appears as `toolResult.toolCallId`. */
+export function planUiToolCallId(request: ExtensionUiRequest | unknown): string | undefined {
+  const record = asRecord(request);
+  const decoded = decodePlanUiRequestTitle(ownField(record ?? {}, "title"));
+  if (!decoded) return undefined;
+  return decoded.payload.kind === "review"
+    ? decoded.payload.planId
+    : decoded.payload.toolCallId;
 }
 
-/** The reserved protocol is trusted only inside the isolated native Plan runtime. */
-export function isTrustedPlanUiRequest(request: ExtensionUiRequest | unknown, runtimeMode: unknown): boolean {
-  return runtimeMode === "plan" && isInternalPlanUiRequest(request);
+export function isInternalPlanUiRequest(request: ExtensionUiRequest | unknown): boolean {
+  return planUiRequestKind(request) !== undefined;
 }
 
 /** A reserved prefix is never allowed to fall back to third-party UI. */
@@ -468,6 +602,31 @@ export function isClaimedPlanUiRequest(request: unknown): boolean {
   return ownField(record ?? {}, "type") === "extension_ui_request"
     && typeof ownField(record ?? {}, "title") === "string"
     && (ownField(record ?? {}, "title") as string).startsWith(PLAN_REQUEST_TITLE_PREFIX);
+}
+
+/**
+ * Classifies an extension dialog without taking any protocol action.
+ *
+ * A reserved Plan request is accepted only when both its versioned payload and
+ * blocking method are valid and the native child attests that it is running in
+ * Plan mode. Every other reserved request stays blocked: callers must never
+ * turn an absent attestation or malformed payload into a synthetic user
+ * cancellation. Unreserved requests remain available to the generic extension
+ * UI path.
+ */
+export function classifyPlanUiRequest(
+  request: ExtensionUiRequest | unknown,
+  runtimeMode: unknown,
+): PlanUiRequestClassification {
+  if (!isClaimedPlanUiRequest(request)) return "generic";
+  return runtimeMode === "plan" && isInternalPlanUiRequest(request)
+    ? "accepted"
+    : "blocked";
+}
+
+/** The reserved protocol is trusted only inside the isolated native Plan runtime. */
+export function isTrustedPlanUiRequest(request: ExtensionUiRequest | unknown, runtimeMode: unknown): boolean {
+  return classifyPlanUiRequest(request, runtimeMode) === "accepted";
 }
 
 /** Builds the bounded question view from a raw internal Plan request. */
@@ -891,6 +1050,58 @@ export function openPlanQuestion(
   return accepted({ phase: "question", revision, question: view }, true);
 }
 
+function samePlanQuestionView(left: PlanQuestionView | undefined, right: PlanQuestionView): boolean {
+  if (!left) return false;
+  const leftOptions = left.options;
+  const rightOptions = right.options;
+  const sameOptions = leftOptions === rightOptions || (
+    leftOptions !== undefined
+    && rightOptions !== undefined
+    && leftOptions.length === rightOptions.length
+    && leftOptions.every((option, index) => option === rightOptions[index])
+  );
+  return left.requestId === right.requestId
+    && left.method === right.method
+    && left.title === right.title
+    && left.message === right.message
+    && left.prefill === right.prefill
+    && sameOptions;
+}
+
+/** Reattaches the exact live native question after renderer/workspace
+ * rehydration. Unlike `openPlanQuestion`, this may replace a stale question
+ * UUID left by an earlier connection. The caller must first attest that the
+ * request is still owned by the current native Prime Agent process. */
+export function restorePlanQuestion(
+  state: PlanModeState,
+  input: PlanQuestionInput,
+): PlanTransitionResult {
+  const { current, valid } = resolveOrIdle(state);
+  if (!valid) return rejected("invalid_state", current);
+  if (current.phase !== "idle" && current.phase !== "planning" && current.phase !== "question") {
+    return rejected("wrong_phase", current);
+  }
+  const view = planQuestionFromRequest(input?.request);
+  if (!view) {
+    const requestRecord = asRecord((input ?? { }).request);
+    const marked = typeof requestRecord?.title === "string"
+      && requestRecord.title.startsWith(PLAN_REQUEST_TITLE_PREFIX);
+    const isExtensionRequest = ownField(requestRecord ?? { }, "type") === "extension_ui_request";
+    return rejected(marked && isExtensionRequest ? "invalid_input" : "not_plan_request", current);
+  }
+  if (current.phase === "question" && samePlanQuestionView(current.question, view)) {
+    return accepted(current, false);
+  }
+  const revision = nextRevision(current);
+  if (revision === undefined) return rejected("revision_overflow", current);
+  return accepted({
+    phase: "question",
+    revision,
+    question: view,
+    ...(current.round !== undefined ? { round: current.round } : {}),
+  }, true);
+}
+
 export interface PlanQuestionAnswerInput {
   /** Echo of the pending question id; a mismatch marks a stale response. */
   readonly requestId?: unknown;
@@ -936,6 +1147,36 @@ export function answerPlanQuestion(
   }, true);
 }
 
+/**
+ * Releases only a dead, previously blocking Plan dialog so Prime Agent can
+ * recreate it with a fresh native request id. This is not a user answer: the
+ * stale question/document is discarded and the active Plan session returns to
+ * `planning`. Replaying the recovery after it already reached `planning` (or
+ * after Plan mode ended) is an accepted no-op.
+ */
+export function rearmPlanModeAfterLostDialog(
+  state: PlanModeState,
+  kind: unknown,
+  guard?: PlanTransitionGuard,
+): PlanTransitionResult {
+  const { current, valid } = resolveOrIdle(state);
+  if (!valid) return rejected("invalid_state", current);
+  if (isStale(current, guard)) return rejected("stale_revision", current);
+  const expectedPhase = oneOf(kind, ["question", "review"] as const);
+  if (!expectedPhase) return rejected("invalid_input", current);
+  if (current.phase === "idle" || current.phase === "planning") {
+    return accepted(current, false);
+  }
+  if (current.phase !== expectedPhase) return rejected("wrong_phase", current);
+  const revision = nextRevision(current);
+  if (revision === undefined) return rejected("revision_overflow", current);
+  return accepted({
+    phase: "planning",
+    revision,
+    ...(current.round !== undefined ? { round: current.round } : {}),
+  }, true);
+}
+
 export interface PlanReviewInput {
   /** Candidate document `{ name?, markdown }`; normalized and bounded. */
   readonly document: unknown;
@@ -966,6 +1207,39 @@ export function openPlanReview(
   const revision = nextRevision(current);
   if (revision === undefined) return rejected("revision_overflow", current);
   return accepted({ phase: "review", revision, round, document: { ...normalized, round } }, true);
+}
+
+/** Reattaches a review form to the exact document recovered from Prime
+ * Agent's persisted tool call. Unlike a normal generation transition, this
+ * may replace a stale review document left by an earlier aborted call. */
+export function restorePlanReview(
+  state: PlanModeState,
+  input: PlanReviewInput,
+): PlanTransitionResult {
+  const { current, valid } = resolveOrIdle(state);
+  if (!valid) return rejected("invalid_state", current);
+  if (current.phase !== "idle" && current.phase !== "planning" && current.phase !== "review") {
+    return rejected("wrong_phase", current);
+  }
+  const normalized = normalizePlanDocument(input?.document);
+  if (!normalized) return rejected("invalid_input", current);
+  const round = current.phase === "review"
+    ? current.round ?? current.document?.round ?? 1
+    : current.phase === "planning"
+      ? (current.round ?? 0) + 1
+      : 1;
+  if (round > PLAN_ROUNDS_MAX) return rejected("round_limit", current);
+  const document = { ...normalized, round };
+  if (
+    current.phase === "review"
+    && current.document?.name === document.name
+    && current.document.markdown === document.markdown
+  ) {
+    return accepted(current, false);
+  }
+  const revision = nextRevision(current);
+  if (revision === undefined) return rejected("revision_overflow", current);
+  return accepted({ phase: "review", revision, round, document }, true);
 }
 
 export interface PlanDecisionInput {
