@@ -4,6 +4,33 @@ All notable changes to Prime Orbit are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-26
+
+### Error reporting
+
+- Classified failed responses by the request Orbit sent rather than by Prime Agent's error prose, so enrichment reads (model catalog, commands, session statistics, schedules, heartbeats) can no longer fail a conversation for any reason.
+- Recognised the daemon's own command spellings (`heartbeat_get`, `heartbeats_list`, `cron_list`) when only a diagnostic identifies a late response.
+- Collapsed identical RPC failures into one counted timeline row instead of one row per bootstrap retry.
+- Stopped the post-maintenance refresh awaiting the model and command catalogs; it now succeeds on state and history.
+
+### Runtime state
+
+- Added an unconditional periodic reconciliation against Prime Agent's own state while a conversation claims active work or still shows rows nothing has updated.
+- Closed lifecycle activity rows at an authoritative idle boundary and at process exit, which previously only happened for tool executions.
+- Gave the bootstrap ownership of the loading state so a retry, runtime-mode switch, or reattach can no longer strand a conversation on `Connecting to Prime Agent`.
+- Re-entered a bootstrap that no longer exists, and released the loading state once a transcript is on screen.
+- Recorded reconciliation corrections as divergences in the session inspector, and added a `Resynchronize` action.
+
+### Plan mode
+
+- Defaulted each of an option's `value` and `label` to the other so a routine omission no longer fails the question and costs a retry round-trip.
+- Read the flag the transcript source actually writes when verifying a plan handoff, which for a published session could never succeed.
+- Stopped the Plan replay probe re-bootstrapping while the runtime is not in Plan mode, which inflated a single Plan row past 1400 updates.
+
+### Runtime detection
+
+- Surfaced a warning when a usable Prime Agent runtime reports a version Prime Orbit was not validated against.
+
 ## [0.2.0] - 2026-08-25
 
 ### Global Prime Agent conversations
